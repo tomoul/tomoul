@@ -195,9 +195,17 @@ pub const ModelLoader = struct {
         // Copy data from file buffer
         const data_bytes = self.file_data[info.data_offset..][0..info.data_size];
 
-        // Reinterpret bytes as f32 slice (little-endian, same as Zig native on x86)
-        const float_data: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, data_bytes));
-        @memcpy(tensor.data, float_data);
+        // Copy bytes to tensor data, handling potential unaligned data
+        // Read f32 values byte-by-byte to handle unaligned memory
+        for (tensor.data, 0..) |*out, i| {
+            const byte_offset = i * 4;
+            out.* = @bitCast([4]u8{
+                data_bytes[byte_offset],
+                data_bytes[byte_offset + 1],
+                data_bytes[byte_offset + 2],
+                data_bytes[byte_offset + 3],
+            });
+        }
 
         return tensor;
     }

@@ -5,9 +5,13 @@ pub const tensor = @import("core/tensor.zig");
 pub const ops = @import("core/ops.zig");
 pub const loader = @import("core/loader.zig");
 
+// Model modules
+pub const vad = @import("models/vad.zig");
+
 // Re-export main types
 pub const Tensor = tensor.Tensor;
 pub const TensorError = tensor.TensorError;
+pub const SileroVAD = vad.SileroVAD;
 
 pub fn main() !void {
     const print = std.debug.print;
@@ -182,4 +186,5 @@ test {
     _ = @import("core/tensor.zig");
     _ = @import("core/ops.zig");
     _ = @import("core/loader.zig");
+    _ = @import("models/vad.zig");
 }
