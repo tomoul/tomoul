@@ -105,8 +105,75 @@ pub fn main() !void {
     print("   Max:  {d:.1}\n", .{ops.max(&a)});
     print("   Min:  {d:.1}\n", .{ops.min(&a)});
 
-    print("\n=== Phase 1 Complete! ===\n", .{});
-    print("Tensor core is operational. Ready for Phase 2 (Matrix Multiplication).\n\n", .{});
+    print("\n=== Phase 1 Complete! ===\n\n", .{});
+
+    // =========================================================================
+    // Phase 2: Matrix Multiplication Demo
+    // =========================================================================
+    print("=== Phase 2: Matrix Multiplication ===\n\n", .{});
+
+    // Create Matrix X (1x3) -> [1, 2, 3]
+    print("1. Matrix multiplication: Y = X @ W\n", .{});
+    var shape_x = [_]usize{ 1, 3 };
+    const data_x = [_]f32{ 1.0, 2.0, 3.0 };
+    var mat_x = try Tensor.initWithData(allocator, &shape_x, &data_x);
+    defer mat_x.deinit();
+
+    print("   X (1x3): [ ", .{});
+    for (mat_x.data) |v| print("{d:.1} ", .{v});
+    print("]\n", .{});
+
+    // Create Matrix W (3x2) -> [[1, 2], [3, 4], [5, 6]]
+    var shape_w = [_]usize{ 3, 2 };
+    const data_w = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
+    var mat_w = try Tensor.initWithData(allocator, &shape_w, &data_w);
+    defer mat_w.deinit();
+
+    print("   W (3x2):\n", .{});
+    print("   [ {d:.1} {d:.1} ]\n", .{ mat_w.data[0], mat_w.data[1] });
+    print("   [ {d:.1} {d:.1} ]\n", .{ mat_w.data[2], mat_w.data[3] });
+    print("   [ {d:.1} {d:.1} ]\n", .{ mat_w.data[4], mat_w.data[5] });
+
+    // Perform Y = X @ W
+    // Y[0,0] = 1*1 + 2*3 + 3*5 = 1 + 6 + 15 = 22
+    // Y[0,1] = 1*2 + 2*4 + 3*6 = 2 + 8 + 18 = 28
+    var mat_y = try ops.matmul(allocator, &mat_x, &mat_w);
+    defer mat_y.deinit();
+
+    print("\n   Y = X @ W (1x2):\n", .{});
+    print("   [ {d:.1} {d:.1} ]  (expected: [22.0, 28.0])\n\n", .{ mat_y.data[0], mat_y.data[1] });
+
+    // =========================================================================
+    // Phase 2: Activation Functions Demo
+    // =========================================================================
+    print("=== Phase 2: Activation Functions ===\n\n", .{});
+
+    // Create tensor [-1.0, 0.0, 1.0]
+    var shape_act = [_]usize{3};
+    const data_act = [_]f32{ -1.0, 0.0, 1.0 };
+    var act_input = try Tensor.initWithData(allocator, &shape_act, &data_act);
+    defer act_input.deinit();
+
+    print("2. Input tensor: [ {d:.1} {d:.1} {d:.1} ]\n\n", .{ act_input.data[0], act_input.data[1], act_input.data[2] });
+
+    // ReLU: max(0, x)
+    var relu_out = try ops.relu(allocator, &act_input);
+    defer relu_out.deinit();
+    print("   ReLU(x):    [ {d:.3} {d:.3} {d:.3} ]  (expected: [0, 0, 1])\n", .{ relu_out.data[0], relu_out.data[1], relu_out.data[2] });
+
+    // Sigmoid: 1 / (1 + exp(-x))
+    var sig_out = try ops.sigmoid(allocator, &act_input);
+    defer sig_out.deinit();
+    print("   Sigmoid(x): [ {d:.3} {d:.3} {d:.3} ]  (expected: [0.269, 0.5, 0.731])\n", .{ sig_out.data[0], sig_out.data[1], sig_out.data[2] });
+
+    // Tanh
+    var tanh_out = try ops.tanh(allocator, &act_input);
+    defer tanh_out.deinit();
+    print("   Tanh(x):    [ {d:.3} {d:.3} {d:.3} ]  (expected: [-0.762, 0, 0.762])\n", .{ tanh_out.data[0], tanh_out.data[1], tanh_out.data[2] });
+
+    print("\n=== Phase 2 Complete! ===\n", .{});
+    print("Matrix multiplication and activations operational.\n", .{});
+    print("Ready for Phase 3 (Data Bridge - PyTorch weight loading).\n\n", .{});
 }
 
 // Pull in tests from submodules
