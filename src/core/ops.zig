@@ -232,6 +232,35 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
     return result;
 }
 
+/// Transpose a 2D matrix: B = A^T
+/// For A with shape [M, N], result has shape [N, M].
+/// Required for PyTorch weight compatibility (nn.Linear stores [out, in]).
+pub fn transpose(allocator: std.mem.Allocator, t: *const Tensor) !Tensor {
+    // Validate: must be 2D matrix
+    if (t.shape.len != 2) {
+        return OpsError.InvalidShape;
+    }
+
+    const m = t.shape[0]; // rows of input
+    const n = t.shape[1]; // cols of input
+
+    // Result shape: [N, M] (flipped)
+    var result_shape = [_]usize{ n, m };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    // Transpose: result[j, i] = t[i, j]
+    for (0..m) |i| {
+        for (0..n) |j| {
+            // t[i, j] is at index i * n + j
+            // result[j, i] is at index j * m + i
+            result.data[j * m + i] = t.data[i * n + j];
+        }
+    }
+
+    return result;
+}
+
 /// Matrix-vector multiplication: y = A @ x
 /// For A with shape [M, N] and x with shape [N], result has shape [M].
 pub fn matvec(allocator: std.mem.Allocator, a: *const Tensor, x: *const Tensor) !Tensor {
@@ -519,6 +548,73 @@ test "reduction operations" {
 // ============================================================================
 // Phase 2 Tests: Matrix Multiplication & Activations
 // ============================================================================
+
+test "transpose 2x3 -> 3x2" {
+    const allocator = std.testing.allocator;
+
+    // Matrix A (2x3):
+    // [ 1, 2, 3 ]
+    // [ 4, 5, 6 ]
+    var shape_a = [_]usize{ 2, 3 };
+    const data_a = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var a = try Tensor.initWithData(allocator, &shape_a, &data_a);
+    defer a.deinit();
+
+    // Transpose: A^T (3x2)
+    // [ 1, 4 ]
+    // [ 2, 5 ]
+    // [ 3, 6 ]
+    var a_t = try transpose(allocator, &a);
+    defer a_t.deinit();
+
+    // Verify shape
+    try std.testing.expectEqual(@as(usize, 2), a_t.shape.len);
+    try std.testing.expectEqual(@as(usize, 3), a_t.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), a_t.shape[1]);
+
+    // Verify data (row-major order)
+    // Row 0: [1, 4]
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), a_t.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), a_t.data[1], 0.001);
+    // Row 1: [2, 5]
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), a_t.data[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), a_t.data[3], 0.001);
+    // Row 2: [3, 6]
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), a_t.data[4], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), a_t.data[5], 0.001);
+}
+
+test "transpose then matmul (PyTorch Linear compatibility)" {
+    const allocator = std.testing.allocator;
+
+    // Simulating PyTorch nn.Linear weight shape [out_features, in_features]
+    // Weight W (2x3) - 2 output features, 3 input features
+    var shape_w = [_]usize{ 2, 3 };
+    const data_w = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var weight = try Tensor.initWithData(allocator, &shape_w, &data_w);
+    defer weight.deinit();
+
+    // Input X (1x3) - batch of 1, 3 input features
+    var shape_x = [_]usize{ 1, 3 };
+    const data_x = [_]f32{ 1, 1, 1 };
+    var input = try Tensor.initWithData(allocator, &shape_x, &data_x);
+    defer input.deinit();
+
+    // Transpose weight: W^T (3x2)
+    var weight_t = try transpose(allocator, &weight);
+    defer weight_t.deinit();
+
+    // Y = X @ W^T -> (1x3) @ (3x2) = (1x2)
+    var output = try matmul(allocator, &input, &weight_t);
+    defer output.deinit();
+
+    // Expected: [1*1+1*2+1*3, 1*4+1*5+1*6] = [6, 15]
+    try std.testing.expectEqual(@as(usize, 2), output.shape.len);
+    try std.testing.expectEqual(@as(usize, 1), output.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), output.shape[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), output.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), output.data[1], 0.001);
+}
 
 test "matmul 2x3 @ 3x2" {
     const allocator = std.testing.allocator;
