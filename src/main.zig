@@ -3,6 +3,7 @@ const std = @import("std");
 // Core modules
 pub const tensor = @import("core/tensor.zig");
 pub const ops = @import("core/ops.zig");
+pub const loader = @import("core/loader.zig");
 
 // Re-export main types
 pub const Tensor = tensor.Tensor;
@@ -180,4 +181,5 @@ pub fn main() !void {
 test {
     _ = @import("core/tensor.zig");
     _ = @import("core/ops.zig");
+    _ = @import("core/loader.zig");
 }
