@@ -9,17 +9,19 @@ const LoadError = loader_mod.LoadError;
 /// Voice Activity Detection using LSTM-based architecture.
 ///
 /// Architecture (16kHz model):
-///   STFT (learned) -> Conv Encoder (4 layers) -> LSTM -> Decoder -> Sigmoid
+///   Context + Audio -> STFT (learned, hop=128) -> Conv Encoder (strides 1,2,2,1)
+///   -> LSTM -> ReLU -> Conv -> Sigmoid
 ///
-/// The model processes audio chunks (typically 512 samples @ 16kHz = 32ms)
-/// and outputs a speech probability [0.0 - 1.0].
+/// The model processes audio chunks (512 samples @ 16kHz = 32ms) with a 64-sample
+/// context buffer carried over between chunks.
+/// Returns speech probability [0.0 - 1.0].
 pub const SileroVAD = struct {
     allocator: std.mem.Allocator,
 
     // STFT basis (learned Fourier transform)
     stft_basis: Tensor, // [258, 1, 256]
 
-    // Encoder Conv1d layers
+    // Encoder Conv1d layers (strides: 1, 2, 2, 1)
     enc0_weight: Tensor, // [128, 129, 3]
     enc0_bias: Tensor, // [128]
     enc1_weight: Tensor, // [64, 128, 3]
@@ -32,12 +34,20 @@ pub const SileroVAD = struct {
     // LSTM weights (hidden_size=128, 4 gates packed)
     lstm_weights: ops.LSTMWeights,
 
-    // Decoder (1x1 conv acting as linear)
+    // Decoder (1x1 conv acting as linear, with ReLU before)
     dec_weight: Tensor, // [1, 128, 1]
     dec_bias: Tensor, // [1]
 
     // LSTM state (persistent across calls)
     lstm_state: ops.LSTMState,
+
+    // Context buffer (64 samples carried over between chunks)
+    context_buffer: Tensor, // [64]
+
+    // Constants
+    const CONTEXT_SIZE: usize = 64;
+    const HOP_SIZE: usize = 128;
+    const STFT_PAD_RIGHT: usize = 64;
 
     const Self = @This();
 
@@ -103,6 +113,12 @@ pub const SileroVAD = struct {
         var lstm_state = try ops.LSTMState.init(allocator, hidden_size);
         errdefer lstm_state.deinit();
 
+        // Initialize context buffer (64 samples of zeros)
+        var ctx_shape = [_]usize{CONTEXT_SIZE};
+        var context_buffer = try Tensor.init(allocator, &ctx_shape);
+        errdefer context_buffer.deinit();
+        // Zero-initialized by Tensor.init
+
         return Self{
             .allocator = allocator,
             .stft_basis = stft_basis,
@@ -123,6 +139,7 @@ pub const SileroVAD = struct {
             .dec_weight = dec_weight,
             .dec_bias = dec_bias,
             .lstm_state = lstm_state,
+            .context_buffer = context_buffer,
         };
     }
 
@@ -144,73 +161,108 @@ pub const SileroVAD = struct {
         self.dec_weight.deinit();
         self.dec_bias.deinit();
         self.lstm_state.deinit();
+        self.context_buffer.deinit();
     }
 
-    /// Reset LSTM state (call between utterances/audio streams)
+    /// Reset LSTM state and context buffer (call between utterances/audio streams)
     pub fn resetStates(self: *Self) void {
         self.lstm_state.reset();
+        // Reset context buffer to zeros
+        @memset(self.context_buffer.data, 0.0);
     }
 
     /// Process audio chunk and return speech probability
     /// audio_chunk: raw audio samples [512] for 16kHz input
     /// Returns: speech probability [0.0 - 1.0]
-    ///
-    /// Note: This is a simplified forward pass. The full Silero VAD pipeline
-    /// includes STFT preprocessing which we simulate here.
     pub fn forward(self: *Self, audio_chunk: *const Tensor) !f32 {
-        // For now, we'll use a simplified pipeline:
-        // 1. The audio goes through feature extraction (simulated)
-        // 2. Then through encoder convolutions
-        // 3. Through LSTM
-        // 4. Through decoder
-        // 5. Sigmoid to get probability
+        // Pipeline:
+        // 1. Prepend context buffer to audio (64 + 512 = 576 samples)
+        // 2. STFT with hop=128, pad_right=64
+        // 3. Encoder convolutions (strides 1,2,2,1 -> output [128,1])
+        // 4. LSTM
+        // 5. ReLU -> Conv -> Sigmoid
 
-        // Step 1: Feature extraction using learned STFT
-        // The STFT basis is [258, 1, 256], we convolve with audio
-        // This produces a spectrogram-like representation
-        var features = try self.computeSTFT(audio_chunk);
+        // Step 1: Prepend context to audio
+        var with_context = try self.prependContext(audio_chunk);
+        defer with_context.deinit();
+
+        // Step 2: STFT with right-padding and hop=128
+        var features = try self.computeSTFT(&with_context);
         defer features.deinit();
 
-        // Step 2: Encoder convolutions
-        var x = try self.runEncoder(&features);
-        defer x.deinit();
+        // Step 3: Encoder convolutions with correct strides
+        var enc_out = try self.runEncoder(&features);
+        defer enc_out.deinit();
 
-        // Step 3: Prepare input for LSTM (need to reduce to 1D)
-        // After convolutions, we have [128, T] - sum over time dimension
-        var lstm_input = try self.prepareForLSTM(&x);
+        // Step 4: Squeeze time dim and run LSTM
+        // enc_out is [128, 1], we need [128]
+        var lstm_input = try self.prepareForLSTM(&enc_out);
         defer lstm_input.deinit();
 
-        // Step 4: LSTM forward pass
         try ops.lstmCell(self.allocator, &lstm_input, &self.lstm_state, &self.lstm_weights);
 
-        // Step 5: Decoder (linear from hidden state to output)
+        // Step 5: Decoder (ReLU -> Conv -> Sigmoid)
         const prob = self.runDecoder();
 
+        // Step 6: Update context buffer with last 64 samples of input
+        self.updateContext(&with_context);
+
         return prob;
+    }
+
+    /// Prepend context buffer to audio chunk
+    fn prependContext(self: *Self, audio: *const Tensor) !Tensor {
+        const total_len = CONTEXT_SIZE + audio.data.len;
+        var shape = [_]usize{total_len};
+        var result = try Tensor.init(self.allocator, &shape);
+        errdefer result.deinit();
+
+        // Copy context buffer
+        @memcpy(result.data[0..CONTEXT_SIZE], self.context_buffer.data);
+        // Copy audio
+        @memcpy(result.data[CONTEXT_SIZE..], audio.data);
+
+        return result;
+    }
+
+    /// Update context buffer with last CONTEXT_SIZE samples
+    fn updateContext(self: *Self, audio_with_ctx: *const Tensor) void {
+        const start = audio_with_ctx.data.len - CONTEXT_SIZE;
+        @memcpy(self.context_buffer.data, audio_with_ctx.data[start..]);
     }
 
     /// Compute Short-Time Fourier Transform using learned basis
     fn computeSTFT(self: *Self, audio: *const Tensor) !Tensor {
         // The STFT basis is [258, 1, 256] = [2*129 freq bins, 1, window_size]
         // This is a learned STFT with 129 frequency bins (real and imaginary parts = 258)
-        // Input audio is [512], we treat it as [1, 512]
         //
         // Silero VAD uses:
         // - Window size (n_fft): 256
-        // - Hop size: 256 (no overlap for efficiency)
-        // - This gives us 512/256 = 2 frames for 512 samples
+        // - Hop size: 128 (50% overlap)
+        // - Right padding: 64 samples (reflect mode, but we'll use zeros)
+        //
+        // Input: [576] (context + audio)
+        // After padding: [576 + 64] = [640]
+        // Output frames: (640 - 256) / 128 + 1 = 4 frames
 
         const audio_len = audio.data.len;
-        var audio_2d_shape = [_]usize{ 1, audio_len };
-        var audio_2d = try Tensor.init(self.allocator, &audio_2d_shape);
-        errdefer audio_2d.deinit();
-        @memcpy(audio_2d.data, audio.data);
+        const padded_len = audio_len + STFT_PAD_RIGHT;
 
-        // Perform 1D convolution with stride=256 (hop size)
-        // Shape: [1, 512] conv [258, 1, 256] with stride=256 -> [258, 2]
-        const hop_size = 256;
-        var stft_complex = try ops.conv1d(self.allocator, &audio_2d, &self.stft_basis, null, hop_size, 0);
-        audio_2d.deinit();
+        // Create padded audio as 2D tensor [1, padded_len]
+        var padded_shape = [_]usize{ 1, padded_len };
+        var audio_padded = try Tensor.init(self.allocator, &padded_shape);
+        errdefer audio_padded.deinit();
+
+        // Copy audio and pad with reflection of last samples
+        @memcpy(audio_padded.data[0..audio_len], audio.data);
+        // Reflect padding: copy last STFT_PAD_RIGHT samples in reverse
+        for (0..STFT_PAD_RIGHT) |i| {
+            audio_padded.data[audio_len + i] = audio.data[audio_len - 1 - i];
+        }
+
+        // Perform 1D convolution with stride=128 (hop size)
+        var stft_complex = try ops.conv1d(self.allocator, &audio_padded, &self.stft_basis, null, HOP_SIZE, 0);
+        audio_padded.deinit();
         errdefer stft_complex.deinit();
 
         // STFT output is [258, T] where first 129 are real, last 129 are imaginary
@@ -235,34 +287,37 @@ pub const SileroVAD = struct {
         return magnitude;
     }
 
-    /// Run encoder conv layers
+    /// Run encoder conv layers with correct strides
     fn runEncoder(self: *Self, features: *const Tensor) !Tensor {
-        // Encoder consists of 4 conv layers
+        // Encoder consists of 4 conv layers with different strides
         // Each: Conv1d -> ReLU
         //
-        // Layer 0: [129, T] -> [128, T'] (input is spectrogram magnitude with 129 bins)
-        // Our STFT now outputs [129, T] magnitude directly
+        // Input: [129, 4] (STFT magnitude with 129 bins, 4 time frames)
+        // Layer 0: stride=1, padding=1 -> [128, 4]
+        // Layer 1: stride=2, padding=1 -> [64, 2]
+        // Layer 2: stride=2, padding=1 -> [64, 1]
+        // Layer 3: stride=1, padding=1 -> [128, 1]
 
         // Clone the input features as our starting point
         var enc_input = try features.clone(self.allocator);
         defer enc_input.deinit();
 
-        // Conv layer 0: [129, T] -> [128, T']
+        // Conv layer 0: stride=1, padding=1
         var x0 = try ops.conv1d(self.allocator, &enc_input, &self.enc0_weight, &self.enc0_bias, 1, 1);
         defer x0.deinit();
         ops.reluInPlace(&x0);
 
-        // Conv layer 1: [128, T'] -> [64, T'']
-        var x1 = try ops.conv1d(self.allocator, &x0, &self.enc1_weight, &self.enc1_bias, 1, 1);
+        // Conv layer 1: stride=2, padding=1
+        var x1 = try ops.conv1d(self.allocator, &x0, &self.enc1_weight, &self.enc1_bias, 2, 1);
         defer x1.deinit();
         ops.reluInPlace(&x1);
 
-        // Conv layer 2: [64, T''] -> [64, T''']
-        var x2 = try ops.conv1d(self.allocator, &x1, &self.enc2_weight, &self.enc2_bias, 1, 1);
+        // Conv layer 2: stride=2, padding=1
+        var x2 = try ops.conv1d(self.allocator, &x1, &self.enc2_weight, &self.enc2_bias, 2, 1);
         defer x2.deinit();
         ops.reluInPlace(&x2);
 
-        // Conv layer 3: [64, T'''] -> [128, T'''']
+        // Conv layer 3: stride=1, padding=1
         var x3 = try ops.conv1d(self.allocator, &x2, &self.enc3_weight, &self.enc3_bias, 1, 1);
         ops.reluInPlace(&x3);
 
@@ -292,17 +347,23 @@ pub const SileroVAD = struct {
     }
 
     /// Run decoder on LSTM hidden state
-    /// Applies linear transformation and sigmoid
+    /// Applies ReLU -> linear transformation -> sigmoid
+    /// The decoder architecture is: dropout -> ReLU -> Conv1d -> Sigmoid
     fn runDecoder(self: *Self) f32 {
         // Decoder weight is [1, 128, 1], essentially a linear layer
         // hidden state is [128], output is scalar
+        //
+        // IMPORTANT: ReLU is applied to hidden state BEFORE the linear/conv layer!
+        // This matches the Silero model's decoder.decoder = [Dropout, ReLU, Conv1d]
 
-        // Compute: output = sigmoid(sum(h * w) + bias)
+        // Compute: output = sigmoid(sum(relu(h) * w) + bias)
         var sum_val: f32 = 0.0;
         for (self.lstm_state.h.data, 0..) |h, i| {
+            // Apply ReLU to hidden state element
+            const h_relu = if (h > 0) h else 0;
             // Weight is [1, 128, 1], we access w[0, i, 0]
             const w = self.dec_weight.data[i];
-            sum_val += h * w;
+            sum_val += h_relu * w;
         }
         sum_val += self.dec_bias.data[0];
 
@@ -421,4 +482,112 @@ test "vad multiple chunks" {
         // Each chunk should give valid probability
         try std.testing.expect(prob >= 0.0 and prob <= 1.0);
     }
+}
+
+test "vad speech detection - real audio" {
+    const allocator = std.testing.allocator;
+
+    var vad = SileroVAD.init(allocator, "models/silero_vad.tl") catch |err| {
+        if (err == LoadError.FileNotFound) {
+            std.debug.print("\nSkipping test: models/silero_vad.tl not found.\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer vad.deinit();
+
+    // Load speech samples from fixture file at runtime
+    const speech_file_data = std.fs.cwd().readFileAlloc(allocator, "tests/fixtures/silero_vad/speech_samples.bin", 1024 * 1024) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("\nSkipping test: speech_samples.bin not found.\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer allocator.free(speech_file_data);
+
+    const silence_file_data = std.fs.cwd().readFileAlloc(allocator, "tests/fixtures/silero_vad/silence_samples.bin", 1024 * 1024) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("\nSkipping test: silence_samples.bin not found.\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer allocator.free(silence_file_data);
+
+    const chunk_size: usize = 512;
+
+    // Parse speech file header
+    const speech_num_chunks = std.mem.readInt(u32, speech_file_data[0..4], .little);
+    const speech_chunk_size = std.mem.readInt(u32, speech_file_data[4..8], .little);
+    try std.testing.expectEqual(chunk_size, speech_chunk_size);
+
+    // Parse silence file header
+    const silence_num_chunks = std.mem.readInt(u32, silence_file_data[0..4], .little);
+    const silence_chunk_size = std.mem.readInt(u32, silence_file_data[4..8], .little);
+    try std.testing.expectEqual(chunk_size, silence_chunk_size);
+
+    std.debug.print("\n=== VAD Speech Detection Test ===\n", .{});
+    std.debug.print("Testing with real audio from sample1.wav\n", .{});
+    std.debug.print("Silence chunks: {}, Speech chunks: {}\n", .{ silence_num_chunks, speech_num_chunks });
+
+    // Reset state before testing
+    vad.resetStates();
+
+    var input_shape = [_]usize{chunk_size};
+    var chunk = try Tensor.init(allocator, &input_shape);
+    defer chunk.deinit();
+
+    // Process silence chunks first (chunks 0-1 from audio file)
+    // These should have LOW probability (< 0.5)
+    std.debug.print("\nSilence chunks (expecting low probability):\n", .{});
+    var silence_max_prob: f32 = 0.0;
+    for (0..silence_num_chunks) |i| {
+        const offset = 8 + i * chunk_size * 4; // Skip header, each f32 is 4 bytes
+        const chunk_bytes = silence_file_data[offset .. offset + chunk_size * 4];
+        // Reinterpret bytes as f32 slice
+        const chunk_floats: [*]const f32 = @ptrCast(@alignCast(chunk_bytes.ptr));
+        @memcpy(chunk.data, chunk_floats[0..chunk_size]);
+
+        const prob = try vad.forward(&chunk);
+        std.debug.print("  Silence chunk {}: prob = {d:.6}\n", .{ i, prob });
+        if (prob > silence_max_prob) silence_max_prob = prob;
+    }
+
+    // Process speech chunks (chunks 2-6 from audio file)
+    // These should have HIGH probability (> 0.5, most > 0.9)
+    std.debug.print("\nSpeech chunks (expecting high probability):\n", .{});
+    var speech_detected: usize = 0;
+    var speech_max_prob: f32 = 0.0;
+    for (0..speech_num_chunks) |i| {
+        const offset = 8 + i * chunk_size * 4;
+        const chunk_bytes = speech_file_data[offset .. offset + chunk_size * 4];
+        const chunk_floats: [*]const f32 = @ptrCast(@alignCast(chunk_bytes.ptr));
+        @memcpy(chunk.data, chunk_floats[0..chunk_size]);
+
+        const prob = try vad.forward(&chunk);
+        const is_speech = prob >= 0.5;
+        std.debug.print("  Speech chunk {}: prob = {d:.6} {s}\n", .{
+            i,
+            prob,
+            if (is_speech) "[SPEECH]" else "[silence]",
+        });
+        if (is_speech) speech_detected += 1;
+        if (prob > speech_max_prob) speech_max_prob = prob;
+    }
+
+    std.debug.print("\nResults:\n", .{});
+    std.debug.print("  Silence max prob: {d:.6}\n", .{silence_max_prob});
+    std.debug.print("  Speech max prob:  {d:.6}\n", .{speech_max_prob});
+    std.debug.print("  Speech detected:  {}/{} chunks\n", .{ speech_detected, speech_num_chunks });
+
+    // Validation: speech chunks should mostly be detected as speech
+    // Reference model detects 5/5 chunks as speech with probs > 0.9
+    // We allow some tolerance but require at least 3/5 (60%) to be speech
+    try std.testing.expect(speech_detected >= 3);
+    std.debug.print("\n✓ Speech detection validation passed!\n", .{});
+
+    // Max speech probability should be significantly higher than max silence
+    try std.testing.expect(speech_max_prob > silence_max_prob);
+    std.debug.print("✓ Speech/silence discrimination passed!\n", .{});
 }

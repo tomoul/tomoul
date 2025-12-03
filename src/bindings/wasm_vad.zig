@@ -25,10 +25,15 @@ const model_bytes = @embedFile("model_weights");
 // Memory Management
 // =============================================================================
 
-// Static heap for all allocations (4MB should be plenty for VAD)
+// Static heap for all allocations (~4MB total)
+// Model weights use ~1.8MB, forward pass needs ~200KB of temporary allocations
 var heap: [4 * 1024 * 1024]u8 = undefined;
 var fba = std.heap.FixedBufferAllocator.init(&heap);
 const allocator = fba.allocator();
+
+// High-water mark after model initialization
+// We reset to this point after each forward pass to reclaim temporary memory
+var init_end_index: usize = 0;
 
 // Audio input buffer (1536 samples = 96ms @ 16kHz, supports various chunk sizes)
 const MAX_INPUT_SAMPLES: usize = 1536;
@@ -52,6 +57,9 @@ export fn init() u32 {
     vad_instance = SileroVAD.initFromBytes(allocator, model_bytes) catch {
         return 0; // Initialization failed
     };
+
+    // Record high-water mark after init - we'll reset to here after each forward pass
+    init_end_index = fba.end_index;
 
     is_initialized = true;
     return 1;
@@ -84,12 +92,16 @@ export fn process_audio(num_samples: usize) f32 {
         return -2.0; // Invalid sample count
     }
 
+    // Reset allocator to post-init state to reclaim memory from previous forward passes
+    // This is safe because forward() doesn't store any persistent allocations
+    fba.end_index = init_end_index;
+
     // Create a tensor from the input buffer
     var input_shape = [_]usize{num_samples};
     var input_tensor = Tensor.init(allocator, &input_shape) catch {
         return -3.0; // Failed to create tensor
     };
-    defer input_tensor.deinit();
+    // No defer needed - we reset allocator at start of each call
 
     // Copy input buffer data to tensor
     @memcpy(input_tensor.data, input_buffer[0..num_samples]);

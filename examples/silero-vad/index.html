@@ -195,6 +195,60 @@
             padding-bottom: 1rem;
             border-bottom: 1px solid #333;
         }
+        .file-upload {
+            border: 2px dashed #444;
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+            margin-bottom: 1rem;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+        }
+        .file-upload:hover {
+            border-color: #00d9ff;
+            background: rgba(0, 217, 255, 0.05);
+        }
+        .file-upload.dragover {
+            border-color: #00ff88;
+            background: rgba(0, 255, 136, 0.1);
+        }
+        .file-upload input {
+            display: none;
+        }
+        .file-info {
+            margin-top: 0.5rem;
+            font-size: 0.85rem;
+            color: #888;
+        }
+        .file-results {
+            background: #16162a;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-top: 1rem;
+            display: none;
+        }
+        .file-results.visible {
+            display: block;
+        }
+        .result-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.25rem 0;
+            border-bottom: 1px solid #333;
+        }
+        .result-row:last-child {
+            border-bottom: none;
+        }
+        .result-label {
+            color: #888;
+        }
+        .result-value {
+            font-family: 'Monaco', 'Consolas', monospace;
+            color: #00d9ff;
+        }
+        .result-value.speech {
+            color: #00ff88;
+        }
     </style>
 </head>
 <body>
@@ -242,6 +296,45 @@
         </div>
 
         <div class="status-card">
+            <h3 style="margin-bottom: 0.5rem; color: #00d9ff;">Test with Audio File</h3>
+            <div class="file-upload" id="file-upload">
+                <input type="file" id="audio-file" accept=".wav,.mp3,.ogg,.webm,audio/*">
+                <p>📁 Drop audio file here or click to browse</p>
+                <p class="file-info">Supports WAV, MP3, OGG, WebM (will be resampled to 16kHz)</p>
+            </div>
+            <div class="file-results" id="file-results">
+                <div class="result-row">
+                    <span class="result-label">File:</span>
+                    <span class="result-value" id="result-filename">--</span>
+                </div>
+                <div class="result-row">
+                    <span class="result-label">Duration:</span>
+                    <span class="result-value" id="result-duration">--</span>
+                </div>
+                <div class="result-row">
+                    <span class="result-label">Sample Rate:</span>
+                    <span class="result-value" id="result-samplerate">--</span>
+                </div>
+                <div class="result-row">
+                    <span class="result-label">Chunks Processed:</span>
+                    <span class="result-value" id="result-chunks">--</span>
+                </div>
+                <div class="result-row">
+                    <span class="result-label">Average Probability:</span>
+                    <span class="result-value" id="result-avg-prob">--</span>
+                </div>
+                <div class="result-row">
+                    <span class="result-label">Max Probability:</span>
+                    <span class="result-value" id="result-max-prob">--</span>
+                </div>
+                <div class="result-row">
+                    <span class="result-label">Speech Detected:</span>
+                    <span class="result-value" id="result-speech">--</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="status-card">
             <h3 style="margin-bottom: 0.5rem; color: #00d9ff;">Console Log</h3>
             <div class="log" id="log"></div>
         </div>
@@ -276,8 +369,12 @@
         // Audio context and processing
         let audioContext = null;
         let mediaStream = null;
-        let scriptProcessor = null;
+        let workletNode = null;      // AudioWorklet node (preferred)
+        let scriptProcessor = null;  // Fallback for older browsers
+        let sourceNode = null;
         let isRecording = false;
+        let useAudioWorklet = true;  // Try AudioWorklet first
+        let frameCount = 0;
 
         // VAD settings
         const TARGET_SAMPLE_RATE = 16000;
@@ -323,7 +420,7 @@
             return result;
         }
 
-        // Start microphone capture
+        // Start microphone capture using AudioWorklet (preferred) or ScriptProcessorNode (fallback)
         async function startMicrophone() {
             try {
                 log('Requesting microphone access...');
@@ -339,77 +436,31 @@
 
                 // Create audio context
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+                // Ensure context is running (can be suspended by browser policy)
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
                 const nativeSampleRate = audioContext.sampleRate;
-                log(`Audio context: ${nativeSampleRate} Hz`, 'info');
+                log(`Audio context: ${nativeSampleRate} Hz, state: ${audioContext.state}`, 'info');
 
                 // Create source from microphone
-                const source = audioContext.createMediaStreamSource(mediaStream);
+                sourceNode = audioContext.createMediaStreamSource(mediaStream);
 
-                // Create script processor for audio capture
-                // Buffer size 4096 gives us ~85ms at 48kHz
-                scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-
-                // Ring buffer for accumulating downsampled audio
-                let ringBuffer = new Float32Array(0);
-
-                // For debug: track peak levels
-                let lastLogTime = 0;
-
-                scriptProcessor.onaudioprocess = (e) => {
-                    if (!isRecording) return;
-
-                    const inputData = e.inputBuffer.getChannelData(0);
-
-                    // Debug: log peak audio level and VAD result periodically
-                    const now = Date.now();
-                    if (now - lastLogTime > 1000) {
-                        let peak = 0;
-                        for (let i = 0; i < inputData.length; i++) {
-                            peak = Math.max(peak, Math.abs(inputData[i]));
-                        }
-                        // Also log downsampled peak
-                        const ds = downsampleBuffer(inputData, nativeSampleRate, TARGET_SAMPLE_RATE);
-                        let dsPeak = 0;
-                        for (let i = 0; i < ds.length; i++) {
-                            dsPeak = Math.max(dsPeak, Math.abs(ds[i]));
-                        }
-                        log(`Peak: raw=${peak.toFixed(3)}, ds=${dsPeak.toFixed(3)}`, 'info');
-                        lastLogTime = now;
+                // Try AudioWorklet first (modern, no GC issues)
+                if (useAudioWorklet && audioContext.audioWorklet) {
+                    try {
+                        await setupAudioWorklet(nativeSampleRate);
+                        return;
+                    } catch (workletErr) {
+                        log(`AudioWorklet failed: ${workletErr.message}, using fallback`, 'error');
+                        useAudioWorklet = false;
                     }
+                }
 
-                    // Downsample to 16kHz
-                    const downsampled = downsampleBuffer(inputData, nativeSampleRate, TARGET_SAMPLE_RATE);
-
-                    // Append to ring buffer
-                    const newBuffer = new Float32Array(ringBuffer.length + downsampled.length);
-                    newBuffer.set(ringBuffer);
-                    newBuffer.set(downsampled, ringBuffer.length);
-                    ringBuffer = newBuffer;
-
-                    // Process in 512-sample chunks
-                    while (ringBuffer.length >= CHUNK_SIZE) {
-                        const chunk = ringBuffer.slice(0, CHUNK_SIZE);
-                        ringBuffer = ringBuffer.slice(CHUNK_SIZE);
-
-                        const prob = processAudio(chunk);
-                        if (prob >= 0) {
-                            updateProb(prob);
-                        }
-                    }
-                };
-
-                // Connect: source -> processor -> destination
-                source.connect(scriptProcessor);
-                scriptProcessor.connect(audioContext.destination);
-
-                isRecording = true;
-                startMicBtn.style.display = 'none';
-                stopMicBtn.style.display = 'inline-block';
-                stopMicBtn.disabled = false;
-                recordingDot.className = 'recording-dot listening';
-                speechLabel.textContent = 'Listening...';
-
-                log(`Microphone active (${nativeSampleRate} Hz -> ${TARGET_SAMPLE_RATE} Hz)`, 'success');
+                // Fallback to ScriptProcessorNode
+                await setupScriptProcessor(nativeSampleRate);
 
             } catch (err) {
                 log(`Microphone error: ${err.message}`, 'error');
@@ -417,13 +468,148 @@
             }
         }
 
+        // Setup AudioWorklet (modern API, runs in separate thread, no GC issues)
+        async function setupAudioWorklet(nativeSampleRate) {
+            log('Loading AudioWorklet processor...', 'info');
+
+            // Load the processor module
+            await audioContext.audioWorklet.addModule('vad-processor.js');
+
+            // Create worklet node
+            workletNode = new AudioWorkletNode(audioContext, 'vad-processor');
+
+            // Configure the processor
+            workletNode.port.postMessage({
+                type: 'config',
+                chunkSize: CHUNK_SIZE,
+                targetSampleRate: TARGET_SAMPLE_RATE
+            });
+
+            // Handle messages from the audio thread
+            workletNode.port.onmessage = (event) => {
+                if (event.data.type === 'audioChunk') {
+                    frameCount++;
+                    const prob = processAudio(event.data.samples);
+                    if (prob >= 0) {
+                        updateProb(prob);
+                    }
+
+                    // Log periodically
+                    if (frameCount % 30 === 0) {
+                        log(`Chunk ${frameCount}: prob=${prob.toFixed(4)}`, 'info');
+                    }
+                }
+            };
+
+            // Connect: source -> worklet
+            sourceNode.connect(workletNode);
+            // Also connect to destination to keep the graph alive
+            workletNode.connect(audioContext.destination);
+
+            isRecording = true;
+            frameCount = 0;
+
+            startMicBtn.style.display = 'none';
+            stopMicBtn.style.display = 'inline-block';
+            stopMicBtn.disabled = false;
+            recordingDot.className = 'recording-dot listening';
+            speechLabel.textContent = 'Listening...';
+
+            log(`Microphone active via AudioWorklet (${nativeSampleRate} Hz -> ${TARGET_SAMPLE_RATE} Hz)`, 'success');
+        }
+
+        // Fallback: Setup ScriptProcessorNode (deprecated but works on older browsers)
+        async function setupScriptProcessor(nativeSampleRate) {
+            log('Using ScriptProcessorNode (fallback)...', 'info');
+
+            // Create a gain node (helps prevent GC of the audio graph)
+            const gainNode = audioContext.createGain();
+            gainNode.gain.value = 1.0;
+
+            // Create script processor for audio capture
+            scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1);
+
+            // Ring buffer for accumulating downsampled audio
+            let ringBuffer = new Float32Array(0);
+
+            scriptProcessor.onaudioprocess = (e) => {
+                if (!isRecording || !audioContext) return;
+
+                frameCount++;
+                const inputData = e.inputBuffer.getChannelData(0);
+
+                // Downsample to 16kHz
+                const downsampled = downsampleBuffer(inputData, nativeSampleRate, TARGET_SAMPLE_RATE);
+
+                // Append to ring buffer
+                const newBuffer = new Float32Array(ringBuffer.length + downsampled.length);
+                newBuffer.set(ringBuffer);
+                newBuffer.set(downsampled, ringBuffer.length);
+                ringBuffer = newBuffer;
+
+                // Process in 512-sample chunks
+                while (ringBuffer.length >= CHUNK_SIZE) {
+                    const chunk = ringBuffer.slice(0, CHUNK_SIZE);
+                    ringBuffer = ringBuffer.slice(CHUNK_SIZE);
+
+                    const prob = processAudio(chunk);
+                    if (prob >= 0) {
+                        updateProb(prob);
+                    }
+                }
+
+                // Log periodically
+                if (frameCount % 50 === 0) {
+                    let peak = 0;
+                    for (let i = 0; i < inputData.length; i++) {
+                        peak = Math.max(peak, Math.abs(inputData[i]));
+                    }
+                    log(`Frame ${frameCount}: peak=${peak.toFixed(3)}, ctx=${audioContext?.state}`, 'info');
+                }
+            };
+
+            // Connect: source -> gain -> processor -> destination
+            sourceNode.connect(gainNode);
+            gainNode.connect(scriptProcessor);
+            scriptProcessor.connect(audioContext.destination);
+
+            // Store references to prevent GC
+            window._vadGainNode = gainNode;
+            window._vadProcessor = scriptProcessor;
+            window._vadSource = sourceNode;
+
+            isRecording = true;
+            frameCount = 0;
+
+            startMicBtn.style.display = 'none';
+            stopMicBtn.style.display = 'inline-block';
+            stopMicBtn.disabled = false;
+            recordingDot.className = 'recording-dot listening';
+            speechLabel.textContent = 'Listening...';
+
+            log(`Microphone active via ScriptProcessor (${nativeSampleRate} Hz -> ${TARGET_SAMPLE_RATE} Hz)`, 'success');
+        }
+
         // Stop microphone capture
         function stopMicrophone() {
             isRecording = false;
 
+            // Stop AudioWorklet if using it
+            if (workletNode) {
+                workletNode.port.postMessage({ type: 'stop' });
+                workletNode.disconnect();
+                workletNode = null;
+            }
+
+            // Stop ScriptProcessor if using it
             if (scriptProcessor) {
                 scriptProcessor.disconnect();
                 scriptProcessor = null;
+            }
+
+            if (sourceNode) {
+                sourceNode.disconnect();
+                sourceNode = null;
             }
             if (audioContext) {
                 audioContext.close();
@@ -433,6 +619,11 @@
                 mediaStream.getTracks().forEach(track => track.stop());
                 mediaStream = null;
             }
+
+            // Clear window references
+            window._vadGainNode = null;
+            window._vadProcessor = null;
+            window._vadSource = null;
 
             // Reset VAD state
             if (wasm) {
@@ -450,9 +641,9 @@
 
         async function loadWasm() {
             try {
-                log('Fetching tomoul_vad.wasm...');
+                log('Fetching tomoul_silero_vad.wasm...');
 
-                const response = await fetch('/zig-out/bin/tomoul_vad.wasm');
+                const response = await fetch('tomoul_silero_vad.wasm');
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
@@ -599,6 +790,117 @@
         // Microphone controls
         startMicBtn.addEventListener('click', startMicrophone);
         stopMicBtn.addEventListener('click', stopMicrophone);
+
+        // File upload elements
+        const fileUpload = document.getElementById('file-upload');
+        const audioFileInput = document.getElementById('audio-file');
+        const fileResults = document.getElementById('file-results');
+
+        // File upload handling
+        fileUpload.addEventListener('click', () => audioFileInput.click());
+
+        fileUpload.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            fileUpload.classList.add('dragover');
+        });
+
+        fileUpload.addEventListener('dragleave', () => {
+            fileUpload.classList.remove('dragover');
+        });
+
+        fileUpload.addEventListener('drop', (e) => {
+            e.preventDefault();
+            fileUpload.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) processAudioFile(file);
+        });
+
+        audioFileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) processAudioFile(file);
+        });
+
+        async function processAudioFile(file) {
+            if (!wasm) {
+                log('VAD not initialized', 'error');
+                return;
+            }
+
+            log(`Processing file: ${file.name}`, 'info');
+
+            try {
+                // Reset VAD state first
+                wasm.reset_state();
+
+                // Create offline audio context to decode the file
+                const arrayBuffer = await file.arrayBuffer();
+
+                // Decode audio using AudioContext
+                const tempContext = new (window.AudioContext || window.webkitAudioContext)();
+                const audioBuffer = await tempContext.decodeAudioData(arrayBuffer);
+                await tempContext.close();
+
+                const nativeSampleRate = audioBuffer.sampleRate;
+                const duration = audioBuffer.duration;
+                const channelData = audioBuffer.getChannelData(0); // Mono, first channel
+
+                log(`Decoded: ${duration.toFixed(2)}s @ ${nativeSampleRate}Hz, ${channelData.length} samples`, 'info');
+
+                // Downsample to 16kHz
+                const downsampled = downsampleBuffer(channelData, nativeSampleRate, TARGET_SAMPLE_RATE);
+                log(`Downsampled to ${downsampled.length} samples @ ${TARGET_SAMPLE_RATE}Hz`, 'info');
+
+                // Process in 512-sample chunks
+                let numChunks = 0;
+                let totalProb = 0;
+                let maxProb = 0;
+                let speechChunks = 0;
+
+                for (let offset = 0; offset + CHUNK_SIZE <= downsampled.length; offset += CHUNK_SIZE) {
+                    const chunk = downsampled.slice(offset, offset + CHUNK_SIZE);
+                    const prob = processAudio(chunk);
+
+                    if (prob >= 0) {
+                        numChunks++;
+                        totalProb += prob;
+                        maxProb = Math.max(maxProb, prob);
+                        if (prob >= SPEECH_THRESHOLD) {
+                            speechChunks++;
+                        }
+                        updateProb(prob);
+                    } else {
+                        log(`Error at offset ${offset}: ${prob}`, 'error');
+                    }
+                }
+
+                const avgProb = numChunks > 0 ? totalProb / numChunks : 0;
+                const speechRatio = numChunks > 0 ? speechChunks / numChunks : 0;
+
+                log(`Done: ${numChunks} chunks, avg=${avgProb.toFixed(4)}, max=${maxProb.toFixed(4)}, speech=${(speechRatio * 100).toFixed(1)}%`, 'success');
+
+                // Update results display
+                document.getElementById('result-filename').textContent = file.name;
+                document.getElementById('result-duration').textContent = `${duration.toFixed(2)}s`;
+                document.getElementById('result-samplerate').textContent = `${nativeSampleRate}Hz → ${TARGET_SAMPLE_RATE}Hz`;
+                document.getElementById('result-chunks').textContent = numChunks;
+                document.getElementById('result-avg-prob').textContent = avgProb.toFixed(4);
+                document.getElementById('result-max-prob').textContent = maxProb.toFixed(4);
+
+                const speechDetected = maxProb >= SPEECH_THRESHOLD;
+                const speechElement = document.getElementById('result-speech');
+                speechElement.textContent = speechDetected ? `YES (${(speechRatio * 100).toFixed(1)}% of chunks)` : 'NO';
+                speechElement.className = 'result-value' + (speechDetected ? ' speech' : '');
+
+                document.getElementById('result-avg-prob').className = 'result-value' + (avgProb >= SPEECH_THRESHOLD ? ' speech' : '');
+                document.getElementById('result-max-prob').className = 'result-value' + (maxProb >= SPEECH_THRESHOLD ? ' speech' : '');
+
+                fileResults.classList.add('visible');
+
+            } catch (err) {
+                log(`Error processing file: ${err.message}`, 'error');
+                console.error(err);
+            }
+        }
 
         // Start loading
         loadWasm();
