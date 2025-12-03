@@ -12,6 +12,9 @@ pub const ModelConfig = struct {
     supports_bundled: bool = true,
     // Export symbols for the wasm module
     export_symbols: []const []const u8,
+    // Hugging Face registry info
+    hf_repo: []const u8 = "", // e.g., "tomoul/silero-vad"
+    description: []const u8 = "", // Human-readable description
 };
 
 pub const ModelKind = enum { audio, text, vision };
@@ -35,6 +38,8 @@ pub const models = [_]ModelConfig{
             "is_ready",
             "get_version",
         },
+        .hf_repo = "tomoul/silero-vad",
+        .description = "Voice Activity Detection",
     },
     // Add more models here:
     // .{

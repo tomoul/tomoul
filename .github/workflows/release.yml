@@ -1,0 +1,265 @@
+name: Release to Hugging Face
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags (e.g., v1.0.0)
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      model:
+        description: 'Model to build (leave empty for all)'
+        required: false
+        default: ''
+
+env:
+  ZIG_VERSION: '0.13.0'
+
+jobs:
+  # ==========================================================================
+  # Job 1: Build WebAssembly artifacts
+  # ==========================================================================
+  build-wasm:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        model: [silero_vad]  # Add more models here as they're implemented
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build WASM (bundled)
+        run: zig build wasm -Dmodel=${{ matrix.model }}
+
+      - name: Rename artifacts with full naming convention
+        run: |
+          mkdir -p artifacts
+          # Bundled WASM for web
+          cp zig-out/bin/tomoul_${{ matrix.model }}.wasm \
+             artifacts/tomoul_${{ matrix.model }}_web_wasm32_bundled.wasm
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-${{ matrix.model }}
+          path: artifacts/
+
+  # ==========================================================================
+  # Job 2: Build Native Linux artifacts
+  # ==========================================================================
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        model: [silero_vad]
+        arch: [x86_64, aarch64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build native Linux
+        run: |
+          # Build main executable for Linux
+          zig build -Dtarget=${{ matrix.arch }}-linux -Doptimize=ReleaseFast
+
+      - name: Rename artifacts
+        run: |
+          mkdir -p artifacts
+          if [ -f zig-out/bin/tomoul ]; then
+            cp zig-out/bin/tomoul artifacts/tomoul_linux_${{ matrix.arch }}_bundled
+          fi
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: artifacts/
+
+  # ==========================================================================
+  # Job 3: Build Native macOS artifacts
+  # ==========================================================================
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        model: [silero_vad]
+        arch: [x86_64, aarch64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build native macOS
+        run: |
+          zig build -Dtarget=${{ matrix.arch }}-macos -Doptimize=ReleaseFast
+
+      - name: Rename artifacts
+        run: |
+          mkdir -p artifacts
+          if [ -f zig-out/bin/tomoul ]; then
+            cp zig-out/bin/tomoul artifacts/tomoul_mac_${{ matrix.arch }}_bundled
+          fi
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: artifacts/
+
+  # ==========================================================================
+  # Job 4: Upload to Hugging Face
+  # ==========================================================================
+  upload-hf:
+    needs: [build-wasm, build-linux, build-macos]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Hugging Face CLI
+        run: pip install huggingface_hub
+
+      - name: Organize artifacts for upload
+        run: |
+          mkdir -p hf-upload/bin
+
+          # Collect all artifacts into bin/
+          find all-artifacts -type f \( -name "*.wasm" -o ! -name "*.*" \) -exec cp {} hf-upload/bin/ \;
+
+          # Copy model weights
+          cp models/silero_vad.tl hf-upload/silero_vad.tl
+
+          # List what we're uploading
+          echo "=== Artifacts to upload ==="
+          ls -la hf-upload/
+          ls -la hf-upload/bin/
+
+      - name: Generate README for HF repo
+        run: |
+          cat > hf-upload/README.md << 'HEREDOC'
+          ---
+          license: mit
+          tags:
+            - voice-activity-detection
+            - audio
+            - zig
+            - wasm
+          ---
+
+          # Tomoul Silero VAD
+
+          Voice Activity Detection running entirely in WebAssembly or native code.
+          Built with [Tomoul](https://github.com/tomoul/tomoul) - the minimalist AI inference engine in Zig.
+
+          ## Quick Start (Browser)
+
+          ```javascript
+          // 1. Load the bundled WASM (includes model weights)
+          const response = await fetch('https://huggingface.co/tomoul/silero-vad/resolve/main/bin/tomoul_silero_vad_web_wasm32_bundled.wasm');
+          const wasm = await WebAssembly.instantiate(await response.arrayBuffer());
+
+          // 2. Initialize
+          wasm.instance.exports.init();
+
+          // 3. Process audio (512 samples @ 16kHz per chunk)
+          const prob = wasm.instance.exports.process_audio(512);
+          console.log(`Speech probability: ${prob}`);
+          ```
+
+          ## Quick Start (Linux CLI)
+
+          ```bash
+          wget https://huggingface.co/tomoul/silero-vad/resolve/main/bin/tomoul_linux_x86_64_bundled
+          chmod +x tomoul_linux_x86_64_bundled
+          ./tomoul_linux_x86_64_bundled input.wav
+          ```
+
+          ## Files
+
+          | File | Size | Description |
+          |------|------|-------------|
+          | `silero_vad.tl` | ~2MB | Raw model weights (Tomoul format) |
+          | `bin/tomoul_silero_vad_web_wasm32_bundled.wasm` | ~2.1MB | Browser WASM with embedded weights |
+          | `bin/tomoul_linux_x86_64_bundled` | ~2.5MB | Linux x64 executable |
+          | `bin/tomoul_linux_aarch64_bundled` | ~2.5MB | Linux ARM64 executable |
+          | `bin/tomoul_mac_x86_64_bundled` | ~2.5MB | macOS Intel executable |
+          | `bin/tomoul_mac_aarch64_bundled` | ~2.5MB | macOS Apple Silicon executable |
+
+          ## API
+
+          ```c
+          // Initialize the VAD model
+          uint32_t init(void);
+
+          // Get pointer to input buffer (write f32 samples here)
+          float* get_input_buffer_ptr(void);
+
+          // Process audio and return speech probability [0.0, 1.0]
+          float process_audio(size_t num_samples);
+
+          // Reset state between audio streams
+          void reset_state(void);
+          ```
+
+          ## License
+
+          MIT License - See [Tomoul](https://github.com/tomoul/tomoul) for details.
+          HEREDOC
+
+      - name: Upload to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Login to Hugging Face
+          huggingface-cli login --token $HF_TOKEN
+
+          # Upload to the tomoul/silero-vad repo
+          huggingface-cli upload tomoul/silero-vad hf-upload/ . \
+            --repo-type model \
+            --commit-message "Release ${{ github.ref_name }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            all-artifacts/**/*
+          body: |
+            ## Tomoul Release ${{ github.ref_name }}
+
+            ### Downloads
+
+            **WebAssembly (Browser)**
+            - [tomoul_silero_vad_web_wasm32_bundled.wasm](https://huggingface.co/tomoul/silero-vad/resolve/main/bin/tomoul_silero_vad_web_wasm32_bundled.wasm)
+
+            **Native Binaries**
+            - Linux x64: `tomoul_linux_x86_64_bundled`
+            - Linux ARM64: `tomoul_linux_aarch64_bundled`
+            - macOS Intel: `tomoul_mac_x86_64_bundled`
+            - macOS Apple Silicon: `tomoul_mac_aarch64_bundled`
+
+            ### Hugging Face
+            All artifacts are also available at: https://huggingface.co/tomoul/silero-vad
