@@ -1,7 +1,7 @@
 const std = @import("std");
-const Tensor = @import("../core/tensor.zig").Tensor;
-const ops = @import("../core/ops.zig");
-const loader_mod = @import("../core/loader.zig");
+const Tensor = @import("../../core/tensor.zig").Tensor;
+const ops = @import("../../core/ops.zig");
+const loader_mod = @import("../../core/loader.zig");
 const ModelLoader = loader_mod.ModelLoader;
 const LoadError = loader_mod.LoadError;
 

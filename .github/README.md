@@ -63,6 +63,21 @@ This means:
 - Just add to `model_registry.zig` and push a tag
 - The workflow parses `hf_repo`, `weights_path`, and `description` automatically
 
+## Model Weight Generation
+
+Model weights (`.tl` files) are **generated at build time**, not stored in git:
+
+```yaml
+# Job 1: generate-weights
+python tools/export_{model}.py  # Downloads from torch.hub, exports to .tl
+```
+
+This approach:
+- **No binary files in git** - keeps repo small
+- **No storage costs** - no Git LFS needed
+- **Always fresh** - uses latest upstream weights
+- **Reproducible** - same export script, same output
+
 ## Current Models
 
 From `model_registry.zig`:
@@ -112,13 +127,22 @@ Add `HF_TOKEN` to repository secrets:
 
 ### Adding New Models
 
-1. Add model to `model_registry.zig`:
+1. Create the model folder with all files:
+   ```
+   src/models/{model_name}/
+   ├── model.zig   # Model implementation
+   ├── wasm.zig    # WebAssembly binding (browser/WASM)
+   └── c.zig       # C API binding (native libraries)
+   ```
+
+2. Add model to `model_registry.zig`:
    ```zig
    .{
        .name = "new_model",
        .kind = .audio,  // or .text, .vision
-       .wasm_binding = "src/bindings/wasm_new_model.zig",
-       .model_module = "src/models/new_model.zig",
+       .wasm_binding = "src/models/new_model/wasm.zig",
+       .c_binding = "src/models/new_model/c.zig",
+       .model_module = "src/models/new_model/model.zig",
        .weights_path = "models/new_model.tl",
        .hf_repo = "tomoul/new-model",
        .description = "Model Description",
@@ -126,9 +150,33 @@ Add `HF_TOKEN` to repository secrets:
    },
    ```
 
-2. Push a version tag - the workflow auto-discovers your new model!
+3. Create export script at `tools/export_new_model.py`:
+   - Downloads model from upstream (e.g., torch.hub)
+   - Exports weights to `models/new_model.tl`
+   - See `tools/export_silero_vad.py` as reference
 
-3. The HF repo will be auto-created on first release.
+4. Push a version tag - the workflow auto-discovers your new model!
+
+5. The HF repo will be auto-created on first release.
+
+### Source Structure
+
+```
+src/
+├── models/                 # Each model gets its own folder
+│   ├── silero_vad/
+│   │   ├── model.zig       # Model implementation (LSTM, layers, etc.)
+│   │   ├── wasm.zig        # WASM binding for browser
+│   │   └── c.zig           # C API for native libs
+│   └── {new_model}/        # Future models follow same pattern
+│       ├── model.zig
+│       ├── wasm.zig
+│       └── c.zig
+└── core/                   # Shared inference engine
+    ├── tensor.zig          # N-dimensional tensor
+    ├── ops.zig             # Neural network operations
+    └── loader.zig          # Model weight loading
+```
 
 ## Local Release
 

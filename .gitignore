@@ -2,6 +2,13 @@
 .zig-cache/
 zig-out/
 
+# Release staging directory (artifacts uploaded to HuggingFace)
+release/
+
+# Python
+__pycache__/
+*.pyc
+
 # Editor files
 *.swp
 *.swo

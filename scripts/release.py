@@ -19,23 +19,115 @@ Setup:
 """
 
 import argparse
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-# Model registry (mirrors model_registry.zig)
-MODELS = {
-    "silero_vad": {
-        "hf_repo": "tomoul/silero-vad",
-        "weights": "models/silero_vad.tl",
-        "description": "Voice Activity Detection",
-    },
-    # Add more models here as they're implemented
-}
 
-# Build targets
+def derive_paths(model_name):
+    """
+    Derive all paths from model name using conventions.
+
+    Given model name "silero_vad", derive:
+      - wasm_binding  → src/models/silero_vad/wasm.zig
+      - c_binding     → src/models/silero_vad/c.zig
+      - model_module  → src/models/silero_vad/model.zig
+      - weights_path  → models/silero_vad.tl
+      - example_dir   → examples/silero-vad (underscores → dashes)
+      - hf_repo       → tomoul/silero-vad (underscores → dashes)
+    """
+    dashed_name = model_name.replace('_', '-')
+    return {
+        "wasm_binding": f"src/models/{model_name}/wasm.zig",
+        "c_binding": f"src/models/{model_name}/c.zig",
+        "model_module": f"src/models/{model_name}/model.zig",
+        "weights_path": f"models/{model_name}.tl",
+        "example_dir": f"examples/{dashed_name}",
+        "hf_repo": f"tomoul/{dashed_name}",
+    }
+
+
+def parse_model_registry():
+    """
+    Parse model_registry.zig to extract model configurations.
+    This is the single source of truth for all model metadata.
+
+    Paths are derived from model name using conventions (not stored in registry).
+    """
+    registry_path = Path(__file__).parent.parent / "src" / "models" / "registry.zig"
+    content = registry_path.read_text()
+
+    models = {}
+
+    # Remove single-line comments first
+    content_no_comments = re.sub(r'//[^\n]*', '', content)
+
+    # Find the models array content
+    models_match = re.search(r'pub const models = \[_\]ModelConfig\{(.*?)\};', content_no_comments, re.DOTALL)
+    if not models_match:
+        return models
+
+    models_content = models_match.group(1)
+
+    # Split into individual model blocks - match from .{ to },
+    # Need to handle nested braces in export_symbols
+    depth = 0
+    current_block = ""
+    blocks = []
+
+    for char in models_content:
+        if char == '{':
+            depth += 1
+            current_block += char
+        elif char == '}':
+            depth -= 1
+            current_block += char
+            if depth == 0 and current_block.strip():
+                blocks.append(current_block)
+                current_block = ""
+        else:
+            if depth > 0:
+                current_block += char
+
+    for block in blocks:
+        name_match = re.search(r'\.name\s*=\s*"([^"]+)"', block)
+        if not name_match:
+            continue
+        name = name_match.group(1)
+
+        # Parse fields from registry
+        description_match = re.search(r'\.description\s*=\s*"([^"]*)"', block)
+        description = description_match.group(1) if description_match else ""
+
+        # export_symbols spans multiple lines with nested braces
+        symbols_match = re.search(r'\.export_symbols\s*=\s*&\.{([^}]+)}', block, re.DOTALL)
+        symbols = []
+        if symbols_match:
+            symbols = re.findall(r'"([^"]+)"', symbols_match.group(1))
+
+        # Derive paths from model name (convention over configuration)
+        paths = derive_paths(name)
+
+        models[name] = {
+            "hf_repo": paths["hf_repo"],
+            "weights": paths["weights_path"],
+            "description": description,
+            "export_symbols": symbols,
+            "c_binding": paths["c_binding"],
+        }
+
+    return models
+
+
+# Parse model registry from Zig source (single source of truth)
+MODELS = parse_model_registry()
+
+# Build targets for executables
 TARGETS = [
     # (platform, arch, zig_target, output_suffix)
     ("web", "wasm32", "wasm32-freestanding", ".wasm"),
@@ -43,6 +135,14 @@ TARGETS = [
     ("linux", "aarch64", "aarch64-linux", ""),
     ("mac", "x86_64", "x86_64-macos", ""),
     ("mac", "aarch64", "aarch64-macos", ""),
+]
+
+# Library targets (platform, arch, zig_target, static_ext, shared_ext)
+LIB_TARGETS = [
+    ("linux", "x86_64", "x86_64-linux", ".a", ".so"),
+    ("linux", "aarch64", "aarch64-linux", ".a", ".so"),
+    ("mac", "x86_64", "x86_64-macos", ".a", ".dylib"),
+    ("mac", "aarch64", "aarch64-macos", ".a", ".dylib"),
 ]
 
 
@@ -99,6 +199,189 @@ def build_native(model_name, platform, arch, zig_target, suffix, output_dir):
         return False
 
 
+def build_library(model_name, platform, arch, zig_target, static_ext, shared_ext, lib_dir, bundled=True):
+    """Build static and shared libraries using the build system.
+
+    Args:
+        bundled: If True, embed model weights in the library (self-contained).
+                 If False, build "lite" library (user must load weights separately).
+    """
+    mode = "bundled" if bundled else "lite"
+    print(f"\n[BUILD] Libraries {platform}/{arch} for {model_name} ({mode})")
+
+    # Use ReleaseSmall for smallest binaries (strips debug symbols)
+    # bundled libs: ~2.2MB (engine + weights), lite libs: ~30KB
+    bundled_flag = "-Dbundled=true" if bundled else ""
+    result = run(f"zig build lib -Dmodel={model_name} -Dtarget={zig_target} -Doptimize=ReleaseSmall {bundled_flag}".strip())
+    if result is None:
+        print(f"  WARNING: Library build failed for {platform}/{arch}")
+        return
+
+    # Copy static library
+    static_src = Path(f"zig-out/lib/libtomoul_{model_name}{static_ext}")
+    if static_src.exists():
+        static_dst = lib_dir / f"libtomoul_{model_name}_{platform}_{arch}{static_ext}"
+        shutil.copy(static_src, static_dst)
+        print(f"  -> {static_dst}")
+    else:
+        print(f"  WARNING: Static lib {static_src} not found")
+
+    # Copy shared library
+    shared_src = Path(f"zig-out/lib/libtomoul_{model_name}{shared_ext}")
+    if shared_src.exists():
+        shared_dst = lib_dir / f"libtomoul_{model_name}_{platform}_{arch}{shared_ext}"
+        shutil.copy(shared_src, shared_dst)
+        print(f"  -> {shared_dst}")
+    else:
+        print(f"  WARNING: Shared lib {shared_src} not found")
+
+
+def parse_c_binding_functions(c_binding_path):
+    """Parse export fn declarations from a C binding Zig file."""
+    functions = []
+    if not c_binding_path or not Path(c_binding_path).exists():
+        return functions
+
+    content = Path(c_binding_path).read_text()
+
+    # Match: export fn name(params) return_type { or export fn name(params) void {
+    # Also capture the doc comment above
+    pattern = re.compile(
+        r'((?:///[^\n]*\n)*)' +  # Optional doc comments
+        r'export fn (\w+)\(([^)]*)\)\s*(\w+)',
+        re.MULTILINE
+    )
+
+    for match in pattern.finditer(content):
+        doc_comment = match.group(1)
+        func_name = match.group(2)
+        params_str = match.group(3).strip()
+        return_type = match.group(4)
+
+        # Parse parameters
+        params = []
+        if params_str:
+            for param in params_str.split(','):
+                param = param.strip()
+                if param:
+                    # Zig params: name: type
+                    parts = param.split(':')
+                    if len(parts) == 2:
+                        param_name = parts[0].strip()
+                        param_type = parts[1].strip()
+                        params.append((param_name, param_type))
+
+        # Clean up doc comment
+        doc_lines = []
+        for line in doc_comment.strip().split('\n'):
+            line = line.strip()
+            if line.startswith('///'):
+                doc_lines.append(line[3:].strip())
+
+        functions.append({
+            'name': func_name,
+            'params': params,
+            'return_type': return_type,
+            'doc': ' '.join(doc_lines),
+        })
+
+    return functions
+
+
+def zig_type_to_c(zig_type):
+    """Convert Zig type to C type."""
+    type_map = {
+        'bool': 'bool',
+        'void': 'void',
+        'f32': 'float',
+        'f64': 'double',
+        'u8': 'uint8_t',
+        'u16': 'uint16_t',
+        'u32': 'uint32_t',
+        'u64': 'uint64_t',
+        'i8': 'int8_t',
+        'i16': 'int16_t',
+        'i32': 'int32_t',
+        'i64': 'int64_t',
+        'usize': 'size_t',
+        'isize': 'ptrdiff_t',
+    }
+
+    # Handle pointer types
+    if zig_type.startswith('[*]const '):
+        inner = zig_type[9:]
+        return f'const {zig_type_to_c(inner)}*'
+    if zig_type.startswith('[*]'):
+        inner = zig_type[3:]
+        return f'{zig_type_to_c(inner)}*'
+
+    return type_map.get(zig_type, zig_type)
+
+
+def generate_c_header(model_name, include_dir):
+    """Generate C header file from C binding Zig file."""
+    print(f"\n[HEADER] Generating C header for {model_name}")
+
+    model_info = MODELS.get(model_name, {})
+    c_binding_path = model_info.get('c_binding', '')
+
+    # Get the project root
+    project_root = Path(__file__).parent.parent
+    if c_binding_path:
+        c_binding_path = project_root / c_binding_path
+
+    functions = parse_c_binding_functions(c_binding_path)
+
+    # Build function declarations
+    func_decls = []
+    for func in functions:
+        # Build C parameter list
+        c_params = []
+        for param_name, param_type in func['params']:
+            c_type = zig_type_to_c(param_type)
+            c_params.append(f'{c_type} {param_name}')
+
+        params_str = ', '.join(c_params) if c_params else 'void'
+        return_type = zig_type_to_c(func['return_type'])
+
+        # Add doc comment if present
+        if func['doc']:
+            func_decls.append(f"/** {func['doc']} */")
+
+        func_decls.append(f"{return_type} {func['name']}({params_str});")
+        func_decls.append("")
+
+    func_decls_str = '\n'.join(func_decls)
+
+    header_content = f"""/**
+ * Tomoul {model_name} - C API
+ * Auto-generated from {c_binding_path.name if c_binding_path else 'model registry'}
+ */
+
+#ifndef TOMOUL_{model_name.upper()}_H
+#define TOMOUL_{model_name.upper()}_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {{
+#endif
+
+{func_decls_str}
+#ifdef __cplusplus
+}}
+#endif
+
+#endif /* TOMOUL_{model_name.upper()}_H */
+"""
+
+    header_path = include_dir / f"tomoul_{model_name}.h"
+    header_path.write_text(header_content)
+    print(f"  -> {header_path}")
+
+
 def ensure_hf_repo_exists(repo):
     """Create HF repo if it doesn't exist."""
     from huggingface_hub import HfApi, repo_exists
@@ -144,6 +427,17 @@ def upload_to_hf(model_name, version, upload_dir):
 def generate_readme(model_name, output_dir):
     """Generate README.md for HF repo."""
     model_info = MODELS[model_name]
+    export_symbols = model_info.get("export_symbols", [])
+
+    # Build export symbols documentation from WASM binding
+    symbols_doc = ""
+    if export_symbols:
+        symbols_doc = "\n## API Reference\n\nExported functions available in the WASM module:\n\n| Function | Description |\n|----------|-------------|\n"
+        for sym in export_symbols:
+            # Function descriptions are derived from the symbol name
+            # Convert snake_case to readable description
+            desc = sym.replace('_', ' ').title()
+            symbols_doc += f"| `{sym}` | {desc} |\n"
 
     readme = f'''---
 license: mit
@@ -166,7 +460,7 @@ const wasm = await WebAssembly.instantiate(await response.arrayBuffer());
 wasm.instance.exports.init();
 const prob = wasm.instance.exports.process_audio(512);
 ```
-
+{symbols_doc}
 ## Files
 
 | File | Description |
@@ -186,6 +480,65 @@ MIT License
     readme_path = output_dir / "README.md"
     readme_path.write_text(readme)
     print(f"  -> {readme_path}")
+
+
+def sha256_file(filepath):
+    """Calculate SHA256 hash of a file."""
+    sha256 = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def generate_manifest(model_name, version, output_dir):
+    """Generate manifest.json with file hashes for programmatic access."""
+    print(f"\n[MANIFEST] Generating manifest.json")
+
+    model_info = MODELS[model_name]
+    artifacts = {}
+
+    # Scan all files in output directory and generate hashes
+    for f in sorted(output_dir.rglob("*")):
+        if f.is_file() and f.name != "manifest.json":
+            rel_path = str(f.relative_to(output_dir))
+            file_hash = sha256_file(f)
+            file_size = f.stat().st_size
+
+            # Categorize artifact
+            if f.suffix == ".wasm":
+                key = f"wasm_{f.stem.replace('tomoul_', '').replace('_bundled', '')}"
+            elif f.suffix in [".so", ".dylib"]:
+                key = f"lib_{f.stem.replace('libtomoul_', '').replace(model_name + '_', '')}_shared"
+            elif f.suffix == ".a":
+                key = f"lib_{f.stem.replace('libtomoul_', '').replace(model_name + '_', '')}_static"
+            elif f.suffix == ".h":
+                key = "header"
+            elif f.suffix == ".tl":
+                key = "weights"
+            elif f.suffix == ".md":
+                key = "readme"
+            elif f.parent.name == "bin" and not f.suffix:
+                key = f"bin_{f.stem.replace('tomoul_', '').replace('_bundled', '')}"
+            else:
+                key = f.stem
+
+            artifacts[key] = {
+                "file": rel_path,
+                "sha256": file_hash,
+                "size": file_size,
+            }
+
+    manifest = {
+        "model": model_name,
+        "version": version,
+        "description": model_info.get("description", ""),
+        "artifacts": artifacts,
+    }
+
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"  -> {manifest_path}")
 
 
 def main():
@@ -218,6 +571,10 @@ def main():
     output_dir.mkdir(parents=True)
     bin_dir = output_dir / "bin"
     bin_dir.mkdir()
+    lib_dir = output_dir / "lib"
+    lib_dir.mkdir()
+    include_dir = output_dir / "include"
+    include_dir.mkdir()
 
     print(f"=== Tomoul Release {args.version} ===")
     print(f"Models: {', '.join(models)}")
@@ -227,6 +584,9 @@ def main():
     for model_name in models:
         model_info = MODELS[model_name]
 
+        # Generate C header
+        generate_c_header(model_name, include_dir)
+
         # Build WASM
         build_wasm(model_name, bin_dir)
 
@@ -235,6 +595,10 @@ def main():
             for platform, arch, zig_target, suffix in TARGETS:
                 if platform != "web":
                     build_native(model_name, platform, arch, zig_target, suffix, bin_dir)
+
+            # Build libraries
+            for platform, arch, zig_target, static_ext, shared_ext in LIB_TARGETS:
+                build_library(model_name, platform, arch, zig_target, static_ext, shared_ext, lib_dir)
 
         # Copy weights
         weights_src = Path(model_info["weights"])
@@ -246,6 +610,9 @@ def main():
         # Generate README
         print(f"\n[README] Generating README.md")
         generate_readme(model_name, output_dir)
+
+        # Generate manifest.json with SHA256 hashes
+        generate_manifest(model_name, args.version, output_dir)
 
         # Upload (unless build-only)
         if not args.build_only:

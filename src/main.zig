@@ -6,7 +6,7 @@ pub const ops = @import("core/ops.zig");
 pub const loader = @import("core/loader.zig");
 
 // Model modules
-pub const silero_vad = @import("models/silero_vad.zig");
+pub const silero_vad = @import("models/silero_vad/model.zig");
 
 // Re-export main types
 pub const Tensor = tensor.Tensor;
@@ -186,5 +186,5 @@ test {
     _ = @import("core/tensor.zig");
     _ = @import("core/ops.zig");
     _ = @import("core/loader.zig");
-    _ = @import("models/silero_vad.zig");
+    _ = @import("models/silero_vad/model.zig");
 }
