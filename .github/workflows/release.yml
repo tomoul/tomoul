@@ -16,13 +16,85 @@ env:
 
 jobs:
   # ==========================================================================
+  # Job 0: Discover models from model_registry.zig
+  # ==========================================================================
+  discover-models:
+    runs-on: ubuntu-latest
+    outputs:
+      models: ${{ steps.parse.outputs.models }}
+      models_json: ${{ steps.parse.outputs.models_json }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse model_registry.zig
+        id: parse
+        run: |
+          # Extract model names from model_registry.zig
+          # Looks for lines like: .name = "silero_vad",
+          models=$(grep -oP '\.name = "\K[^"]+' model_registry.zig)
+
+          # Convert to JSON array for matrix
+          models_json=$(echo "$models" | jq -R -s -c 'split("\n") | map(select(. != ""))')
+
+          echo "Found models: $models"
+          echo "JSON: $models_json"
+
+          # If manual trigger with specific model, filter to just that model
+          if [ -n "${{ github.event.inputs.model }}" ]; then
+            models_json='["${{ github.event.inputs.model }}"]'
+            echo "Filtered to: $models_json"
+          fi
+
+          echo "models=$models_json" >> $GITHUB_OUTPUT
+          echo "models_json=$models_json" >> $GITHUB_OUTPUT
+
+      - name: Extract model metadata
+        id: metadata
+        run: |
+          # Create a JSON file with full model metadata for the upload job
+          python3 << 'EOF'
+          import re
+          import json
+
+          with open('model_registry.zig', 'r') as f:
+              content = f.read()
+
+          # Parse model configs
+          models = {}
+          # Find each model block
+          pattern = r'\.name = "([^"]+)".*?\.weights_path = "([^"]+)".*?\.hf_repo = "([^"]*)".*?\.description = "([^"]*)"'
+
+          for match in re.finditer(pattern, content, re.DOTALL):
+              name, weights, hf_repo, desc = match.groups()
+              models[name] = {
+                  'weights_path': weights,
+                  'hf_repo': hf_repo or f'tomoul/{name.replace("_", "-")}',
+                  'description': desc or name,
+              }
+
+          print(json.dumps(models, indent=2))
+
+          with open('model_metadata.json', 'w') as f:
+              json.dump(models, f)
+          EOF
+
+          cat model_metadata.json
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-metadata
+          path: model_metadata.json
+
+  # ==========================================================================
   # Job 1: Build WebAssembly artifacts
   # ==========================================================================
   build-wasm:
+    needs: discover-models
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        model: [silero_vad]  # Add more models here as they're implemented
+        model: ${{ fromJson(needs.discover-models.outputs.models) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -52,10 +124,11 @@ jobs:
   # Job 2: Build Native Linux artifacts
   # ==========================================================================
   build-linux:
+    needs: discover-models
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        model: [silero_vad]
+        model: ${{ fromJson(needs.discover-models.outputs.models) }}
         arch: [x86_64, aarch64]
 
     steps:
@@ -81,17 +154,18 @@ jobs:
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ matrix.arch }}
+          name: linux-${{ matrix.model }}-${{ matrix.arch }}
           path: artifacts/
 
   # ==========================================================================
   # Job 3: Build Native macOS artifacts
   # ==========================================================================
   build-macos:
+    needs: discover-models
     runs-on: macos-latest
     strategy:
       matrix:
-        model: [silero_vad]
+        model: ${{ fromJson(needs.discover-models.outputs.models) }}
         arch: [x86_64, aarch64]
 
     steps:
@@ -116,23 +190,57 @@ jobs:
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}
+          name: macos-${{ matrix.model }}-${{ matrix.arch }}
           path: artifacts/
 
   # ==========================================================================
-  # Job 4: Upload to Hugging Face
+  # Job 4: Upload to Hugging Face (per model)
   # ==========================================================================
   upload-hf:
-    needs: [build-wasm, build-linux, build-macos]
+    needs: [discover-models, build-wasm, build-linux, build-macos]
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        model: ${{ fromJson(needs.discover-models.outputs.models) }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download model metadata
         uses: actions/download-artifact@v4
         with:
-          path: all-artifacts
+          name: model-metadata
+          path: .
+
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-${{ matrix.model }}
+          path: artifacts/wasm
+
+      - name: Download Linux x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-${{ matrix.model }}-x86_64
+          path: artifacts/linux-x86_64
+
+      - name: Download Linux aarch64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-${{ matrix.model }}-aarch64
+          path: artifacts/linux-aarch64
+
+      - name: Download macOS x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-${{ matrix.model }}-x86_64
+          path: artifacts/macos-x86_64
+
+      - name: Download macOS aarch64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-${{ matrix.model }}-aarch64
+          path: artifacts/macos-aarch64
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -147,82 +255,68 @@ jobs:
           mkdir -p hf-upload/bin
 
           # Collect all artifacts into bin/
-          find all-artifacts -type f \( -name "*.wasm" -o ! -name "*.*" \) -exec cp {} hf-upload/bin/ \;
+          find artifacts -type f \( -name "*.wasm" -o ! -name "*.*" \) -exec cp {} hf-upload/bin/ \;
+
+          # Get model metadata
+          MODEL_NAME="${{ matrix.model }}"
+          WEIGHTS_PATH=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(m['$MODEL_NAME']['weights_path'])")
 
           # Copy model weights
-          cp models/silero_vad.tl hf-upload/silero_vad.tl
+          if [ -f "$WEIGHTS_PATH" ]; then
+            cp "$WEIGHTS_PATH" "hf-upload/$(basename $WEIGHTS_PATH)"
+          fi
 
           # List what we're uploading
-          echo "=== Artifacts to upload ==="
+          echo "=== Artifacts to upload for $MODEL_NAME ==="
           ls -la hf-upload/
           ls -la hf-upload/bin/
 
       - name: Generate README for HF repo
         run: |
-          cat > hf-upload/README.md << 'HEREDOC'
+          MODEL_NAME="${{ matrix.model }}"
+          HF_REPO=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(m['$MODEL_NAME']['hf_repo'])")
+          DESCRIPTION=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(m['$MODEL_NAME']['description'])")
+          WEIGHTS_FILE=$(python3 -c "import json; import os; m=json.load(open('model_metadata.json')); print(os.path.basename(m['$MODEL_NAME']['weights_path']))")
+
+          cat > hf-upload/README.md << HEREDOC
           ---
           license: mit
           tags:
-            - voice-activity-detection
-            - audio
+            - tomoul
             - zig
             - wasm
           ---
 
-          # Tomoul Silero VAD
+          # Tomoul ${DESCRIPTION}
 
-          Voice Activity Detection running entirely in WebAssembly or native code.
           Built with [Tomoul](https://github.com/tomoul/tomoul) - the minimalist AI inference engine in Zig.
 
           ## Quick Start (Browser)
 
-          ```javascript
-          // 1. Load the bundled WASM (includes model weights)
-          const response = await fetch('https://huggingface.co/tomoul/silero-vad/resolve/main/bin/tomoul_silero_vad_web_wasm32_bundled.wasm');
+          \`\`\`javascript
+          const response = await fetch('https://huggingface.co/${HF_REPO}/resolve/main/bin/tomoul_${MODEL_NAME}_web_wasm32_bundled.wasm');
           const wasm = await WebAssembly.instantiate(await response.arrayBuffer());
-
-          // 2. Initialize
           wasm.instance.exports.init();
-
-          // 3. Process audio (512 samples @ 16kHz per chunk)
-          const prob = wasm.instance.exports.process_audio(512);
-          console.log(`Speech probability: ${prob}`);
-          ```
+          \`\`\`
 
           ## Quick Start (Linux CLI)
 
-          ```bash
-          wget https://huggingface.co/tomoul/silero-vad/resolve/main/bin/tomoul_linux_x86_64_bundled
+          \`\`\`bash
+          wget https://huggingface.co/${HF_REPO}/resolve/main/bin/tomoul_linux_x86_64_bundled
           chmod +x tomoul_linux_x86_64_bundled
           ./tomoul_linux_x86_64_bundled input.wav
-          ```
+          \`\`\`
 
           ## Files
 
-          | File | Size | Description |
-          |------|------|-------------|
-          | `silero_vad.tl` | ~2MB | Raw model weights (Tomoul format) |
-          | `bin/tomoul_silero_vad_web_wasm32_bundled.wasm` | ~2.1MB | Browser WASM with embedded weights |
-          | `bin/tomoul_linux_x86_64_bundled` | ~2.5MB | Linux x64 executable |
-          | `bin/tomoul_linux_aarch64_bundled` | ~2.5MB | Linux ARM64 executable |
-          | `bin/tomoul_mac_x86_64_bundled` | ~2.5MB | macOS Intel executable |
-          | `bin/tomoul_mac_aarch64_bundled` | ~2.5MB | macOS Apple Silicon executable |
-
-          ## API
-
-          ```c
-          // Initialize the VAD model
-          uint32_t init(void);
-
-          // Get pointer to input buffer (write f32 samples here)
-          float* get_input_buffer_ptr(void);
-
-          // Process audio and return speech probability [0.0, 1.0]
-          float process_audio(size_t num_samples);
-
-          // Reset state between audio streams
-          void reset_state(void);
-          ```
+          | File | Description |
+          |------|-------------|
+          | \`${WEIGHTS_FILE}\` | Raw model weights (Tomoul format) |
+          | \`bin/tomoul_${MODEL_NAME}_web_wasm32_bundled.wasm\` | Browser WASM with embedded weights |
+          | \`bin/tomoul_linux_x86_64_bundled\` | Linux x64 executable |
+          | \`bin/tomoul_linux_aarch64_bundled\` | Linux ARM64 executable |
+          | \`bin/tomoul_mac_x86_64_bundled\` | macOS Intel executable |
+          | \`bin/tomoul_mac_aarch64_bundled\` | macOS Apple Silicon executable |
 
           ## License
 
@@ -233,33 +327,55 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          MODEL_NAME="${{ matrix.model }}"
+          HF_REPO=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(m['$MODEL_NAME']['hf_repo'])")
+
           # Login to Hugging Face
           huggingface-cli login --token $HF_TOKEN
 
-          # Upload to the tomoul/silero-vad repo
-          huggingface-cli upload tomoul/silero-vad hf-upload/ . \
+          # Create repo if it doesn't exist
+          python3 << EOF
+          from huggingface_hub import HfApi, repo_exists
+          api = HfApi()
+          if not repo_exists("$HF_REPO", repo_type="model"):
+              print(f"Creating repo: $HF_REPO")
+              api.create_repo("$HF_REPO", repo_type="model", exist_ok=True)
+          EOF
+
+          # Upload
+          huggingface-cli upload "$HF_REPO" hf-upload/ . \
             --repo-type model \
             --commit-message "Release ${{ github.ref_name }}"
 
+          echo "Uploaded to: https://huggingface.co/$HF_REPO"
+
+  # ==========================================================================
+  # Job 5: Create GitHub Release
+  # ==========================================================================
+  create-release:
+    needs: [discover-models, upload-hf]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             all-artifacts/**/*
           body: |
             ## Tomoul Release ${{ github.ref_name }}
 
-            ### Downloads
-
-            **WebAssembly (Browser)**
-            - [tomoul_silero_vad_web_wasm32_bundled.wasm](https://huggingface.co/tomoul/silero-vad/resolve/main/bin/tomoul_silero_vad_web_wasm32_bundled.wasm)
-
-            **Native Binaries**
-            - Linux x64: `tomoul_linux_x86_64_bundled`
-            - Linux ARM64: `tomoul_linux_aarch64_bundled`
-            - macOS Intel: `tomoul_mac_x86_64_bundled`
-            - macOS Apple Silicon: `tomoul_mac_aarch64_bundled`
+            ### Models Released
+            ${{ needs.discover-models.outputs.models }}
 
             ### Hugging Face
-            All artifacts are also available at: https://huggingface.co/tomoul/silero-vad
+            All artifacts are available on Hugging Face:
+            - https://huggingface.co/tomoul

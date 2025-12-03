@@ -20,6 +20,20 @@ For each model in `model_registry.zig`, we build:
 | macOS | x86_64 | `x86_64-macos` | `tomoul_mac_x86_64_bundled` |
 | macOS | aarch64 | `aarch64-macos` | `tomoul_mac_aarch64_bundled` |
 
+## Dynamic Model Discovery
+
+The workflow **automatically discovers** models from `model_registry.zig`:
+
+```yaml
+# Job 0: discover-models
+models=$(grep -oP '\.name = "\K[^"]+' model_registry.zig)
+```
+
+This means:
+- **No manual matrix updates** when adding new models
+- Just add to `model_registry.zig` and push a tag
+- The workflow parses `hf_repo`, `weights_path`, and `description` automatically
+
 ## Current Models
 
 From `model_registry.zig`:
@@ -81,11 +95,7 @@ Add `HF_TOKEN` to repository secrets:
    },
    ```
 
-2. Update workflow matrix in `release.yml`:
-   ```yaml
-   matrix:
-     model: [silero_vad, new_model]
-   ```
+2. Push a version tag - the workflow auto-discovers your new model!
 
 3. The HF repo will be auto-created on first release.
 
