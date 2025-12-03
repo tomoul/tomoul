@@ -7,6 +7,10 @@ Binary Format (.tl):
 - Header (16 bytes): Magic "TOUL", Version (u32), Tensor count (u32), Reserved (u32)
 - Tensor Table: For each tensor - name, shape, data offset, data size
 - Data Section: Raw f32 data (little-endian)
+
+Output:
+- tests/fixtures/linear/model.tl - Model weights
+- tests/fixtures/linear/validation.tl - Input/output test vectors
 """
 
 import struct
@@ -48,6 +52,7 @@ class TomoulExporter:
     def export(self, output_path: str) -> Path:
         """Write all tensors to .tl file."""
         path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         tensor_count = len(self.tensors)
 
         print(f"\nExporting {tensor_count} tensors to {path}")
@@ -103,52 +108,93 @@ class TomoulExporter:
         return path
 
 
-def export_simple_model():
-    """Export a simple linear model for testing."""
-    print("Creating simple test model...")
-    print("Model: Linear(4, 8) -> ReLU -> Linear(8, 2)")
+def export_linear_fixture():
+    """
+    Export a simple y = 2x + 1 linear model for testing.
 
-    model = nn.Sequential(
-        nn.Linear(4, 8),
-        nn.ReLU(),
-        nn.Linear(8, 2)
-    )
+    This creates a deterministic, simple fixture that can be committed to git
+    and used for CI/CD testing without downloading large models.
+    """
+    print("=" * 60)
+    print("Linear Fixture Generator")
+    print("=" * 60)
+    print("\nCreating simple linear model: y = 2x + 1")
 
-    # Initialize with known values for testing
+    # Create a simple Linear(1, 1) model representing y = 2x + 1
+    model = nn.Linear(1, 1, bias=True)
+
     with torch.no_grad():
-        model[0].weight.fill_(0.1)
-        model[0].bias.fill_(0.01)
-        model[2].weight.fill_(0.2)
-        model[2].bias.fill_(0.02)
+        model.weight.fill_(2.0)  # y = 2 * x
+        model.bias.fill_(1.0)    # + 1
 
-    print("\nExtracting parameters:")
+    print("\nModel parameters:")
+    print(f"  weight: {model.weight.item()}")
+    print(f"  bias: {model.bias.item()}")
+
+    # Export model weights
     exporter = TomoulExporter()
-    exporter.add_model(model)
+    exporter.add_tensor("weight", model.weight)
+    exporter.add_tensor("bias", model.bias)
 
-    # Export to models directory
-    output_path = Path(__file__).parent.parent / "models" / "model.tl"
-    output_path.parent.mkdir(exist_ok=True)
-    exporter.export(str(output_path))
+    fixture_dir = Path(__file__).parent.parent / "tests" / "fixtures" / "linear"
+    model_path = fixture_dir / "model.tl"
+    exporter.export(str(model_path))
 
-    # Print verification data
-    print("\n" + "=" * 50)
-    print("VERIFICATION DATA (compare with Zig loader):")
-    print("=" * 50)
-    print(f"\nTensor count: {len(exporter.tensors)}")
+    # Create validation data
+    print("\n" + "=" * 60)
+    print("Creating validation data")
+    print("=" * 60)
 
-    for name, tensor in exporter.tensors.items():
-        print(f"\n{name}:")
-        print(f"  Shape: {list(tensor.shape)}")
-        flat = tensor.flatten()
-        print(f"  First 5 values: {flat[:5].tolist()}")
+    validation_exporter = TomoulExporter()
 
-    return output_path
+    # Test case 1: x = 10.0 -> y = 2*10 + 1 = 21.0
+    test_input = torch.tensor([[10.0]])
+    with torch.no_grad():
+        test_output = model(test_input)
+
+    validation_exporter.add_tensor("input", test_input)
+    validation_exporter.add_tensor("expected_output", test_output)
+
+    print(f"\nTest case: input={test_input.item():.1f} -> expected={test_output.item():.1f}")
+
+    # Test case 2: x = 0.0 -> y = 1.0
+    test_input_2 = torch.tensor([[0.0]])
+    with torch.no_grad():
+        test_output_2 = model(test_input_2)
+
+    validation_exporter.add_tensor("input_zero", test_input_2)
+    validation_exporter.add_tensor("expected_output_zero", test_output_2)
+
+    print(f"Test case: input={test_input_2.item():.1f} -> expected={test_output_2.item():.1f}")
+
+    # Test case 3: x = -5.0 -> y = -9.0
+    test_input_3 = torch.tensor([[-5.0]])
+    with torch.no_grad():
+        test_output_3 = model(test_input_3)
+
+    validation_exporter.add_tensor("input_negative", test_input_3)
+    validation_exporter.add_tensor("expected_output_negative", test_output_3)
+
+    print(f"Test case: input={test_input_3.item():.1f} -> expected={test_output_3.item():.1f}")
+
+    validation_path = fixture_dir / "validation.tl"
+    validation_exporter.export(str(validation_path))
+
+    print("\n" + "=" * 60)
+    print("Fixture Export Complete!")
+    print("=" * 60)
+    print(f"\nFiles created:")
+    print(f"  - {model_path}")
+    print(f"  - {validation_path}")
+    print(f"\nThese files can be committed to git for CI/CD testing.")
+
+    return model_path, validation_path
 
 
 def verify_file(path: Path):
     """Read and verify the exported file structure."""
     print(f"\n{'=' * 50}")
-    print("FILE VERIFICATION:")
+    print(f"FILE VERIFICATION: {path.name}")
     print("=" * 50)
 
     with open(path, 'rb') as f:
@@ -162,10 +208,9 @@ def verify_file(path: Path):
         print(f"  Magic: {magic} (expected: b'TOUL')")
         print(f"  Version: {version}")
         print(f"  Tensor count: {tensor_count}")
-        print(f"  Reserved: {reserved}")
 
         # Read tensor table
-        print(f"\nTensor Table:")
+        print(f"\nTensors:")
         for i in range(tensor_count):
             name_len = struct.unpack('<I', f.read(4))[0]
             name = f.read(name_len).decode('utf-8')
@@ -174,20 +219,17 @@ def verify_file(path: Path):
             data_offset = struct.unpack('<Q', f.read(8))[0]
             data_size = struct.unpack('<Q', f.read(8))[0]
 
-            print(f"\n  [{i}] {name}:")
-            print(f"      Shape: {shape}")
-            print(f"      Data offset: {data_offset}")
-            print(f"      Data size: {data_size} bytes")
-
-            # Read and show first few values
+            # Read first value
             current_pos = f.tell()
             f.seek(data_offset)
-            num_floats = min(5, data_size // 4)
-            values = [struct.unpack('<f', f.read(4))[0] for _ in range(num_floats)]
-            print(f"      First {num_floats} values: {values}")
+            first_val = struct.unpack('<f', f.read(4))[0]
             f.seek(current_pos)
+
+            print(f"  [{i}] {name}: shape={shape}, first_val={first_val:.4f}")
 
 
 if __name__ == "__main__":
-    output_path = export_simple_model()
-    verify_file(output_path)
+    # Export fixtures for CI/CD testing
+    model_path, validation_path = export_linear_fixture()
+    verify_file(model_path)
+    verify_file(validation_path)

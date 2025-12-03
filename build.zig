@@ -39,6 +39,29 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Integration tests (uses fixtures from tests/fixtures/)
+    // Create tomoul module from main.zig to access all exports
+    const tomoul_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const integration_module = b.createModule(.{
+        .root_source_file = b.path("tests/integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_module.addImport("tomoul", tomoul_module);
+
+    const integration_tests = b.addTest(.{
+        .root_module = integration_module,
+    });
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const integration_test_step = b.step("test-integration", "Run integration tests with fixtures");
+    integration_test_step.dependOn(&run_integration_tests.step);
+
     // WebAssembly build target
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,

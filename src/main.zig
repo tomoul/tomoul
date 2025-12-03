@@ -6,12 +6,12 @@ pub const ops = @import("core/ops.zig");
 pub const loader = @import("core/loader.zig");
 
 // Model modules
-pub const vad = @import("models/vad.zig");
+pub const silero_vad = @import("models/silero_vad.zig");
 
 // Re-export main types
 pub const Tensor = tensor.Tensor;
 pub const TensorError = tensor.TensorError;
-pub const SileroVAD = vad.SileroVAD;
+pub const SileroVAD = silero_vad.SileroVAD;
 
 pub fn main() !void {
     const print = std.debug.print;
@@ -186,5 +186,5 @@ test {
     _ = @import("core/tensor.zig");
     _ = @import("core/ops.zig");
     _ = @import("core/loader.zig");
-    _ = @import("models/vad.zig");
+    _ = @import("models/silero_vad.zig");
 }

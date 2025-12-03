@@ -3,8 +3,9 @@
 Tomoul Silero VAD Exporter
 Exports Silero VAD model weights to .tl binary format for Zig inference engine.
 
-Downloads the model from torch.hub and exports all parameters.
-Also creates a validation file with test input/output for parity testing.
+Usage:
+  python export_vad.py           # Export full Silero VAD to models/
+  python export_vad.py --tiny    # Export tiny fixture to tests/fixtures/silero_vad/
 
 Binary Format (.tl):
 - Header (16 bytes): Magic "TOUL", Version (u32), Tensor count (u32), Reserved (u32)
@@ -12,8 +13,10 @@ Binary Format (.tl):
 - Data Section: Raw f32 data (little-endian)
 """
 
+import argparse
 import struct
 import torch
+import torch.nn as nn
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -38,6 +41,7 @@ class TomoulExporter:
     def export(self, output_path: str) -> Path:
         """Write all tensors to .tl file."""
         path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         tensor_count = len(self.tensors)
 
         print(f"\nExporting {tensor_count} tensors to {path}")
@@ -93,8 +97,199 @@ class TomoulExporter:
         return path
 
 
+class TinySileroVAD(nn.Module):
+    """
+    A tiny mock VAD model with the same architecture as Silero VAD but with small dimensions.
+    Used for CI/CD testing without downloading the full 2MB model.
+
+    Architecture:
+      STFT basis -> Conv Encoder (4 layers) -> LSTM -> Decoder -> Sigmoid
+    """
+
+    def __init__(self, stft_bins=16, hidden_size=8, kernel_size=3):
+        super().__init__()
+        self.stft_bins = stft_bins
+        self.hidden_size = hidden_size
+
+        # STFT basis (mock - normally [258, 1, 256] for 16kHz)
+        # Using smaller: [stft_bins*2, 1, stft_bins*2]
+        self.stft_forward_basis = nn.Parameter(
+            torch.randn(stft_bins * 2, 1, stft_bins * 2) * 0.1
+        )
+
+        # Encoder: 4 conv layers
+        # Layer 0: [hidden_size, stft_bins+1, kernel_size]
+        self.enc0_weight = nn.Parameter(torch.randn(hidden_size, stft_bins + 1, kernel_size) * 0.1)
+        self.enc0_bias = nn.Parameter(torch.zeros(hidden_size))
+
+        # Layer 1: [hidden_size//2, hidden_size, kernel_size]
+        self.enc1_weight = nn.Parameter(torch.randn(hidden_size // 2, hidden_size, kernel_size) * 0.1)
+        self.enc1_bias = nn.Parameter(torch.zeros(hidden_size // 2))
+
+        # Layer 2: [hidden_size//2, hidden_size//2, kernel_size]
+        self.enc2_weight = nn.Parameter(torch.randn(hidden_size // 2, hidden_size // 2, kernel_size) * 0.1)
+        self.enc2_bias = nn.Parameter(torch.zeros(hidden_size // 2))
+
+        # Layer 3: [hidden_size, hidden_size//2, kernel_size]
+        self.enc3_weight = nn.Parameter(torch.randn(hidden_size, hidden_size // 2, kernel_size) * 0.1)
+        self.enc3_bias = nn.Parameter(torch.zeros(hidden_size))
+
+        # LSTM: [4*hidden_size, hidden_size] weights
+        self.lstm_weight_ih = nn.Parameter(torch.randn(4 * hidden_size, hidden_size) * 0.1)
+        self.lstm_weight_hh = nn.Parameter(torch.randn(4 * hidden_size, hidden_size) * 0.1)
+        self.lstm_bias_ih = nn.Parameter(torch.zeros(4 * hidden_size))
+        self.lstm_bias_hh = nn.Parameter(torch.zeros(4 * hidden_size))
+
+        # Decoder: [1, hidden_size, 1]
+        self.dec_weight = nn.Parameter(torch.randn(1, hidden_size, 1) * 0.1)
+        self.dec_bias = nn.Parameter(torch.zeros(1))
+
+        # LSTM state
+        self.h = None
+        self.c = None
+
+    def reset_states(self):
+        """Reset LSTM hidden and cell states."""
+        self.h = None
+        self.c = None
+
+    def forward(self, audio, sample_rate=16000):
+        """
+        Forward pass through the tiny VAD.
+        Returns a probability between 0 and 1.
+        """
+        batch_size = audio.shape[0]
+
+        # Initialize states if needed
+        if self.h is None:
+            self.h = torch.zeros(batch_size, self.hidden_size)
+            self.c = torch.zeros(batch_size, self.hidden_size)
+
+        # Simplified forward pass (just returns something deterministic based on input)
+        # Real model would do: STFT -> Conv -> LSTM -> Decoder
+
+        # Simple hash of input to get deterministic output
+        input_sum = audio.abs().mean().item()
+        x = torch.tensor([[input_sum * 0.1]])
+
+        # Simple linear combination with weights
+        gate_ih = x @ self.lstm_weight_ih[:self.hidden_size, :1].t()
+        gate_ih = gate_ih + self.lstm_bias_ih[:self.hidden_size]
+
+        # LSTM-like computation (simplified)
+        i = torch.sigmoid(gate_ih)
+        self.c = self.c * 0.9 + i * 0.1
+        self.h = torch.tanh(self.c)
+
+        # Decoder
+        out = (self.h * self.dec_weight[0, :, 0]).sum(dim=1, keepdim=True)
+        out = out + self.dec_bias
+        prob = torch.sigmoid(out)
+
+        return prob
+
+    def get_state_dict_for_export(self):
+        """Return state dict with Silero-compatible names."""
+        return {
+            "_model.stft.forward_basis_buffer": self.stft_forward_basis,
+            "_model.encoder.0.reparam_conv.weight": self.enc0_weight,
+            "_model.encoder.0.reparam_conv.bias": self.enc0_bias,
+            "_model.encoder.1.reparam_conv.weight": self.enc1_weight,
+            "_model.encoder.1.reparam_conv.bias": self.enc1_bias,
+            "_model.encoder.2.reparam_conv.weight": self.enc2_weight,
+            "_model.encoder.2.reparam_conv.bias": self.enc2_bias,
+            "_model.encoder.3.reparam_conv.weight": self.enc3_weight,
+            "_model.encoder.3.reparam_conv.bias": self.enc3_bias,
+            "_model.decoder.rnn.weight_ih": self.lstm_weight_ih,
+            "_model.decoder.rnn.weight_hh": self.lstm_weight_hh,
+            "_model.decoder.rnn.bias_ih": self.lstm_bias_ih,
+            "_model.decoder.rnn.bias_hh": self.lstm_bias_hh,
+            "_model.decoder.decoder.2.weight": self.dec_weight,
+            "_model.decoder.decoder.2.bias": self.dec_bias,
+        }
+
+
+def export_tiny_vad():
+    """
+    Export a tiny VAD model fixture for CI/CD testing.
+    Creates deterministic, small files that can be committed to git.
+    """
+    print("=" * 60)
+    print("Tiny VAD Fixture Generator")
+    print("=" * 60)
+
+    # Set seed for reproducibility
+    torch.manual_seed(42)
+
+    # Create tiny model
+    model = TinySileroVAD(stft_bins=16, hidden_size=8)
+    model.eval()
+
+    print("\nModel dimensions:")
+    print(f"  STFT bins: {model.stft_bins}")
+    print(f"  Hidden size: {model.hidden_size}")
+
+    # Export model weights
+    exporter = TomoulExporter()
+    print("\n=== Extracting Weights ===")
+    for name, tensor in model.get_state_dict_for_export().items():
+        exporter.add_tensor(name, tensor)
+
+    fixture_dir = Path(__file__).parent.parent / "tests" / "fixtures" / "silero_vad"
+    model_path = fixture_dir / "model_tiny.tl"
+    exporter.export(str(model_path))
+
+    # Create validation data
+    print("\n" + "=" * 60)
+    print("Creating Validation Data")
+    print("=" * 60)
+
+    validation_exporter = TomoulExporter()
+
+    # Test 1: Zeros
+    model.reset_states()
+    test_zeros = torch.zeros(1, 64)  # Smaller input for tiny model
+    with torch.no_grad():
+        prob_zeros = model(test_zeros)
+    validation_exporter.add_tensor("input_zeros", test_zeros)
+    validation_exporter.add_tensor("output_zeros", prob_zeros)
+    print(f"\nZeros: prob = {prob_zeros.item():.6f}")
+
+    # Test 2: Ones
+    model.reset_states()
+    test_ones = torch.ones(1, 64)
+    with torch.no_grad():
+        prob_ones = model(test_ones)
+    validation_exporter.add_tensor("input_ones", test_ones)
+    validation_exporter.add_tensor("output_ones", prob_ones)
+    print(f"Ones: prob = {prob_ones.item():.6f}")
+
+    # Test 3: Random (seeded)
+    model.reset_states()
+    torch.manual_seed(123)
+    test_random = torch.randn(1, 64) * 0.1
+    with torch.no_grad():
+        prob_random = model(test_random)
+    validation_exporter.add_tensor("input_random", test_random)
+    validation_exporter.add_tensor("output_random", prob_random)
+    print(f"Random: prob = {prob_random.item():.6f}")
+
+    validation_path = fixture_dir / "validation.tl"
+    validation_exporter.export(str(validation_path))
+
+    print("\n" + "=" * 60)
+    print("Fixture Export Complete!")
+    print("=" * 60)
+    print(f"\nFiles created:")
+    print(f"  - {model_path}")
+    print(f"  - {validation_path}")
+    print(f"\nThese files can be committed to git for CI/CD testing.")
+
+    return model_path, validation_path
+
+
 def export_silero_vad():
-    """Export Silero VAD model."""
+    """Export full Silero VAD model."""
     print("=" * 60)
     print("Silero VAD Model Exporter")
     print("=" * 60)
@@ -208,85 +403,11 @@ def export_validation_data(model):
     }
 
 
-def inspect_model_internals(model):
-    """Detailed inspection of model for implementation reference."""
-    print("\n" + "=" * 60)
-    print("Model Internals (Implementation Reference)")
-    print("=" * 60)
-
-    state_dict = model.state_dict()
-
-    # Categorize tensors
-    encoder_tensors = []
-    lstm_tensors = []
-    decoder_tensors = []
-    other_tensors = []
-
-    for name in state_dict.keys():
-        clean_name = name.replace("_orig_mod.", "")
-        if 'encoder' in clean_name or 'stft' in clean_name or 'first' in clean_name:
-            encoder_tensors.append(clean_name)
-        elif 'lstm' in clean_name or 'rnn' in clean_name:
-            lstm_tensors.append(clean_name)
-        elif 'decoder' in clean_name or 'final' in clean_name or 'out' in clean_name:
-            decoder_tensors.append(clean_name)
-        else:
-            other_tensors.append(clean_name)
-
-    print("\n[Encoder Tensors]")
-    for name in encoder_tensors:
-        param = state_dict[name.replace("_orig_mod.", "") if "_orig_mod." not in name else name]
-        print(f"  {name}: {list(param.shape)}")
-
-    print("\n[LSTM Tensors]")
-    for name in lstm_tensors:
-        # Find the original name in state_dict
-        for orig_name in state_dict.keys():
-            if name in orig_name or orig_name.replace("_orig_mod.", "") == name:
-                param = state_dict[orig_name]
-                print(f"  {name}: {list(param.shape)}")
-                break
-
-    print("\n[Decoder Tensors]")
-    for name in decoder_tensors:
-        for orig_name in state_dict.keys():
-            if name in orig_name or orig_name.replace("_orig_mod.", "") == name:
-                param = state_dict[orig_name]
-                print(f"  {name}: {list(param.shape)}")
-                break
-
-    if other_tensors:
-        print("\n[Other Tensors]")
-        for name in other_tensors:
-            for orig_name in state_dict.keys():
-                if name in orig_name or orig_name.replace("_orig_mod.", "") == name:
-                    param = state_dict[orig_name]
-                    print(f"  {name}: {list(param.shape)}")
-                    break
-
-    # LSTM specifics
-    print("\n[LSTM Gate Layout]")
-    print("PyTorch LSTM weights are packed as [input, forget, cell, output] gates")
-    print("Each gate has hidden_size rows, so total is 4*hidden_size")
-
-    for name in state_dict.keys():
-        if 'weight_ih' in name:
-            param = state_dict[name]
-            hidden_size = param.shape[0] // 4
-            input_size = param.shape[1]
-            print(f"\n  {name}:")
-            print(f"    Total shape: {list(param.shape)}")
-            print(f"    hidden_size: {hidden_size}")
-            print(f"    input_size: {input_size}")
-            print(f"    Gates: i[0:{hidden_size}], f[{hidden_size}:{2*hidden_size}], "
-                  f"g[{2*hidden_size}:{3*hidden_size}], o[{3*hidden_size}:{4*hidden_size}]")
-
-
 def verify_export(model_path: Path):
     """Read and verify the exported file structure."""
-    print("\n" + "=" * 60)
-    print("File Verification")
-    print("=" * 60)
+    print(f"\n{'=' * 50}")
+    print(f"FILE VERIFICATION: {model_path.name}")
+    print("=" * 50)
 
     with open(model_path, 'rb') as f:
         # Read header
@@ -301,7 +422,7 @@ def verify_export(model_path: Path):
         print(f"  Tensor count: {tensor_count}")
 
         # Read tensor table (just count and verify)
-        print(f"\nTensor Table ({tensor_count} entries):")
+        print(f"\nTensors:")
         for i in range(min(5, tensor_count)):  # Show first 5
             name_len = struct.unpack('<I', f.read(4))[0]
             name = f.read(name_len).decode('utf-8')
@@ -316,26 +437,34 @@ def verify_export(model_path: Path):
 
 
 if __name__ == "__main__":
-    # Export the model
-    model, exporter = export_silero_vad()
+    parser = argparse.ArgumentParser(description="Export Silero VAD model")
+    parser.add_argument("--tiny", action="store_true",
+                        help="Export a tiny mock model for CI/CD testing")
+    args = parser.parse_args()
 
-    # Inspect internals for implementation
-    inspect_model_internals(model)
+    if args.tiny:
+        # Export tiny fixture
+        model_path, validation_path = export_tiny_vad()
+        verify_export(model_path)
+        verify_export(validation_path)
+    else:
+        # Export full model
+        model, exporter = export_silero_vad()
 
-    # Create validation data
-    validation_results = export_validation_data(model)
+        # Create validation data
+        validation_results = export_validation_data(model)
 
-    # Verify exported file
-    model_path = Path(__file__).parent.parent / "models" / "silero_vad.tl"
-    verify_export(model_path)
+        # Verify exported file
+        model_path = Path(__file__).parent.parent / "models" / "silero_vad.tl"
+        verify_export(model_path)
 
-    print("\n" + "=" * 60)
-    print("Export Complete!")
-    print("=" * 60)
-    print(f"\nFiles created:")
-    print(f"  - models/silero_vad.tl (model weights)")
-    print(f"  - models/vad_validation.tl (test vectors)")
-    print(f"\nNext steps:")
-    print(f"  1. Implement LSTM cell in src/core/ops.zig")
-    print(f"  2. Create SileroVAD struct in src/models/vad.zig")
-    print(f"  3. Load weights and run inference")
+        print("\n" + "=" * 60)
+        print("Export Complete!")
+        print("=" * 60)
+        print(f"\nFiles created:")
+        print(f"  - models/silero_vad.tl (model weights)")
+        print(f"  - models/vad_validation.tl (test vectors)")
+        print(f"\nNext steps:")
+        print(f"  1. Implement LSTM cell in src/core/ops.zig")
+        print(f"  2. Create SileroVAD struct in src/models/silero_vad.zig")
+        print(f"  3. Load weights and run inference")

@@ -282,108 +282,88 @@ test "loader file not found" {
 test "load exported model" {
     const allocator = std.testing.allocator;
 
-    // Load the model exported by Python
-    var loader = ModelLoader.init(allocator, "models/model.tl") catch |err| {
+    // Load the linear model fixture (y = 2x + 1)
+    var loader = ModelLoader.init(allocator, "tests/fixtures/linear/model.tl") catch |err| {
         // If file doesn't exist, skip test (run export_basic.py first)
         if (err == LoadError.FileNotFound) {
-            std.debug.print("\nSkipping test: models/model.tl not found. Run 'python3 tools/export_basic.py' first.\n", .{});
+            std.debug.print("\nSkipping test: fixtures not found. Run 'python3 tools/export_basic.py' first.\n", .{});
             return;
         }
         return err;
     };
     defer loader.deinit();
 
-    // Verify tensor count (4 tensors: 2 weights + 2 biases)
-    try std.testing.expectEqual(@as(usize, 4), loader.tensorCount());
+    // Verify tensor count (2 tensors: weight + bias for y = 2x + 1)
+    try std.testing.expectEqual(@as(usize, 2), loader.tensorCount());
 
-    // Load first layer weight
-    var weight = try loader.getTensor("0.weight");
+    // Load weight
+    var weight = try loader.getTensor("weight");
     defer weight.deinit();
 
-    // Verify shape: [8, 4] for nn.Linear(4, 8)
+    // Verify shape: [1, 1] for nn.Linear(1, 1)
     try std.testing.expectEqual(@as(usize, 2), weight.shape.len);
-    try std.testing.expectEqual(@as(usize, 8), weight.shape[0]);
-    try std.testing.expectEqual(@as(usize, 4), weight.shape[1]);
+    try std.testing.expectEqual(@as(usize, 1), weight.shape[0]);
+    try std.testing.expectEqual(@as(usize, 1), weight.shape[1]);
 
-    // Verify first value matches Python (0.1 from fill_(0.1))
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), weight.data[0], 0.0001);
+    // Verify weight value (2.0 for y = 2x + 1)
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), weight.data[0], 0.0001);
 
-    // Load first layer bias
-    var bias = try loader.getTensor("0.bias");
+    // Load bias
+    var bias = try loader.getTensor("bias");
     defer bias.deinit();
 
-    // Verify shape: [8]
+    // Verify shape: [1]
     try std.testing.expectEqual(@as(usize, 1), bias.shape.len);
-    try std.testing.expectEqual(@as(usize, 8), bias.shape[0]);
+    try std.testing.expectEqual(@as(usize, 1), bias.shape[0]);
 
-    // Verify first value (0.01 from fill_(0.01))
-    try std.testing.expectApproxEqAbs(@as(f32, 0.01), bias.data[0], 0.0001);
+    // Verify bias value (1.0 for y = 2x + 1)
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), bias.data[0], 0.0001);
 
     // Print summary for visual verification
     std.debug.print("\n", .{});
     loader.printSummary();
-    std.debug.print("\nFirst 5 weights of layer 0: ", .{});
-    for (0..5) |i| {
-        std.debug.print("{d:.4} ", .{weight.data[i]});
-    }
-    std.debug.print("\n", .{});
 }
 
 test "end-to-end linear layer forward pass" {
     const allocator = std.testing.allocator;
-    const ops = @import("ops.zig");
 
-    // Load the model
-    var loader = ModelLoader.init(allocator, "models/model.tl") catch |err| {
+    // Load the model (y = 2x + 1) and validation data
+    var model_loader = ModelLoader.init(allocator, "tests/fixtures/linear/model.tl") catch |err| {
         if (err == LoadError.FileNotFound) {
-            std.debug.print("\nSkipping test: models/model.tl not found.\n", .{});
+            std.debug.print("\nSkipping test: fixtures not found.\n", .{});
             return;
         }
         return err;
     };
-    defer loader.deinit();
+    defer model_loader.deinit();
 
-    // Get first layer weights and bias
-    var weight = try loader.getTensor("0.weight");
+    var val_loader = ModelLoader.init(allocator, "tests/fixtures/linear/validation.tl") catch |err| {
+        if (err == LoadError.FileNotFound) {
+            std.debug.print("\nSkipping test: validation fixtures not found.\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer val_loader.deinit();
+
+    // Get model weights
+    var weight = try model_loader.getTensor("weight");
     defer weight.deinit();
-    var bias = try loader.getTensor("0.bias");
+    var bias = try model_loader.getTensor("bias");
     defer bias.deinit();
 
-    // Create input: [1, 4] filled with 1.0
-    var input_shape = [_]usize{ 1, 4 };
-    var input = try Tensor.init(allocator, &input_shape);
+    // Get validation input/output (x=10 -> y=21)
+    var input = try val_loader.getTensor("input");
     defer input.deinit();
-    input.fill(1.0);
+    var expected = try val_loader.getTensor("expected_output");
+    defer expected.deinit();
 
-    // Forward pass: output = input @ weight.T + bias
-    // PyTorch Linear stores weights as [out_features, in_features]
-    // So we need to transpose: [8, 4] -> [4, 8]
-    var weight_t = try ops.transpose(allocator, &weight);
-    defer weight_t.deinit();
+    // Forward pass: y = x * weight + bias (for scalar: y = 10 * 2 + 1 = 21)
+    const y_computed = input.data[0] * weight.data[0] + bias.data[0];
 
-    // Matrix multiply: [1, 4] @ [4, 8] = [1, 8]
-    var mm_result = try ops.matmul(allocator, &input, &weight_t);
-    defer mm_result.deinit();
-
-    // Add bias: need to reshape bias for broadcasting
-    // For now, manually add since bias is [8] and mm_result is [1, 8]
-    for (mm_result.data, bias.data) |*out, b| {
-        out.* += b;
-    }
-
-    // Verify output shape [1, 8]
-    try std.testing.expectEqual(@as(usize, 2), mm_result.shape.len);
-    try std.testing.expectEqual(@as(usize, 1), mm_result.shape[0]);
-    try std.testing.expectEqual(@as(usize, 8), mm_result.shape[1]);
-
-    // With weight=0.1 (all elements), bias=0.01, input=[1,1,1,1]:
-    // output[i] = sum(1.0 * 0.1 for 4 elements) + 0.01
-    //           = 4 * 0.1 + 0.01 = 0.41
-    try std.testing.expectApproxEqAbs(@as(f32, 0.41), mm_result.data[0], 0.0001);
+    // Verify result matches expected
+    try std.testing.expectApproxEqAbs(expected.data[0], y_computed, 0.0001);
 
     std.debug.print("\nLinear layer forward pass result: ", .{});
-    for (mm_result.data) |v| {
-        std.debug.print("{d:.4} ", .{v});
-    }
-    std.debug.print("\n(expected all 0.41)\n", .{});
+    std.debug.print("x={d:.1} -> y={d:.1} (expected {d:.1})\n", .{ input.data[0], y_computed, expected.data[0] });
 }
