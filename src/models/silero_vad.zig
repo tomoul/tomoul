@@ -191,62 +191,60 @@ pub const SileroVAD = struct {
 
     /// Compute Short-Time Fourier Transform using learned basis
     fn computeSTFT(self: *Self, audio: *const Tensor) !Tensor {
-        // The STFT basis is [258, 1, 256]
-        // We need to reshape it to [258, 256] for 1D convolution
+        // The STFT basis is [258, 1, 256] = [2*129 freq bins, 1, window_size]
+        // This is a learned STFT with 129 frequency bins (real and imaginary parts = 258)
         // Input audio is [512], we treat it as [1, 512]
+        //
+        // Silero VAD uses:
+        // - Window size (n_fft): 256
+        // - Hop size: 256 (no overlap for efficiency)
+        // - This gives us 512/256 = 2 frames for 512 samples
 
-        // Reshape audio to [1, audio_len]
         const audio_len = audio.data.len;
         var audio_2d_shape = [_]usize{ 1, audio_len };
         var audio_2d = try Tensor.init(self.allocator, &audio_2d_shape);
         errdefer audio_2d.deinit();
         @memcpy(audio_2d.data, audio.data);
 
-        // The STFT produces complex values (real + imag), but the model uses
-        // a learned basis that directly produces magnitude-like features.
-        // Shape: [258, 1, 256] -> treating as [out_ch=258, in_ch=1, kernel=256]
-        // But our conv1d expects [out_ch, in_ch, kernel], so this matches
-
-        // Perform 1D convolution: [1, 512] conv [258, 1, 256] -> [258, output_width]
-        // output_width = (512 - 256) / 1 + 1 = 257 (approximately)
-        var stft_result = try ops.conv1d(self.allocator, &audio_2d, &self.stft_basis, null, 1, 0);
+        // Perform 1D convolution with stride=256 (hop size)
+        // Shape: [1, 512] conv [258, 1, 256] with stride=256 -> [258, 2]
+        const hop_size = 256;
+        var stft_complex = try ops.conv1d(self.allocator, &audio_2d, &self.stft_basis, null, hop_size, 0);
         audio_2d.deinit();
+        errdefer stft_complex.deinit();
 
-        // Take magnitude (or in this case, ReLU since it's a learned transform)
-        ops.reluInPlace(&stft_result);
+        // STFT output is [258, T] where first 129 are real, last 129 are imaginary
+        // We need to compute magnitude: sqrt(real^2 + imag^2)
+        const num_bins = 129;
+        const time_len = stft_complex.shape[1];
 
-        return stft_result;
+        var magnitude_shape = [_]usize{ num_bins, time_len };
+        var magnitude = try Tensor.init(self.allocator, &magnitude_shape);
+        errdefer magnitude.deinit();
+
+        // Compute magnitude for each frequency bin
+        for (0..num_bins) |freq| {
+            for (0..time_len) |t| {
+                const real = stft_complex.data[freq * time_len + t];
+                const imag = stft_complex.data[(freq + num_bins) * time_len + t];
+                magnitude.data[freq * time_len + t] = @sqrt(real * real + imag * imag);
+            }
+        }
+
+        stft_complex.deinit();
+        return magnitude;
     }
 
     /// Run encoder conv layers
     fn runEncoder(self: *Self, features: *const Tensor) !Tensor {
         // Encoder consists of 4 conv layers
         // Each: Conv1d -> ReLU
+        //
+        // Layer 0: [129, T] -> [128, T'] (input is spectrogram magnitude with 129 bins)
+        // Our STFT now outputs [129, T] magnitude directly
 
-        // Layer 0: [129, T] -> [128, T'] (input is spectrogram with 129 bins)
-        // But our STFT output is [258, T], let's adjust
-        // Actually, the first encoder expects [129, T] - half the STFT output (mag only)
-        // For simplicity, we'll take the first 129 channels
-
-        // Slice to get first 129 channels
-        const in_channels = features.shape[0];
-        const time_len = features.shape[1];
-
-        // Create a view with 129 channels if needed
-        var enc_input: Tensor = undefined;
-        if (in_channels > 129) {
-            var input_shape = [_]usize{ 129, time_len };
-            enc_input = try Tensor.init(self.allocator, &input_shape);
-            errdefer enc_input.deinit();
-            // Copy first 129 channels
-            for (0..129) |c| {
-                for (0..time_len) |t| {
-                    enc_input.data[c * time_len + t] = features.data[c * time_len + t];
-                }
-            }
-        } else {
-            enc_input = try features.clone(self.allocator);
-        }
+        // Clone the input features as our starting point
+        var enc_input = try features.clone(self.allocator);
         defer enc_input.deinit();
 
         // Conv layer 0: [129, T] -> [128, T']

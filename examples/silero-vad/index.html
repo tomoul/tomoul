@@ -139,6 +139,62 @@
             color: #00d9ff;
             text-decoration: none;
         }
+        /* Speech indicator */
+        .speech-indicator {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        .recording-dot {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #444;
+            transition: background 0.1s;
+        }
+        .recording-dot.listening {
+            background: #888;
+            animation: pulse 1.5s infinite;
+        }
+        .recording-dot.speech {
+            background: #00ff88;
+            animation: pulse-fast 0.3s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        @keyframes pulse-fast {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.2); }
+        }
+        .speech-label {
+            font-weight: bold;
+            color: #888;
+            transition: color 0.1s;
+        }
+        .speech-label.speech {
+            color: #00ff88;
+        }
+        .prob-value.speech {
+            color: #00ff88;
+        }
+        .prob-value.silence {
+            color: #888;
+        }
+        button.recording {
+            background: #ff4444;
+        }
+        .mic-controls {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            margin-bottom: 1rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid #333;
+        }
     </style>
 </head>
 <body>
@@ -162,6 +218,10 @@
         </div>
 
         <div class="status-card">
+            <div class="speech-indicator">
+                <div class="recording-dot" id="recording-dot"></div>
+                <span class="speech-label" id="speech-label">Idle</span>
+            </div>
             <div class="prob-display">
                 <div class="prob-value" id="prob-value">0.0000</div>
                 <div class="prob-bar">
@@ -169,9 +229,14 @@
                 </div>
                 <p style="color: #888; margin-top: 0.5rem;">Speech Probability</p>
             </div>
+            <div class="mic-controls">
+                <button id="start-mic" disabled>Start Microphone</button>
+                <button id="stop-mic" disabled style="display: none;">Stop Microphone</button>
+            </div>
             <div class="controls">
                 <button id="test-silence" disabled>Test Silence</button>
                 <button id="test-noise" disabled>Test Noise</button>
+                <button id="test-tone" disabled>Test Tone</button>
                 <button id="reset-state" disabled>Reset State</button>
             </div>
         </div>
@@ -197,11 +262,27 @@
         const logDiv = document.getElementById('log');
         const testSilenceBtn = document.getElementById('test-silence');
         const testNoiseBtn = document.getElementById('test-noise');
+        const testToneBtn = document.getElementById('test-tone');
         const resetStateBtn = document.getElementById('reset-state');
+        const startMicBtn = document.getElementById('start-mic');
+        const stopMicBtn = document.getElementById('stop-mic');
+        const recordingDot = document.getElementById('recording-dot');
+        const speechLabel = document.getElementById('speech-label');
 
         // Wasm instance
         let wasm = null;
         let memory = null;
+
+        // Audio context and processing
+        let audioContext = null;
+        let mediaStream = null;
+        let scriptProcessor = null;
+        let isRecording = false;
+
+        // VAD settings
+        const TARGET_SAMPLE_RATE = 16000;
+        const CHUNK_SIZE = 512;
+        const SPEECH_THRESHOLD = 0.5;
 
         function log(msg, type = 'info') {
             const entry = document.createElement('div');
@@ -214,6 +295,157 @@
         function updateProb(prob) {
             probValue.textContent = prob.toFixed(4);
             probFill.style.width = `${prob * 100}%`;
+
+            // Update speech indicator
+            const isSpeech = prob >= SPEECH_THRESHOLD;
+            if (isRecording) {
+                recordingDot.className = 'recording-dot ' + (isSpeech ? 'speech' : 'listening');
+                speechLabel.className = 'speech-label ' + (isSpeech ? 'speech' : '');
+                speechLabel.textContent = isSpeech ? 'Speech Detected' : 'Listening...';
+                probValue.className = 'prob-value ' + (isSpeech ? 'speech' : 'silence');
+            }
+        }
+
+        // Downsample audio buffer from native sample rate to target rate
+        function downsampleBuffer(buffer, sampleRate, targetRate) {
+            if (targetRate === sampleRate) return buffer;
+            if (targetRate > sampleRate) {
+                throw new Error('Cannot upsample audio');
+            }
+
+            const ratio = sampleRate / targetRate;
+            const newLength = Math.floor(buffer.length / ratio);
+            const result = new Float32Array(newLength);
+
+            for (let i = 0; i < newLength; i++) {
+                result[i] = buffer[Math.floor(i * ratio)];
+            }
+            return result;
+        }
+
+        // Start microphone capture
+        async function startMicrophone() {
+            try {
+                log('Requesting microphone access...');
+
+                // Request microphone
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                // Create audio context
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const nativeSampleRate = audioContext.sampleRate;
+                log(`Audio context: ${nativeSampleRate} Hz`, 'info');
+
+                // Create source from microphone
+                const source = audioContext.createMediaStreamSource(mediaStream);
+
+                // Create script processor for audio capture
+                // Buffer size 4096 gives us ~85ms at 48kHz
+                scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                // Ring buffer for accumulating downsampled audio
+                let ringBuffer = new Float32Array(0);
+
+                // For debug: track peak levels
+                let lastLogTime = 0;
+
+                scriptProcessor.onaudioprocess = (e) => {
+                    if (!isRecording) return;
+
+                    const inputData = e.inputBuffer.getChannelData(0);
+
+                    // Debug: log peak audio level and VAD result periodically
+                    const now = Date.now();
+                    if (now - lastLogTime > 1000) {
+                        let peak = 0;
+                        for (let i = 0; i < inputData.length; i++) {
+                            peak = Math.max(peak, Math.abs(inputData[i]));
+                        }
+                        // Also log downsampled peak
+                        const ds = downsampleBuffer(inputData, nativeSampleRate, TARGET_SAMPLE_RATE);
+                        let dsPeak = 0;
+                        for (let i = 0; i < ds.length; i++) {
+                            dsPeak = Math.max(dsPeak, Math.abs(ds[i]));
+                        }
+                        log(`Peak: raw=${peak.toFixed(3)}, ds=${dsPeak.toFixed(3)}`, 'info');
+                        lastLogTime = now;
+                    }
+
+                    // Downsample to 16kHz
+                    const downsampled = downsampleBuffer(inputData, nativeSampleRate, TARGET_SAMPLE_RATE);
+
+                    // Append to ring buffer
+                    const newBuffer = new Float32Array(ringBuffer.length + downsampled.length);
+                    newBuffer.set(ringBuffer);
+                    newBuffer.set(downsampled, ringBuffer.length);
+                    ringBuffer = newBuffer;
+
+                    // Process in 512-sample chunks
+                    while (ringBuffer.length >= CHUNK_SIZE) {
+                        const chunk = ringBuffer.slice(0, CHUNK_SIZE);
+                        ringBuffer = ringBuffer.slice(CHUNK_SIZE);
+
+                        const prob = processAudio(chunk);
+                        if (prob >= 0) {
+                            updateProb(prob);
+                        }
+                    }
+                };
+
+                // Connect: source -> processor -> destination
+                source.connect(scriptProcessor);
+                scriptProcessor.connect(audioContext.destination);
+
+                isRecording = true;
+                startMicBtn.style.display = 'none';
+                stopMicBtn.style.display = 'inline-block';
+                stopMicBtn.disabled = false;
+                recordingDot.className = 'recording-dot listening';
+                speechLabel.textContent = 'Listening...';
+
+                log(`Microphone active (${nativeSampleRate} Hz -> ${TARGET_SAMPLE_RATE} Hz)`, 'success');
+
+            } catch (err) {
+                log(`Microphone error: ${err.message}`, 'error');
+                console.error(err);
+            }
+        }
+
+        // Stop microphone capture
+        function stopMicrophone() {
+            isRecording = false;
+
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+                scriptProcessor = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+
+            // Reset VAD state
+            if (wasm) {
+                wasm.reset_state();
+            }
+
+            startMicBtn.style.display = 'inline-block';
+            stopMicBtn.style.display = 'none';
+            recordingDot.className = 'recording-dot';
+            speechLabel.textContent = 'Idle';
+            probValue.className = 'prob-value';
+
+            log('Microphone stopped', 'info');
         }
 
         async function loadWasm() {
@@ -251,7 +483,9 @@
                     // Enable buttons
                     testSilenceBtn.disabled = false;
                     testNoiseBtn.disabled = false;
+                    testToneBtn.disabled = false;
                     resetStateBtn.disabled = false;
+                    startMicBtn.disabled = false;
                 } else {
                     throw new Error('init() returned failure');
                 }
@@ -311,8 +545,46 @@
                 updateProb(prob);
                 log(`Noise probability: ${prob.toFixed(6)}`, 'success');
             } else {
-                log('Error processing audio', 'error');
+                const errCodes = {'-1': 'not initialized', '-2': 'invalid sample count', '-3': 'tensor alloc failed', '-4': 'forward pass failed'};
+                log(`Error processing audio: ${errCodes[prob.toFixed(0)] || prob}`, 'error');
             }
+        });
+
+        // Test with speech-like tone (vowel-like formants)
+        testToneBtn.addEventListener('click', () => {
+            log('Testing with speech-like tone (multiple chunks)...');
+            // Generate a vowel-like sound with fundamental + harmonics
+            // F0 = 150Hz (typical male fundamental), with formants
+            const sampleRate = 16000;
+            const samples = new Float32Array(512);
+            const f0 = 150; // Fundamental frequency
+
+            for (let i = 0; i < samples.length; i++) {
+                const t = i / sampleRate;
+                // Fundamental + harmonics to simulate vowel
+                let sample = 0;
+                sample += 0.5 * Math.sin(2 * Math.PI * f0 * t);        // F0
+                sample += 0.3 * Math.sin(2 * Math.PI * f0 * 2 * t);    // 2nd harmonic
+                sample += 0.2 * Math.sin(2 * Math.PI * f0 * 3 * t);    // 3rd harmonic
+                sample += 0.1 * Math.sin(2 * Math.PI * f0 * 4 * t);    // 4th harmonic
+                sample += 0.05 * Math.sin(2 * Math.PI * 800 * t);      // Formant F1
+                sample += 0.03 * Math.sin(2 * Math.PI * 1200 * t);     // Formant F2
+                samples[i] = sample * 0.3; // Scale down
+            }
+
+            // Process multiple chunks to build up LSTM state
+            let lastProb = 0;
+            for (let chunk = 0; chunk < 5; chunk++) {
+                const prob = processAudio(samples);
+                if (prob >= 0) {
+                    lastProb = prob;
+                    log(`Chunk ${chunk + 1}: prob = ${prob.toFixed(6)}`, prob > 0.3 ? 'success' : 'info');
+                } else {
+                    log(`Error on chunk ${chunk + 1}`, 'error');
+                    break;
+                }
+            }
+            updateProb(lastProb);
         });
 
         // Reset state
@@ -323,6 +595,10 @@
                 log('VAD state reset', 'info');
             }
         });
+
+        // Microphone controls
+        startMicBtn.addEventListener('click', startMicrophone);
+        stopMicBtn.addEventListener('click', stopMicrophone);
 
         // Start loading
         loadWasm();

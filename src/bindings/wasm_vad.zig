@@ -70,20 +70,24 @@ export fn get_max_input_samples() usize {
 
 /// Process audio samples and return speech probability
 /// num_samples: Number of f32 samples written to the input buffer
-/// Returns: Speech probability [0.0, 1.0], or -1.0 on error
+/// Returns: Speech probability [0.0, 1.0], or negative on error:
+///   -1.0: Not initialized
+///   -2.0: Invalid sample count
+///   -3.0: Failed to create tensor
+///   -4.0: Forward pass failed
 export fn process_audio(num_samples: usize) f32 {
     if (!is_initialized) {
         return -1.0; // Not initialized
     }
 
     if (num_samples == 0 or num_samples > MAX_INPUT_SAMPLES) {
-        return -1.0; // Invalid sample count
+        return -2.0; // Invalid sample count
     }
 
     // Create a tensor from the input buffer
     var input_shape = [_]usize{num_samples};
     var input_tensor = Tensor.init(allocator, &input_shape) catch {
-        return -1.0;
+        return -3.0; // Failed to create tensor
     };
     defer input_tensor.deinit();
 
@@ -92,7 +96,7 @@ export fn process_audio(num_samples: usize) f32 {
 
     // Run VAD forward pass
     const prob = vad_instance.?.forward(&input_tensor) catch {
-        return -1.0;
+        return -4.0; // Forward pass failed
     };
 
     return prob;
