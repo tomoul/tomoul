@@ -22,7 +22,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       models: ${{ steps.parse.outputs.models }}
-      models_json: ${{ steps.parse.outputs.models_json }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,10 +29,7 @@ jobs:
         id: parse
         run: |
           # Extract model names from model_registry.zig
-          # Looks for lines like: .name = "silero_vad",
           models=$(grep -oP '\.name = "\K[^"]+' model_registry.zig)
-
-          # Convert to JSON array for matrix
           models_json=$(echo "$models" | jq -R -s -c 'split("\n") | map(select(. != ""))')
 
           echo "Found models: $models"
@@ -46,12 +42,9 @@ jobs:
           fi
 
           echo "models=$models_json" >> $GITHUB_OUTPUT
-          echo "models_json=$models_json" >> $GITHUB_OUTPUT
 
       - name: Extract model metadata
-        id: metadata
         run: |
-          # Create a JSON file with full model metadata for the upload job
           python3 << 'EOF'
           import re
           import json
@@ -59,9 +52,7 @@ jobs:
           with open('model_registry.zig', 'r') as f:
               content = f.read()
 
-          # Parse model configs
           models = {}
-          # Find each model block
           pattern = r'\.name = "([^"]+)".*?\.weights_path = "([^"]+)".*?\.hf_repo = "([^"]*)".*?\.description = "([^"]*)"'
 
           for match in re.finditer(pattern, content, re.DOTALL):
@@ -72,13 +63,10 @@ jobs:
                   'description': desc or name,
               }
 
-          print(json.dumps(models, indent=2))
-
           with open('model_metadata.json', 'w') as f:
-              json.dump(models, f)
+              json.dump(models, f, indent=2)
+          print(json.dumps(models, indent=2))
           EOF
-
-          cat model_metadata.json
 
       - name: Upload metadata
         uses: actions/upload-artifact@v4
@@ -87,7 +75,98 @@ jobs:
           path: model_metadata.json
 
   # ==========================================================================
-  # Job 1: Build WebAssembly artifacts
+  # Job 1: Generate C Header
+  # ==========================================================================
+  generate-header:
+    needs: discover-models
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        model: ${{ fromJson(needs.discover-models.outputs.models) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate C header
+        run: |
+          mkdir -p artifacts/include
+          MODEL="${{ matrix.model }}"
+
+          # Generate C header for FFI
+          cat > artifacts/include/tomoul_${MODEL}.h << 'HEADER'
+          /**
+           * Tomoul ${{ matrix.model }} - C API
+           * Auto-generated header for FFI integration
+           */
+
+          #ifndef TOMOUL_${{ matrix.model }}_H
+          #define TOMOUL_${{ matrix.model }}_H
+
+          #include <stdint.h>
+          #include <stddef.h>
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /**
+           * Initialize the model
+           * @return 1 on success, 0 on failure
+           */
+          uint32_t tomoul_init(void);
+
+          /**
+           * Check if model is initialized
+           * @return 1 if ready, 0 otherwise
+           */
+          uint32_t tomoul_is_ready(void);
+
+          /**
+           * Get pointer to input buffer
+           * Write audio samples (f32) here before calling process
+           * @return Pointer to input buffer
+           */
+          float* tomoul_get_input_buffer_ptr(void);
+
+          /**
+           * Get maximum input samples supported
+           * @return Maximum number of f32 samples
+           */
+          size_t tomoul_get_max_input_samples(void);
+
+          /**
+           * Process audio and return result
+           * @param num_samples Number of samples in input buffer
+           * @return Probability [0.0, 1.0] or negative error code
+           */
+          float tomoul_process_audio(size_t num_samples);
+
+          /**
+           * Reset model state (for new audio stream)
+           */
+          void tomoul_reset_state(void);
+
+          /**
+           * Get API version
+           * @return Version number
+           */
+          uint32_t tomoul_get_version(void);
+
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #endif /* TOMOUL_${{ matrix.model }}_H */
+          HEADER
+
+      - name: Upload header
+        uses: actions/upload-artifact@v4
+        with:
+          name: header-${{ matrix.model }}
+          path: artifacts/
+
+  # ==========================================================================
+  # Job 2: Build WebAssembly
   # ==========================================================================
   build-wasm:
     needs: discover-models
@@ -104,24 +183,23 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build WASM (bundled)
+      - name: Build WASM
         run: zig build wasm -Dmodel=${{ matrix.model }}
 
-      - name: Rename artifacts with full naming convention
+      - name: Rename artifacts
         run: |
-          mkdir -p artifacts
-          # Bundled WASM for web
+          mkdir -p artifacts/bin
           cp zig-out/bin/tomoul_${{ matrix.model }}.wasm \
-             artifacts/tomoul_${{ matrix.model }}_web_wasm32_bundled.wasm
+             artifacts/bin/tomoul_${{ matrix.model }}_web_wasm32_bundled.wasm
 
-      - name: Upload WASM artifacts
+      - name: Upload WASM
         uses: actions/upload-artifact@v4
         with:
           name: wasm-${{ matrix.model }}
           path: artifacts/
 
   # ==========================================================================
-  # Job 2: Build Native Linux artifacts
+  # Job 3: Build Linux (executable, static lib, shared lib)
   # ==========================================================================
   build-linux:
     needs: discover-models
@@ -139,17 +217,58 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build native Linux
+      - name: Build Linux artifacts
         run: |
-          # Build main executable for Linux
-          zig build -Dtarget=${{ matrix.arch }}-linux -Doptimize=ReleaseFast
+          TARGET="${{ matrix.arch }}-linux"
+          MODEL="${{ matrix.model }}"
 
-      - name: Rename artifacts
+          # Build executable
+          zig build -Dtarget=$TARGET -Doptimize=ReleaseFast
+
+          # Build static library (.a)
+          zig build-lib src/bindings/wasm_vad.zig \
+            -target $TARGET \
+            -OReleaseFast \
+            --name tomoul_${MODEL} \
+            -fno-emit-bin \
+            -femit-static-lib || echo "Static lib build skipped"
+
+          # Build shared library (.so)
+          zig build-lib src/bindings/wasm_vad.zig \
+            -target $TARGET \
+            -OReleaseFast \
+            --name tomoul_${MODEL} \
+            -fno-emit-bin \
+            -femit-shared-lib || echo "Shared lib build skipped"
+
+      - name: Organize artifacts
         run: |
-          mkdir -p artifacts
+          mkdir -p artifacts/bin artifacts/lib
+          MODEL="${{ matrix.model }}"
+          ARCH="${{ matrix.arch }}"
+
+          # Executable
           if [ -f zig-out/bin/tomoul ]; then
-            cp zig-out/bin/tomoul artifacts/tomoul_linux_${{ matrix.arch }}_bundled
+            cp zig-out/bin/tomoul artifacts/bin/tomoul_linux_${ARCH}_bundled
           fi
+
+          # Static library
+          if [ -f zig-out/lib/libtomoul_${MODEL}.a ]; then
+            cp zig-out/lib/libtomoul_${MODEL}.a artifacts/lib/libtomoul_${MODEL}_linux_${ARCH}.a
+          elif [ -f libtomoul_${MODEL}.a ]; then
+            cp libtomoul_${MODEL}.a artifacts/lib/libtomoul_${MODEL}_linux_${ARCH}.a
+          fi
+
+          # Shared library
+          if [ -f zig-out/lib/libtomoul_${MODEL}.so ]; then
+            cp zig-out/lib/libtomoul_${MODEL}.so artifacts/lib/libtomoul_${MODEL}_linux_${ARCH}.so
+          elif [ -f libtomoul_${MODEL}.so ]; then
+            cp libtomoul_${MODEL}.so artifacts/lib/libtomoul_${MODEL}_linux_${ARCH}.so
+          fi
+
+          ls -la artifacts/ || true
+          ls -la artifacts/bin/ || true
+          ls -la artifacts/lib/ || true
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
@@ -158,7 +277,7 @@ jobs:
           path: artifacts/
 
   # ==========================================================================
-  # Job 3: Build Native macOS artifacts
+  # Job 4: Build macOS (executable, static lib, dylib)
   # ==========================================================================
   build-macos:
     needs: discover-models
@@ -176,16 +295,58 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build native macOS
+      - name: Build macOS artifacts
         run: |
-          zig build -Dtarget=${{ matrix.arch }}-macos -Doptimize=ReleaseFast
+          TARGET="${{ matrix.arch }}-macos"
+          MODEL="${{ matrix.model }}"
 
-      - name: Rename artifacts
+          # Build executable
+          zig build -Dtarget=$TARGET -Doptimize=ReleaseFast
+
+          # Build static library (.a)
+          zig build-lib src/bindings/wasm_vad.zig \
+            -target $TARGET \
+            -OReleaseFast \
+            --name tomoul_${MODEL} \
+            -fno-emit-bin \
+            -femit-static-lib || echo "Static lib build skipped"
+
+          # Build dynamic library (.dylib)
+          zig build-lib src/bindings/wasm_vad.zig \
+            -target $TARGET \
+            -OReleaseFast \
+            --name tomoul_${MODEL} \
+            -fno-emit-bin \
+            -femit-shared-lib || echo "Dylib build skipped"
+
+      - name: Organize artifacts
         run: |
-          mkdir -p artifacts
+          mkdir -p artifacts/bin artifacts/lib
+          MODEL="${{ matrix.model }}"
+          ARCH="${{ matrix.arch }}"
+
+          # Executable
           if [ -f zig-out/bin/tomoul ]; then
-            cp zig-out/bin/tomoul artifacts/tomoul_mac_${{ matrix.arch }}_bundled
+            cp zig-out/bin/tomoul artifacts/bin/tomoul_mac_${ARCH}_bundled
           fi
+
+          # Static library
+          if [ -f zig-out/lib/libtomoul_${MODEL}.a ]; then
+            cp zig-out/lib/libtomoul_${MODEL}.a artifacts/lib/libtomoul_${MODEL}_mac_${ARCH}.a
+          elif [ -f libtomoul_${MODEL}.a ]; then
+            cp libtomoul_${MODEL}.a artifacts/lib/libtomoul_${MODEL}_mac_${ARCH}.a
+          fi
+
+          # Dynamic library
+          if [ -f zig-out/lib/libtomoul_${MODEL}.dylib ]; then
+            cp zig-out/lib/libtomoul_${MODEL}.dylib artifacts/lib/libtomoul_${MODEL}_mac_${ARCH}.dylib
+          elif [ -f libtomoul_${MODEL}.dylib ]; then
+            cp libtomoul_${MODEL}.dylib artifacts/lib/libtomoul_${MODEL}_mac_${ARCH}.dylib
+          fi
+
+          ls -la artifacts/ || true
+          ls -la artifacts/bin/ || true
+          ls -la artifacts/lib/ || true
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
@@ -194,10 +355,117 @@ jobs:
           path: artifacts/
 
   # ==========================================================================
-  # Job 4: Upload to Hugging Face (per model)
+  # Job 5: Build iOS (static lib only)
+  # ==========================================================================
+  build-ios:
+    needs: discover-models
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        model: ${{ fromJson(needs.discover-models.outputs.models) }}
+        arch: [aarch64]  # iOS is ARM64 only (simulator would be x86_64)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build iOS static library
+        run: |
+          MODEL="${{ matrix.model }}"
+
+          # iOS device (ARM64)
+          zig build-lib src/bindings/wasm_vad.zig \
+            -target aarch64-ios \
+            -OReleaseFast \
+            --name tomoul_${MODEL} \
+            -fno-emit-bin \
+            -femit-static-lib || echo "iOS build skipped"
+
+      - name: Organize artifacts
+        run: |
+          mkdir -p artifacts/lib
+          MODEL="${{ matrix.model }}"
+
+          if [ -f libtomoul_${MODEL}.a ]; then
+            cp libtomoul_${MODEL}.a artifacts/lib/libtomoul_${MODEL}_ios_aarch64.a
+          fi
+
+          ls -la artifacts/lib/ || true
+
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ matrix.model }}-${{ matrix.arch }}
+          path: artifacts/
+
+  # ==========================================================================
+  # Job 6: Build Android (static lib)
+  # ==========================================================================
+  build-android:
+    needs: discover-models
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        model: ${{ fromJson(needs.discover-models.outputs.models) }}
+        arch: [aarch64, x86_64]  # arm64-v8a, x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build Android static library
+        run: |
+          MODEL="${{ matrix.model }}"
+          ARCH="${{ matrix.arch }}"
+
+          # Android uses linux ABI with android OS tag
+          zig build-lib src/bindings/wasm_vad.zig \
+            -target ${ARCH}-linux-android \
+            -OReleaseFast \
+            --name tomoul_${MODEL} \
+            -fno-emit-bin \
+            -femit-static-lib || echo "Android build skipped"
+
+      - name: Organize artifacts
+        run: |
+          mkdir -p artifacts/lib
+          MODEL="${{ matrix.model }}"
+          ARCH="${{ matrix.arch }}"
+
+          # Map arch to Android ABI names
+          if [ "$ARCH" = "aarch64" ]; then
+            ABI="arm64-v8a"
+          elif [ "$ARCH" = "x86_64" ]; then
+            ABI="x86_64"
+          else
+            ABI="$ARCH"
+          fi
+
+          if [ -f libtomoul_${MODEL}.a ]; then
+            cp libtomoul_${MODEL}.a artifacts/lib/libtomoul_${MODEL}_android_${ABI}.a
+          fi
+
+          ls -la artifacts/lib/ || true
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.model }}-${{ matrix.arch }}
+          path: artifacts/
+
+  # ==========================================================================
+  # Job 7: Upload to Hugging Face
   # ==========================================================================
   upload-hf:
-    needs: [discover-models, build-wasm, build-linux, build-macos]
+    needs: [discover-models, generate-header, build-wasm, build-linux, build-macos, build-ios, build-android]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -206,41 +474,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download model metadata
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: model-metadata
-          path: .
-
-      - name: Download WASM artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wasm-${{ matrix.model }}
-          path: artifacts/wasm
-
-      - name: Download Linux x86_64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-${{ matrix.model }}-x86_64
-          path: artifacts/linux-x86_64
-
-      - name: Download Linux aarch64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-${{ matrix.model }}-aarch64
-          path: artifacts/linux-aarch64
-
-      - name: Download macOS x86_64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-${{ matrix.model }}-x86_64
-          path: artifacts/macos-x86_64
-
-      - name: Download macOS aarch64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-${{ matrix.model }}-aarch64
-          path: artifacts/macos-aarch64
+          path: all-artifacts
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -252,88 +489,133 @@ jobs:
 
       - name: Organize artifacts for upload
         run: |
-          mkdir -p hf-upload/bin
+          MODEL="${{ matrix.model }}"
+          mkdir -p hf-upload/bin hf-upload/lib hf-upload/include
 
-          # Collect all artifacts into bin/
-          find artifacts -type f \( -name "*.wasm" -o ! -name "*.*" \) -exec cp {} hf-upload/bin/ \;
+          # Copy header
+          find all-artifacts/header-${MODEL} -name "*.h" -exec cp {} hf-upload/include/ \; 2>/dev/null || true
 
-          # Get model metadata
-          MODEL_NAME="${{ matrix.model }}"
-          WEIGHTS_PATH=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(m['$MODEL_NAME']['weights_path'])")
+          # Copy WASM
+          find all-artifacts/wasm-${MODEL} -name "*.wasm" -exec cp {} hf-upload/bin/ \; 2>/dev/null || true
+
+          # Copy executables
+          find all-artifacts/linux-${MODEL}-* all-artifacts/macos-${MODEL}-* -path "*/bin/*" -type f -exec cp {} hf-upload/bin/ \; 2>/dev/null || true
+
+          # Copy libraries
+          find all-artifacts -path "*/lib/*" -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" \) -exec cp {} hf-upload/lib/ \; 2>/dev/null || true
 
           # Copy model weights
+          WEIGHTS_PATH=$(python3 -c "import json; m=json.load(open('all-artifacts/model-metadata/model_metadata.json')); print(m['$MODEL']['weights_path'])")
           if [ -f "$WEIGHTS_PATH" ]; then
             cp "$WEIGHTS_PATH" "hf-upload/$(basename $WEIGHTS_PATH)"
           fi
 
-          # List what we're uploading
-          echo "=== Artifacts to upload for $MODEL_NAME ==="
-          ls -la hf-upload/
-          ls -la hf-upload/bin/
+          echo "=== Upload structure for $MODEL ==="
+          find hf-upload -type f | head -50
 
-      - name: Generate README for HF repo
+      - name: Generate README
         run: |
-          MODEL_NAME="${{ matrix.model }}"
-          HF_REPO=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(m['$MODEL_NAME']['hf_repo'])")
-          DESCRIPTION=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(m['$MODEL_NAME']['description'])")
-          WEIGHTS_FILE=$(python3 -c "import json; import os; m=json.load(open('model_metadata.json')); print(os.path.basename(m['$MODEL_NAME']['weights_path']))")
+          MODEL="${{ matrix.model }}"
+          HF_REPO=$(python3 -c "import json; m=json.load(open('all-artifacts/model-metadata/model_metadata.json')); print(m['$MODEL']['hf_repo'])")
+          DESCRIPTION=$(python3 -c "import json; m=json.load(open('all-artifacts/model-metadata/model_metadata.json')); print(m['$MODEL']['description'])")
+          WEIGHTS_FILE=$(python3 -c "import json; import os; m=json.load(open('all-artifacts/model-metadata/model_metadata.json')); print(os.path.basename(m['$MODEL']['weights_path']))")
 
           cat > hf-upload/README.md << HEREDOC
-          ---
-          license: mit
-          tags:
-            - tomoul
-            - zig
-            - wasm
-          ---
+---
+license: mit
+tags:
+  - tomoul
+  - zig
+  - wasm
+  - voice-activity-detection
+---
 
-          # Tomoul ${DESCRIPTION}
+# Tomoul ${DESCRIPTION}
 
-          Built with [Tomoul](https://github.com/tomoul/tomoul) - the minimalist AI inference engine in Zig.
+Built with [Tomoul](https://github.com/tomoul/tomoul) - the minimalist AI inference engine in Zig.
 
-          ## Quick Start (Browser)
+## Quick Start (Browser)
 
-          \`\`\`javascript
-          const response = await fetch('https://huggingface.co/${HF_REPO}/resolve/main/bin/tomoul_${MODEL_NAME}_web_wasm32_bundled.wasm');
-          const wasm = await WebAssembly.instantiate(await response.arrayBuffer());
-          wasm.instance.exports.init();
-          \`\`\`
+\`\`\`javascript
+const response = await fetch('https://huggingface.co/${HF_REPO}/resolve/main/bin/tomoul_${MODEL}_web_wasm32_bundled.wasm');
+const wasm = await WebAssembly.instantiate(await response.arrayBuffer());
+wasm.instance.exports.init();
+const prob = wasm.instance.exports.process_audio(512);
+\`\`\`
 
-          ## Quick Start (Linux CLI)
+## Quick Start (C/C++)
 
-          \`\`\`bash
-          wget https://huggingface.co/${HF_REPO}/resolve/main/bin/tomoul_linux_x86_64_bundled
-          chmod +x tomoul_linux_x86_64_bundled
-          ./tomoul_linux_x86_64_bundled input.wav
-          \`\`\`
+\`\`\`c
+#include "tomoul_${MODEL}.h"
 
-          ## Files
+int main() {
+    tomoul_init();
+    float* buf = tomoul_get_input_buffer_ptr();
+    // Fill buf with 512 f32 audio samples @ 16kHz
+    float prob = tomoul_process_audio(512);
+    return 0;
+}
+\`\`\`
 
-          | File | Description |
-          |------|-------------|
-          | \`${WEIGHTS_FILE}\` | Raw model weights (Tomoul format) |
-          | \`bin/tomoul_${MODEL_NAME}_web_wasm32_bundled.wasm\` | Browser WASM with embedded weights |
-          | \`bin/tomoul_linux_x86_64_bundled\` | Linux x64 executable |
-          | \`bin/tomoul_linux_aarch64_bundled\` | Linux ARM64 executable |
-          | \`bin/tomoul_mac_x86_64_bundled\` | macOS Intel executable |
-          | \`bin/tomoul_mac_aarch64_bundled\` | macOS Apple Silicon executable |
+## Files
 
-          ## License
+### Model Weights
+| File | Description |
+|------|-------------|
+| \`${WEIGHTS_FILE}\` | Raw model weights (Tomoul format) |
 
-          MIT License - See [Tomoul](https://github.com/tomoul/tomoul) for details.
-          HEREDOC
+### C Header
+| File | Description |
+|------|-------------|
+| \`include/tomoul_${MODEL}.h\` | C/C++ header for FFI |
+
+### WebAssembly
+| File | Platform | Description |
+|------|----------|-------------|
+| \`bin/tomoul_${MODEL}_web_wasm32_bundled.wasm\` | Browser | WASM with embedded weights |
+
+### Executables
+| File | Platform | Arch |
+|------|----------|------|
+| \`bin/tomoul_linux_x86_64_bundled\` | Linux | x64 |
+| \`bin/tomoul_linux_aarch64_bundled\` | Linux | ARM64 |
+| \`bin/tomoul_mac_x86_64_bundled\` | macOS | Intel |
+| \`bin/tomoul_mac_aarch64_bundled\` | macOS | Apple Silicon |
+
+### Static Libraries (.a)
+| File | Platform | Arch |
+|------|----------|------|
+| \`lib/libtomoul_${MODEL}_linux_x86_64.a\` | Linux | x64 |
+| \`lib/libtomoul_${MODEL}_linux_aarch64.a\` | Linux | ARM64 |
+| \`lib/libtomoul_${MODEL}_mac_x86_64.a\` | macOS | Intel |
+| \`lib/libtomoul_${MODEL}_mac_aarch64.a\` | macOS | Apple Silicon |
+| \`lib/libtomoul_${MODEL}_ios_aarch64.a\` | iOS | ARM64 |
+| \`lib/libtomoul_${MODEL}_android_arm64-v8a.a\` | Android | arm64-v8a |
+| \`lib/libtomoul_${MODEL}_android_x86_64.a\` | Android | x86_64 |
+
+### Shared Libraries
+| File | Platform | Arch |
+|------|----------|------|
+| \`lib/libtomoul_${MODEL}_linux_x86_64.so\` | Linux | x64 |
+| \`lib/libtomoul_${MODEL}_linux_aarch64.so\` | Linux | ARM64 |
+| \`lib/libtomoul_${MODEL}_mac_x86_64.dylib\` | macOS | Intel |
+| \`lib/libtomoul_${MODEL}_mac_aarch64.dylib\` | macOS | Apple Silicon |
+
+## License
+
+MIT License - See [Tomoul](https://github.com/tomoul/tomoul) for details.
+HEREDOC
 
       - name: Upload to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          MODEL_NAME="${{ matrix.model }}"
-          HF_REPO=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(m['$MODEL_NAME']['hf_repo'])")
+          MODEL="${{ matrix.model }}"
+          HF_REPO=$(python3 -c "import json; m=json.load(open('all-artifacts/model-metadata/model_metadata.json')); print(m['$MODEL']['hf_repo'])")
 
-          # Login to Hugging Face
           huggingface-cli login --token $HF_TOKEN
 
-          # Create repo if it doesn't exist
+          # Create repo if needed
           python3 << EOF
           from huggingface_hub import HfApi, repo_exists
           api = HfApi()
@@ -342,15 +624,14 @@ jobs:
               api.create_repo("$HF_REPO", repo_type="model", exist_ok=True)
           EOF
 
-          # Upload
           huggingface-cli upload "$HF_REPO" hf-upload/ . \
             --repo-type model \
             --commit-message "Release ${{ github.ref_name }}"
 
-          echo "Uploaded to: https://huggingface.co/$HF_REPO"
+          echo "✓ Uploaded to: https://huggingface.co/$HF_REPO"
 
   # ==========================================================================
-  # Job 5: Create GitHub Release
+  # Job 8: Create GitHub Release
   # ==========================================================================
   create-release:
     needs: [discover-models, upload-hf]
@@ -376,6 +657,12 @@ jobs:
             ### Models Released
             ${{ needs.discover-models.outputs.models }}
 
+            ### Artifact Types
+            - **WASM**: Browser WebAssembly with embedded weights
+            - **Executables**: Linux/macOS CLI binaries
+            - **Static Libraries**: `.a` files for iOS, Android, Linux, macOS
+            - **Shared Libraries**: `.so` (Linux), `.dylib` (macOS)
+            - **C Headers**: FFI integration headers
+
             ### Hugging Face
-            All artifacts are available on Hugging Face:
-            - https://huggingface.co/tomoul
+            All artifacts available at: https://huggingface.co/tomoul
