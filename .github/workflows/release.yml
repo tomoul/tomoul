@@ -1,9 +1,22 @@
 name: Release to Hugging Face
 
+# ==========================================================================
+# Tag-based release workflow
+# ==========================================================================
+# Supports two tag formats:
+#   - v1.0.0           → Build ALL models (major releases)
+#   - silero_vad-v1.0.0 → Build only silero_vad model
+#   - whisper_tiny-v2.0.0 → Build only whisper_tiny model
+#
+# This allows releasing individual models without rebuilding everything.
+# For a community project with 100+ models, this prevents 900+ CI jobs.
+# ==========================================================================
+
 on:
   push:
     tags:
-      - 'v*'  # Trigger on version tags (e.g., v1.0.0)
+      - 'v*'      # All models: v1.0.0, v2.0.0-beta
+      - '*-v*'    # Single model: silero_vad-v1.0.0, whisper_tiny-v2.0.0
   workflow_dispatch:  # Allow manual trigger
     inputs:
       model:
@@ -16,41 +29,87 @@ env:
 
 jobs:
   # ==========================================================================
-  # Job 0: Discover models from model_registry.zig
+  # Job 0: Discover models from registry + parse tag for filtering
   # ==========================================================================
   discover-models:
     runs-on: ubuntu-latest
     outputs:
       models: ${{ steps.parse.outputs.models }}
+      version: ${{ steps.parse.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Parse model_registry.zig
+      - name: Parse tag and discover models
         id: parse
         run: |
-          # Extract model names from model_registry.zig (excluding comments)
-          models=$(grep -v '//' model_registry.zig | grep -oP '\.name = "\K[^"]+')
-          models_json=$(echo "$models" | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          # Get all models from registry
+          REGISTRY_PATH="src/models/registry.zig"
+          all_models=$(grep -v '//' "$REGISTRY_PATH" | grep -oP '\.name = "\K[^"]+')
+          all_models_json=$(echo "$all_models" | jq -R -s -c 'split("\n") | map(select(. != ""))')
 
-          echo "Found models: $models"
-          echo "JSON: $models_json"
+          echo "All registered models: $all_models"
 
-          # If manual trigger with specific model, filter to just that model
+          # Parse the tag to determine which model(s) to build
+          TAG="${{ github.ref_name }}"
+          echo "Tag: $TAG"
+
+          # Check if manual trigger with specific model
           if [ -n "${{ github.event.inputs.model }}" ]; then
+            # Manual trigger with specific model
             models_json='["${{ github.event.inputs.model }}"]'
-            echo "Filtered to: $models_json"
+            version="manual"
+            echo "Manual trigger for model: ${{ github.event.inputs.model }}"
+
+          elif [[ "$TAG" =~ ^v[0-9] ]]; then
+            # Tag format: v1.0.0 → build ALL models
+            models_json="$all_models_json"
+            version="$TAG"
+            echo "Building ALL models for release $TAG"
+
+          elif [[ "$TAG" =~ ^(.+)-v([0-9].*)$ ]]; then
+            # Tag format: silero_vad-v1.0.0 → build only that model
+            model_name="${BASH_REMATCH[1]}"
+            version="v${BASH_REMATCH[2]}"
+
+            # Verify the model exists in registry
+            if echo "$all_models" | grep -q "^${model_name}$"; then
+              models_json="[\"${model_name}\"]"
+              echo "Building single model: $model_name (version: $version)"
+            else
+              echo "ERROR: Model '$model_name' not found in registry!"
+              echo "Available models: $all_models"
+              exit 1
+            fi
+
+          else
+            # Unknown tag format
+            echo "ERROR: Unknown tag format: $TAG"
+            echo "Expected: v1.0.0 (all models) or model_name-v1.0.0 (single model)"
+            exit 1
           fi
 
           echo "models=$models_json" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Final models to build: $models_json"
 
       - name: Extract model metadata
         run: |
           python3 << 'EOF'
           import re
           import json
+          from pathlib import Path
 
-          with open('model_registry.zig', 'r') as f:
-              content = f.read()
+          # Derive paths from model name (convention over configuration)
+          def derive_paths(name):
+              dashed = name.replace('_', '-')
+              return {
+                  'weights_path': f'models/{name}.tl',
+                  'hf_repo': f'tomoul/{dashed}',
+                  'c_binding': f'src/models/{name}/c.zig',
+              }
+
+          registry_path = Path('src/models/registry.zig')
+          content = registry_path.read_text()
 
           # Remove comments before parsing
           content_no_comments = re.sub(r'//[^\n]*', '', content)
@@ -85,17 +144,17 @@ jobs:
                       continue
                   name = name_match.group(1)
 
-                  weights_match = re.search(r'\.weights_path\s*=\s*"([^"]+)"', block)
-                  hf_repo_match = re.search(r'\.hf_repo\s*=\s*"([^"]*)"', block)
                   desc_match = re.search(r'\.description\s*=\s*"([^"]*)"', block)
-                  c_binding_match = re.search(r'\.c_binding\s*=\s*"([^"]+)"', block)
                   symbols_match = re.search(r'\.export_symbols\s*=\s*&\.{([^}]+)}', block, re.DOTALL)
 
+                  # Derive paths from model name
+                  paths = derive_paths(name)
+
                   models[name] = {
-                      'weights_path': weights_match.group(1) if weights_match else '',
-                      'hf_repo': hf_repo_match.group(1) if hf_repo_match else f'tomoul/{name.replace("_", "-")}',
+                      'weights_path': paths['weights_path'],
+                      'hf_repo': paths['hf_repo'],
                       'description': desc_match.group(1) if desc_match else name,
-                      'c_binding': c_binding_match.group(1) if c_binding_match else '',
+                      'c_binding': paths['c_binding'],
                       'export_symbols': re.findall(r'"([^"]+)"', symbols_match.group(1)) if symbols_match else [],
                   }
 

@@ -5,8 +5,25 @@ Automated build and release infrastructure for Tomoul models.
 ## Release Workflow
 
 The [release.yml](workflows/release.yml) workflow triggers on:
-- **Version tags**: `v*` (e.g., `v1.0.0`)
+- **All models**: `v*` tags (e.g., `v1.0.0`) - builds every model in registry
+- **Single model**: `{model}-v*` tags (e.g., `silero_vad-v1.0.0`) - builds only that model
 - **Manual dispatch**: Via GitHub Actions UI
+
+### Tag-Based Release (Recommended for Scale)
+
+For a community project with many contributed models, use per-model tags to avoid rebuilding everything:
+
+```bash
+# Release a single model (9 jobs instead of 9 × N models)
+git tag silero_vad-v1.2.0
+git push origin silero_vad-v1.2.0
+
+# Release all models (rare, major releases)
+git tag v2.0.0
+git push origin v2.0.0
+```
+
+This prevents 900+ CI jobs when you have 100+ models.
 
 ## Build Matrix
 
@@ -135,27 +152,34 @@ Add `HF_TOKEN` to repository secrets:
    └── c.zig       # C API binding (native libraries)
    ```
 
-2. Add model to `model_registry.zig`:
+2. Add model to `src/models/registry.zig` (convention over configuration):
    ```zig
    .{
-       .name = "new_model",
-       .kind = .audio,  // or .text, .vision
-       .wasm_binding = "src/models/new_model/wasm.zig",
-       .c_binding = "src/models/new_model/c.zig",
-       .model_module = "src/models/new_model/model.zig",
-       .weights_path = "models/new_model.tl",
-       .hf_repo = "tomoul/new-model",
+       .name = "new_model",         // Paths are derived from this name!
+       .kind = .audio,              // or .text, .vision
        .description = "Model Description",
        .export_symbols = &.{ "init", "process", ... },
+       .has_example = false,        // Set to true if you have examples/new-model/
    },
    ```
+
+   **Paths are automatically derived:**
+   - `src/models/new_model/wasm.zig` ← wasm binding
+   - `src/models/new_model/c.zig` ← c binding
+   - `src/models/new_model/model.zig` ← model implementation
+   - `models/new_model.tl` ← weights file
+   - `tomoul/new-model` ← HuggingFace repo (underscores → dashes)
 
 3. Create export script at `tools/export_new_model.py`:
    - Downloads model from upstream (e.g., torch.hub)
    - Exports weights to `models/new_model.tl`
    - See `tools/export_silero_vad.py` as reference
 
-4. Push a version tag - the workflow auto-discovers your new model!
+4. Push a model-specific tag to release:
+   ```bash
+   git tag new_model-v1.0.0
+   git push origin new_model-v1.0.0
+   ```
 
 5. The HF repo will be auto-created on first release.
 
