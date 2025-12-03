@@ -62,22 +62,78 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests with fixtures");
     integration_test_step.dependOn(&run_integration_tests.step);
 
-    // WebAssembly build target
+    // WebAssembly build target (bundled - includes model weights)
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
     });
 
-    const wasm = b.addExecutable(.{
-        .name = "tomoul",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = wasm_target,
-            .optimize = .ReleaseSmall,
-        }),
+    // Create core modules for Wasm
+    // ops.zig and loader.zig use relative imports (tensor.zig) so we need to
+    // map "tensor.zig" to our tensor module for them to work
+    const wasm_tensor_module = b.createModule(.{
+        .root_source_file = b.path("src/core/tensor.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
     });
+
+    const wasm_ops_module = b.createModule(.{
+        .root_source_file = b.path("src/core/ops.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_ops_module.addImport("tensor.zig", wasm_tensor_module);
+
+    const wasm_loader_module = b.createModule(.{
+        .root_source_file = b.path("src/core/loader.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_loader_module.addImport("tensor.zig", wasm_tensor_module);
+
+    // Create the SileroVAD model module for Wasm
+    const wasm_vad_model = b.createModule(.{
+        .root_source_file = b.path("src/models/silero_vad.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    // Map relative imports to our wasm modules
+    wasm_vad_model.addImport("../core/tensor.zig", wasm_tensor_module);
+    wasm_vad_model.addImport("../core/ops.zig", wasm_ops_module);
+    wasm_vad_model.addImport("../core/loader.zig", wasm_loader_module);
+
+    // The binding file imports the model and exposes it to JS
+    const wasm_binding = b.createModule(.{
+        .root_source_file = b.path("src/bindings/wasm_vad.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_binding.addImport("tensor", wasm_tensor_module);
+    wasm_binding.addImport("vad", wasm_vad_model);
+    // Embed model weights
+    wasm_binding.addAnonymousImport("model_weights", .{
+        .root_source_file = b.path("models/silero_vad.tl"),
+    });
+
+    const wasm = b.addExecutable(.{
+        .name = "tomoul_vad",
+        .root_module = wasm_binding,
+    });
+
+    // Disable entry point (we use exported functions instead)
     wasm.entry = .disabled;
 
-    const wasm_step = b.step("wasm", "Build WebAssembly target");
+    // Export symbols for JavaScript access
+    wasm.root_module.export_symbol_names = &.{
+        "init",
+        "get_input_buffer_ptr",
+        "get_max_input_samples",
+        "process_audio",
+        "reset_state",
+        "is_ready",
+        "get_version",
+    };
+
+    const wasm_step = b.step("wasm", "Build WebAssembly target (bundled with model)");
     wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
 }

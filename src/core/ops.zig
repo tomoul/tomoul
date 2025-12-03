@@ -1,6 +1,9 @@
 const std = @import("std");
-const Tensor = @import("tensor.zig").Tensor;
-const TensorError = @import("tensor.zig").TensorError;
+
+// Support both module imports (Wasm build) and relative imports (native build)
+const tensor_import = @import("tensor.zig");
+const Tensor = tensor_import.Tensor;
+const TensorError = tensor_import.TensorError;
 
 /// Operations error types
 pub const OpsError = error{

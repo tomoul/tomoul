@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tomoul VAD - WebAssembly Demo</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+        h1 {
+            color: #00d9ff;
+            margin-bottom: 0.5rem;
+        }
+        .subtitle {
+            color: #888;
+            margin-bottom: 2rem;
+        }
+        .container {
+            max-width: 600px;
+            width: 100%;
+        }
+        .status-card {
+            background: #252547;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+        .status-label {
+            color: #888;
+        }
+        .status-value {
+            font-family: 'Monaco', 'Consolas', monospace;
+        }
+        .status-value.ready {
+            color: #00ff88;
+        }
+        .status-value.loading {
+            color: #ffaa00;
+        }
+        .status-value.error {
+            color: #ff4444;
+        }
+        .prob-display {
+            text-align: center;
+            padding: 2rem;
+        }
+        .prob-value {
+            font-size: 4rem;
+            font-weight: bold;
+            color: #00d9ff;
+            font-family: 'Monaco', 'Consolas', monospace;
+        }
+        .prob-bar {
+            height: 20px;
+            background: #333;
+            border-radius: 10px;
+            margin: 1rem 0;
+            overflow: hidden;
+        }
+        .prob-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d9ff, #00ff88);
+            border-radius: 10px;
+            transition: width 0.1s ease;
+            width: 0%;
+        }
+        .controls {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            margin-top: 1rem;
+        }
+        button {
+            background: #00d9ff;
+            color: #1a1a2e;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        button:hover {
+            opacity: 0.9;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .log {
+            background: #16162a;
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 0.85rem;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .log-entry {
+            margin-bottom: 0.25rem;
+            color: #888;
+        }
+        .log-entry.info {
+            color: #00d9ff;
+        }
+        .log-entry.success {
+            color: #00ff88;
+        }
+        .log-entry.error {
+            color: #ff4444;
+        }
+        .footer {
+            margin-top: 2rem;
+            color: #666;
+            font-size: 0.85rem;
+            text-align: center;
+        }
+        .footer a {
+            color: #00d9ff;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <h1>TOMOUL VAD</h1>
+    <p class="subtitle">Voice Activity Detection in WebAssembly</p>
+
+    <div class="container">
+        <div class="status-card">
+            <div class="status-row">
+                <span class="status-label">Wasm Status:</span>
+                <span id="wasm-status" class="status-value loading">Loading...</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Model Size:</span>
+                <span id="model-size" class="status-value">--</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">API Version:</span>
+                <span id="api-version" class="status-value">--</span>
+            </div>
+        </div>
+
+        <div class="status-card">
+            <div class="prob-display">
+                <div class="prob-value" id="prob-value">0.0000</div>
+                <div class="prob-bar">
+                    <div class="prob-fill" id="prob-fill"></div>
+                </div>
+                <p style="color: #888; margin-top: 0.5rem;">Speech Probability</p>
+            </div>
+            <div class="controls">
+                <button id="test-silence" disabled>Test Silence</button>
+                <button id="test-noise" disabled>Test Noise</button>
+                <button id="reset-state" disabled>Reset State</button>
+            </div>
+        </div>
+
+        <div class="status-card">
+            <h3 style="margin-bottom: 0.5rem; color: #00d9ff;">Console Log</h3>
+            <div class="log" id="log"></div>
+        </div>
+    </div>
+
+    <div class="footer">
+        <p>Tomoul - Minimalist AI Inference Engine in Zig</p>
+        <p>Running Silero VAD (~2MB) entirely in browser</p>
+    </div>
+
+    <script>
+        // DOM elements
+        const wasmStatus = document.getElementById('wasm-status');
+        const modelSize = document.getElementById('model-size');
+        const apiVersion = document.getElementById('api-version');
+        const probValue = document.getElementById('prob-value');
+        const probFill = document.getElementById('prob-fill');
+        const logDiv = document.getElementById('log');
+        const testSilenceBtn = document.getElementById('test-silence');
+        const testNoiseBtn = document.getElementById('test-noise');
+        const resetStateBtn = document.getElementById('reset-state');
+
+        // Wasm instance
+        let wasm = null;
+        let memory = null;
+
+        function log(msg, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function updateProb(prob) {
+            probValue.textContent = prob.toFixed(4);
+            probFill.style.width = `${prob * 100}%`;
+        }
+
+        async function loadWasm() {
+            try {
+                log('Fetching tomoul_vad.wasm...');
+
+                const response = await fetch('/zig-out/bin/tomoul_vad.wasm');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const wasmBytes = await response.arrayBuffer();
+                modelSize.textContent = `${(wasmBytes.byteLength / (1024 * 1024)).toFixed(2)} MB`;
+                log(`Loaded ${wasmBytes.byteLength} bytes`, 'success');
+
+                log('Instantiating WebAssembly module...');
+                const result = await WebAssembly.instantiate(wasmBytes, {
+                    env: {
+                        // Wasm may need these stubs
+                    }
+                });
+
+                wasm = result.instance.exports;
+                memory = wasm.memory;
+
+                log('Calling init()...');
+                const initResult = wasm.init();
+
+                if (initResult === 1) {
+                    wasmStatus.textContent = 'Ready';
+                    wasmStatus.className = 'status-value ready';
+                    apiVersion.textContent = `v${wasm.get_version()}`;
+                    log('VAD model initialized successfully!', 'success');
+
+                    // Enable buttons
+                    testSilenceBtn.disabled = false;
+                    testNoiseBtn.disabled = false;
+                    resetStateBtn.disabled = false;
+                } else {
+                    throw new Error('init() returned failure');
+                }
+
+            } catch (err) {
+                wasmStatus.textContent = 'Error';
+                wasmStatus.className = 'status-value error';
+                log(`Error: ${err.message}`, 'error');
+                console.error(err);
+            }
+        }
+
+        function processAudio(samples) {
+            if (!wasm) return -1;
+
+            // Get the input buffer pointer
+            const inputPtr = wasm.get_input_buffer_ptr();
+            const maxSamples = wasm.get_max_input_samples();
+
+            const numSamples = Math.min(samples.length, maxSamples);
+
+            // Write samples to Wasm memory
+            const inputBuffer = new Float32Array(memory.buffer, inputPtr, numSamples);
+            for (let i = 0; i < numSamples; i++) {
+                inputBuffer[i] = samples[i];
+            }
+
+            // Call process_audio
+            const prob = wasm.process_audio(numSamples);
+            return prob;
+        }
+
+        // Test with silence (zeros)
+        testSilenceBtn.addEventListener('click', () => {
+            log('Testing with 512 samples of silence...');
+            const silence = new Float32Array(512).fill(0);
+            const prob = processAudio(silence);
+
+            if (prob >= 0) {
+                updateProb(prob);
+                log(`Silence probability: ${prob.toFixed(6)}`, 'success');
+            } else {
+                log('Error processing audio', 'error');
+            }
+        });
+
+        // Test with random noise
+        testNoiseBtn.addEventListener('click', () => {
+            log('Testing with 512 samples of random noise...');
+            const noise = new Float32Array(512);
+            for (let i = 0; i < noise.length; i++) {
+                noise[i] = (Math.random() * 2 - 1) * 0.5; // Random values between -0.5 and 0.5
+            }
+            const prob = processAudio(noise);
+
+            if (prob >= 0) {
+                updateProb(prob);
+                log(`Noise probability: ${prob.toFixed(6)}`, 'success');
+            } else {
+                log('Error processing audio', 'error');
+            }
+        });
+
+        // Reset state
+        resetStateBtn.addEventListener('click', () => {
+            if (wasm) {
+                wasm.reset_state();
+                updateProb(0);
+                log('VAD state reset', 'info');
+            }
+        });
+
+        // Start loading
+        loadWasm();
+    </script>
+</body>
+</html>

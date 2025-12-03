@@ -25,6 +25,7 @@ pub const TensorInfo = struct {
 pub const ModelLoader = struct {
     allocator: std.mem.Allocator,
     file_data: []const u8,
+    owns_file_data: bool, // Track if we allocated file_data
     tensors: std.StringHashMap(TensorInfo),
     tensor_names: std.ArrayList([]const u8),
     version: u32,
@@ -59,6 +60,27 @@ pub const ModelLoader = struct {
         var loader = Self{
             .allocator = allocator,
             .file_data = file_data,
+            .owns_file_data = true,
+            .tensors = std.StringHashMap(TensorInfo).init(allocator),
+            .tensor_names = .{},
+            .version = 0,
+        };
+
+        try loader.parseHeader();
+        return loader;
+    }
+
+    /// Load from embedded/pre-existing bytes (does not take ownership)
+    /// Use this for Wasm builds where model is embedded via @embedFile
+    pub fn initFromBytes(allocator: std.mem.Allocator, data: []const u8) !Self {
+        if (data.len < 16) {
+            return LoadError.CorruptedFile;
+        }
+
+        var loader = Self{
+            .allocator = allocator,
+            .file_data = data,
+            .owns_file_data = false, // Don't free embedded data
             .tensors = std.StringHashMap(TensorInfo).init(allocator),
             .tensor_names = .{},
             .version = 0,
@@ -81,8 +103,10 @@ pub const ModelLoader = struct {
         // Free tensor names list
         self.tensor_names.deinit(self.allocator);
 
-        // Free file data
-        self.allocator.free(self.file_data);
+        // Free file data only if we allocated it
+        if (self.owns_file_data) {
+            self.allocator.free(self.file_data);
+        }
     }
 
     /// Parse the file header and tensor table
@@ -193,7 +217,10 @@ pub const ModelLoader = struct {
         }
 
         // Copy data from file buffer
-        const data_bytes = self.file_data[info.data_offset..][0..info.data_size];
+        // Cast u64 to usize for slice indexing (safe on wasm32 since model files are small)
+        const offset: usize = @intCast(info.data_offset);
+        const size: usize = @intCast(info.data_size);
+        const data_bytes = self.file_data[offset..][0..size];
 
         // Copy bytes to tensor data, handling potential unaligned data
         // Read f32 values byte-by-byte to handle unaligned memory

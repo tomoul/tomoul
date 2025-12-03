@@ -1,8 +1,9 @@
 const std = @import("std");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const ops = @import("../core/ops.zig");
-const ModelLoader = @import("../core/loader.zig").ModelLoader;
-const LoadError = @import("../core/loader.zig").LoadError;
+const loader_mod = @import("../core/loader.zig");
+const ModelLoader = loader_mod.ModelLoader;
+const LoadError = loader_mod.LoadError;
 
 /// Silero VAD Model
 /// Voice Activity Detection using LSTM-based architecture.
@@ -44,7 +45,18 @@ pub const SileroVAD = struct {
     pub fn init(allocator: std.mem.Allocator, model_path: []const u8) !Self {
         var loader = try ModelLoader.init(allocator, model_path);
         defer loader.deinit();
+        return Self.initFromLoader(allocator, &loader);
+    }
 
+    /// Load Silero VAD model from embedded bytes (for Wasm)
+    pub fn initFromBytes(allocator: std.mem.Allocator, model_bytes: []const u8) !Self {
+        var loader = try ModelLoader.initFromBytes(allocator, model_bytes);
+        defer loader.deinit();
+        return Self.initFromLoader(allocator, &loader);
+    }
+
+    /// Internal: Initialize from a ModelLoader
+    fn initFromLoader(allocator: std.mem.Allocator, loader: *ModelLoader) !Self {
         // Load STFT basis
         var stft_basis = try loader.getTensor("_model.stft.forward_basis_buffer");
         errdefer stft_basis.deinit();
