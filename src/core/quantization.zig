@@ -269,6 +269,299 @@ pub fn matmulF32Q8Simd(
 }
 
 // ============================================================================
+// Q4_0: Simple 4-bit Symmetric Quantization (Weight-Only)
+// ============================================================================
+
+/// Q4_0: Simple symmetric 4-bit quantization
+/// Storage: 4-byte scale + ceil(n/2) bytes of packed 4-bit data
+/// Two 4-bit values packed per byte (low nibble = even index, high nibble = odd)
+/// Used for aggressive weight compression (8x vs float32)
+pub const QuantizedTensorQ4 = struct {
+    scale: f32,
+    data: []u8, // Packed 4-bit values (2 per byte)
+    shape: []usize,
+    element_count: usize,
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    /// Initialize with given shape (data is uninitialized)
+    pub fn init(allocator: std.mem.Allocator, shape: []const usize) !Self {
+        var total: usize = 1;
+        for (shape) |dim| total *= dim;
+
+        const shape_copy = try allocator.dupe(usize, shape);
+        errdefer allocator.free(shape_copy);
+
+        // Packed bytes: ceil(total / 2)
+        const packed_size = (total + 1) / 2;
+        const data = try allocator.alloc(u8, packed_size);
+        errdefer allocator.free(data);
+
+        return .{
+            .scale = 0.0,
+            .data = data,
+            .shape = shape_copy,
+            .element_count = total,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free memory
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.data);
+        self.allocator.free(self.shape);
+    }
+
+    /// Get total number of elements
+    pub fn numel(self: *const Self) usize {
+        return self.element_count;
+    }
+
+    /// Memory size in bytes (scale + packed data)
+    pub fn sizeBytes(self: *const Self) usize {
+        return 4 + self.data.len; // 4 bytes for scale + packed bytes
+    }
+
+    /// Get compression ratio vs float32
+    pub fn compressionRatio(self: *const Self) f32 {
+        const f32_size: f32 = @floatFromInt(self.numel() * 4);
+        const q4_size: f32 = @floatFromInt(self.sizeBytes());
+        return f32_size / q4_size;
+    }
+
+    /// Get quantized value at index (unpacks from byte)
+    pub fn get(self: *const Self, idx: usize) i8 {
+        const byte_idx = idx / 2;
+        const byte_val = self.data[byte_idx];
+
+        if (idx % 2 == 0) {
+            // Low nibble (sign-extend from 4-bit)
+            const nibble: u4 = @truncate(byte_val & 0x0F);
+            return signExtend4(nibble);
+        } else {
+            // High nibble (sign-extend from 4-bit)
+            const nibble: u4 = @truncate(byte_val >> 4);
+            return signExtend4(nibble);
+        }
+    }
+
+    /// Set quantized value at index (packs into byte)
+    pub fn set(self: *Self, idx: usize, value: i8) void {
+        const byte_idx = idx / 2;
+        const clamped = std.math.clamp(value, -7, 7);
+        const nibble: u4 = @bitCast(@as(i4, @intCast(clamped)));
+
+        if (idx % 2 == 0) {
+            // Low nibble
+            self.data[byte_idx] = (self.data[byte_idx] & 0xF0) | nibble;
+        } else {
+            // High nibble
+            self.data[byte_idx] = (self.data[byte_idx] & 0x0F) | (@as(u8, nibble) << 4);
+        }
+    }
+};
+
+/// Sign-extend 4-bit value to i8
+fn signExtend4(nibble: u4) i8 {
+    const as_i4: i4 = @bitCast(nibble);
+    return as_i4;
+}
+
+/// Quantize float32 tensor to Q4_0 format (symmetric, per-tensor scale)
+/// 4-bit range: [-7, 7] (using symmetric quantization)
+pub fn quantizeQ4(allocator: std.mem.Allocator, tensor: *const Tensor) !QuantizedTensorQ4 {
+    var result = try QuantizedTensorQ4.init(allocator, tensor.shape);
+    errdefer result.deinit();
+
+    // Initialize packed data to zero
+    @memset(result.data, 0);
+
+    // Find max absolute value
+    var max_abs: f32 = 0.0;
+    for (tensor.data) |v| {
+        const abs_v = @abs(v);
+        if (abs_v > max_abs) max_abs = abs_v;
+    }
+
+    // Avoid division by zero
+    if (max_abs == 0.0) {
+        result.scale = 1.0;
+        return result;
+    }
+
+    // Calculate scale (symmetric quantization)
+    result.scale = max_abs / 7.0;
+    const inv_scale = 7.0 / max_abs;
+
+    // Quantize each element
+    for (tensor.data, 0..) |v, i| {
+        const scaled = v * inv_scale;
+        const rounded = @round(scaled);
+        const clamped = std.math.clamp(rounded, -7.0, 7.0);
+        result.set(i, @intFromFloat(clamped));
+    }
+
+    return result;
+}
+
+/// Dequantize Q4_0 tensor back to float32
+/// Used for verification/debugging
+pub fn dequantizeQ4(allocator: std.mem.Allocator, qtensor: *const QuantizedTensorQ4) !Tensor {
+    var result = try Tensor.init(allocator, qtensor.shape);
+    errdefer result.deinit();
+
+    for (0..qtensor.element_count) |i| {
+        const q = qtensor.get(i);
+        result.data[i] = @as(f32, @floatFromInt(q)) * qtensor.scale;
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Q4_0 Weight-Only Quantized Matrix Multiplication
+// ============================================================================
+
+/// Weight-Only Quantized Matrix Multiplication for Q4_0
+/// a: [M, K] float32 input (activations)
+/// b: [K, N] quantized weights (4-bit packed)
+/// Returns: [M, N] float32 result
+pub fn matmulF32Q4(
+    allocator: std.mem.Allocator,
+    a: *const Tensor,
+    b: *const QuantizedTensorQ4,
+) !Tensor {
+    // Validate shapes
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return QuantError.InvalidShape;
+    }
+
+    const m = a.shape[0];
+    const k_a = a.shape[1];
+    const k_b = b.shape[0];
+    const n = b.shape[1];
+
+    if (k_a != k_b) {
+        return QuantError.ShapeMismatch;
+    }
+
+    const k = k_a;
+
+    var result_shape = [_]usize{ m, n };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    const scale = b.scale;
+
+    // Initialize result to zero
+    @memset(result.data, 0.0);
+
+    // Simple i,k,j loop (unpacking 4-bit values on the fly)
+    for (0..m) |i| {
+        for (0..k) |kk| {
+            const a_val = a.data[i * k + kk];
+
+            for (0..n) |j| {
+                // Get 4-bit quantized weight (unpacks from packed byte)
+                const w_idx = kk * n + j;
+                const w_int = b.get(w_idx);
+                const w_f32 = @as(f32, @floatFromInt(w_int)) * scale;
+                result.data[i * n + j] += a_val * w_f32;
+            }
+        }
+    }
+
+    return result;
+}
+
+/// SIMD-optimized Weight-Only Matmul for Q4_0
+/// Unpacks 8 values at a time for vectorized processing
+pub fn matmulF32Q4Simd(
+    allocator: std.mem.Allocator,
+    a: *const Tensor,
+    b: *const QuantizedTensorQ4,
+) !Tensor {
+    // Validate shapes
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return QuantError.InvalidShape;
+    }
+
+    const m = a.shape[0];
+    const k_a = a.shape[1];
+    const k_b = b.shape[0];
+    const n = b.shape[1];
+
+    if (k_a != k_b) {
+        return QuantError.ShapeMismatch;
+    }
+
+    const k = k_a;
+
+    var result_shape = [_]usize{ m, n };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    const scale = b.scale;
+
+    // Initialize result to zero
+    @memset(result.data, 0.0);
+
+    // SIMD vector width (8 floats)
+    const VEC_WIDTH = 8;
+    const Vec8f32 = @Vector(VEC_WIDTH, f32);
+    const Vec8i32 = @Vector(VEC_WIDTH, i32);
+
+    for (0..m) |i| {
+        for (0..k) |kk| {
+            const a_val = a.data[i * k + kk];
+            const a_vec: Vec8f32 = @splat(a_val);
+            const scale_vec: Vec8f32 = @splat(scale);
+
+            var j: usize = 0;
+
+            // SIMD loop (8 elements at a time)
+            while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
+                // Unpack 8 x 4-bit values (4 bytes) into i32 vector
+                const base_idx = kk * n + j;
+                var w_i32: Vec8i32 = undefined;
+
+                // Unpack each 4-bit value
+                inline for (0..VEC_WIDTH) |vi| {
+                    w_i32[vi] = b.get(base_idx + vi);
+                }
+
+                // Convert to float32
+                const w_f32: Vec8f32 = @floatFromInt(w_i32);
+
+                // Scale to dequantize
+                const w_scaled = w_f32 * scale_vec;
+
+                // Load current result
+                const result_ptr = result.data[i * n + j ..];
+                var result_vec: Vec8f32 = result_ptr[0..VEC_WIDTH].*;
+
+                // Multiply and accumulate
+                result_vec += a_vec * w_scaled;
+
+                // Store back
+                result_ptr[0..VEC_WIDTH].* = result_vec;
+            }
+
+            // Handle remainder (tail loop)
+            while (j < n) : (j += 1) {
+                const w_idx = kk * n + j;
+                const w_int = b.get(w_idx);
+                const w_f32 = @as(f32, @floatFromInt(w_int)) * scale;
+                result.data[i * n + j] += a_val * w_f32;
+            }
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -453,4 +746,220 @@ test "quantization preserves extreme values" {
 
     // Check scale
     try std.testing.expectApproxEqAbs(@as(f32, 100.0 / 127.0), qtensor.scale, 0.0001);
+}
+
+// ============================================================================
+// Q4_0 Tests
+// ============================================================================
+
+test "Q4_0 quantization roundtrip" {
+    const allocator = std.testing.allocator;
+
+    // Create test tensor
+    var shape = [_]usize{ 2, 3 };
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    tensor.data[0] = 2.5;
+    tensor.data[1] = -1.0;
+    tensor.data[2] = 0.5;
+    tensor.data[3] = -2.0;
+    tensor.data[4] = 0.0;
+    tensor.data[5] = 1.5;
+
+    // Quantize
+    var qtensor = try quantizeQ4(allocator, &tensor);
+    defer qtensor.deinit();
+
+    // Check compression ratio (4-bit = 8x theoretical, minus scale overhead)
+    const ratio = qtensor.compressionRatio();
+    try std.testing.expect(ratio > 3.0); // Should be close to 8x for large tensors
+
+    // Dequantize
+    var restored = try dequantizeQ4(allocator, &qtensor);
+    defer restored.deinit();
+
+    // Check accuracy (4-bit has higher error than 8-bit)
+    // With only 15 levels, error can be up to ~7% of max value
+    const tolerance = 2.5 * 0.15; // 15% of max
+    for (tensor.data, 0..) |original, i| {
+        try std.testing.expectApproxEqAbs(original, restored.data[i], tolerance);
+    }
+}
+
+test "Q4_0 packing correctness" {
+    const allocator = std.testing.allocator;
+
+    var shape = [_]usize{8};
+    var qtensor = try QuantizedTensorQ4.init(allocator, &shape);
+    defer qtensor.deinit();
+
+    // Set values: [-7, -3, 0, 3, 7, -1, 1, -2]
+    qtensor.set(0, -7);
+    qtensor.set(1, -3);
+    qtensor.set(2, 0);
+    qtensor.set(3, 3);
+    qtensor.set(4, 7);
+    qtensor.set(5, -1);
+    qtensor.set(6, 1);
+    qtensor.set(7, -2);
+
+    // Verify get returns correct values
+    try std.testing.expectEqual(@as(i8, -7), qtensor.get(0));
+    try std.testing.expectEqual(@as(i8, -3), qtensor.get(1));
+    try std.testing.expectEqual(@as(i8, 0), qtensor.get(2));
+    try std.testing.expectEqual(@as(i8, 3), qtensor.get(3));
+    try std.testing.expectEqual(@as(i8, 7), qtensor.get(4));
+    try std.testing.expectEqual(@as(i8, -1), qtensor.get(5));
+    try std.testing.expectEqual(@as(i8, 1), qtensor.get(6));
+    try std.testing.expectEqual(@as(i8, -2), qtensor.get(7));
+
+    // Check packed size (8 elements = 4 bytes)
+    try std.testing.expectEqual(@as(usize, 4), qtensor.data.len);
+}
+
+test "Q4_0 size reduction" {
+    const allocator = std.testing.allocator;
+
+    // 1000 element tensor
+    var shape = [_]usize{1000};
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    for (tensor.data, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    }
+
+    var qtensor = try quantizeQ4(allocator, &tensor);
+    defer qtensor.deinit();
+
+    // Float32: 1000 * 4 = 4000 bytes
+    // Q4_0:    4 + 500   = 504 bytes (8x reduction)
+    const f32_size = tensor.data.len * 4;
+    const q4_size = qtensor.sizeBytes();
+
+    try std.testing.expect(q4_size < f32_size / 6); // At least 6x smaller
+}
+
+test "Q4_0 zero tensor" {
+    const allocator = std.testing.allocator;
+
+    var shape = [_]usize{10};
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+    tensor.fill(0.0);
+
+    var qtensor = try quantizeQ4(allocator, &tensor);
+    defer qtensor.deinit();
+
+    // Should handle zero tensor gracefully
+    try std.testing.expectEqual(@as(f32, 1.0), qtensor.scale);
+    for (0..qtensor.element_count) |i| {
+        try std.testing.expectEqual(@as(i8, 0), qtensor.get(i));
+    }
+}
+
+test "Q4_0 weight-only matmul accuracy" {
+    const allocator = std.testing.allocator;
+
+    // Float32 input (activations)
+    var a_shape = [_]usize{ 2, 3 };
+    var a = try Tensor.init(allocator, &a_shape);
+    defer a.deinit();
+    a.data[0] = 1.0;
+    a.data[1] = 2.0;
+    a.data[2] = 3.0;
+    a.data[3] = 4.0;
+    a.data[4] = 5.0;
+    a.data[5] = 6.0;
+
+    // Float32 weights (will be quantized to Q4)
+    var b_shape = [_]usize{ 3, 2 };
+    var b = try Tensor.init(allocator, &b_shape);
+    defer b.deinit();
+    b.data[0] = 1.0;
+    b.data[1] = 2.0;
+    b.data[2] = 3.0;
+    b.data[3] = 4.0;
+    b.data[4] = 5.0;
+    b.data[5] = 6.0;
+
+    // Float32 reference
+    const ops = @import("ops.zig");
+    var ref = try ops.matmul(allocator, &a, &b);
+    defer ref.deinit();
+
+    // Quantize weights to Q4_0
+    var qb = try quantizeQ4(allocator, &b);
+    defer qb.deinit();
+
+    // Q4 weight-only matmul
+    var qresult = try matmulF32Q4(allocator, &a, &qb);
+    defer qresult.deinit();
+
+    // Compare (allow 15% error due to 4-bit quantization)
+    for (ref.data, 0..) |expected, i| {
+        const tolerance = @abs(expected) * 0.15 + 0.5;
+        try std.testing.expectApproxEqAbs(expected, qresult.data[i], tolerance);
+    }
+}
+
+test "Q4_0 weight-only matmul SIMD" {
+    const allocator = std.testing.allocator;
+
+    // Larger test to exercise SIMD path
+    var a_shape = [_]usize{ 4, 32 };
+    var a = try Tensor.init(allocator, &a_shape);
+    defer a.deinit();
+    for (a.data, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    }
+
+    var b_shape = [_]usize{ 32, 16 };
+    var b = try Tensor.init(allocator, &b_shape);
+    defer b.deinit();
+    for (b.data, 0..) |*v, i| {
+        v.* = @cos(@as(f32, @floatFromInt(i)) * 0.1);
+    }
+
+    // Scalar reference
+    var qb = try quantizeQ4(allocator, &b);
+    defer qb.deinit();
+
+    var scalar_result = try matmulF32Q4(allocator, &a, &qb);
+    defer scalar_result.deinit();
+
+    // SIMD path
+    var simd_result = try matmulF32Q4Simd(allocator, &a, &qb);
+    defer simd_result.deinit();
+
+    // Both should produce the same result
+    for (scalar_result.data, 0..) |expected, i| {
+        try std.testing.expectApproxEqAbs(expected, simd_result.data[i], 0.0001);
+    }
+}
+
+test "Q4_0 extreme values" {
+    const allocator = std.testing.allocator;
+
+    var shape = [_]usize{5};
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    tensor.data[0] = 100.0;
+    tensor.data[1] = -100.0;
+    tensor.data[2] = 0.0;
+    tensor.data[3] = 50.0;
+    tensor.data[4] = -50.0;
+
+    var qtensor = try quantizeQ4(allocator, &tensor);
+    defer qtensor.deinit();
+
+    // Max and min should map to ±7
+    try std.testing.expectEqual(@as(i8, 7), qtensor.get(0));
+    try std.testing.expectEqual(@as(i8, -7), qtensor.get(1));
+    try std.testing.expectEqual(@as(i8, 0), qtensor.get(2));
+
+    // Check scale
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0 / 7.0), qtensor.scale, 0.0001);
 }

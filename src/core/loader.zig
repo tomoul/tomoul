@@ -3,6 +3,7 @@ const tensor_import = @import("tensor.zig");
 const Tensor = tensor_import.Tensor;
 const quantization = @import("quantization.zig");
 const QuantizedTensorQ8 = quantization.QuantizedTensorQ8;
+const QuantizedTensorQ4 = quantization.QuantizedTensorQ4;
 
 /// Error types for model loading operations
 pub const LoadError = error{
@@ -295,6 +296,49 @@ pub const ModelLoader = struct {
         const data_start = offset + 4;
         for (qtensor.data, 0..) |*out, i| {
             out.* = @bitCast(self.file_data[data_start + i]);
+        }
+
+        return qtensor;
+    }
+
+    /// Get a quantized tensor by name (for Q4_0 format files)
+    /// Returns the tensor in quantized form for weight-only inference
+    pub fn getQuantizedTensorQ4(self: *Self, name: []const u8) !QuantizedTensorQ4 {
+        if (self.quant_format != .q4_0) {
+            return LoadError.UnsupportedQuantFormat;
+        }
+
+        const info = self.tensors.get(name) orelse return LoadError.TensorNotFound;
+
+        // Validate data bounds
+        const end_offset = info.data_offset + info.data_size;
+        if (end_offset > self.file_data.len) {
+            return LoadError.CorruptedFile;
+        }
+
+        // Create quantized tensor with the stored shape
+        var qtensor = try QuantizedTensorQ4.init(self.allocator, info.shape);
+        errdefer qtensor.deinit();
+
+        // Q4_0 format: 4-byte scale + ceil(N/2) bytes of packed 4-bit data
+        const expected_size = 4 + qtensor.data.len;
+        if (info.data_size != expected_size) {
+            return LoadError.CorruptedFile;
+        }
+
+        // Read scale (first 4 bytes)
+        const offset: usize = @intCast(info.data_offset);
+        qtensor.scale = @bitCast([4]u8{
+            self.file_data[offset],
+            self.file_data[offset + 1],
+            self.file_data[offset + 2],
+            self.file_data[offset + 3],
+        });
+
+        // Read packed 4-bit data (remaining bytes)
+        const data_start = offset + 4;
+        for (qtensor.data, 0..) |*out, i| {
+            out.* = self.file_data[data_start + i];
         }
 
         return qtensor;

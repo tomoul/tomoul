@@ -5,6 +5,7 @@ Tomoul .tl format utilities - shared across all exporters.
 Supports:
 - Float32 format (default)
 - Q8_0 format (8-bit symmetric quantization)
+- Q4_0 format (4-bit symmetric quantization)
 """
 
 import struct
@@ -56,6 +57,95 @@ def quantize_q8_0(tensor: np.ndarray) -> Tuple[float, np.ndarray]:
 def dequantize_q8_0(scale: float, quantized: np.ndarray) -> np.ndarray:
     """Dequantize Q8_0 data back to float32 for verification."""
     return quantized.astype(np.float32) * scale
+
+
+def quantize_q4_0(tensor: np.ndarray) -> Tuple[float, np.ndarray]:
+    """
+    Quantize tensor to Q4_0 format (symmetric 4-bit, packed).
+
+    Args:
+        tensor: Float32 numpy array
+
+    Returns:
+        (scale, packed_data) where:
+        - scale: float32 scale factor
+        - packed_data: uint8 numpy array (2 values per byte)
+    """
+    data = tensor.flatten().astype(np.float32)
+    n = len(data)
+
+    # Find max absolute value
+    max_abs = np.max(np.abs(data))
+
+    if max_abs == 0:
+        packed_size = (n + 1) // 2
+        return 1.0, np.zeros(packed_size, dtype=np.uint8)
+
+    # Symmetric quantization: scale = max_abs / 7
+    scale = float(max_abs / 7.0)
+
+    # Quantize: q = round(x / scale), clamp to [-7, 7]
+    quantized = np.round(data / scale).astype(np.int32)
+    quantized = np.clip(quantized, -7, 7).astype(np.int8)
+
+    # Pack two 4-bit values per byte (low nibble = even index, high nibble = odd)
+    packed_size = (n + 1) // 2
+    packed = np.zeros(packed_size, dtype=np.uint8)
+
+    for i in range(n):
+        byte_idx = i // 2
+        # Convert signed 4-bit to unsigned nibble
+        nibble = quantized[i] & 0x0F
+
+        if i % 2 == 0:
+            # Low nibble
+            packed[byte_idx] = nibble
+        else:
+            # High nibble
+            packed[byte_idx] |= (nibble << 4)
+
+    return scale, packed
+
+
+def dequantize_q4_0(scale: float, packed: np.ndarray, element_count: int) -> np.ndarray:
+    """Dequantize Q4_0 packed data back to float32 for verification."""
+    result = np.zeros(element_count, dtype=np.float32)
+
+    for i in range(element_count):
+        byte_idx = i // 2
+        if i % 2 == 0:
+            nibble = int(packed[byte_idx]) & 0x0F
+        else:
+            nibble = (int(packed[byte_idx]) >> 4) & 0x0F
+
+        # Sign-extend from 4-bit
+        if nibble & 0x08:
+            value = nibble - 16
+        else:
+            value = nibble
+
+        result[i] = float(value) * scale
+
+    return result
+
+
+def verify_quantization_q4(original: np.ndarray, scale: float, packed: np.ndarray) -> Dict:
+    """Verify Q4_0 quantization accuracy."""
+    element_count = original.size
+    restored = dequantize_q4_0(scale, packed, element_count)
+    original_flat = original.flatten()
+
+    mse = np.mean((original_flat - restored) ** 2)
+    max_error = np.max(np.abs(original_flat - restored))
+    max_val = np.max(np.abs(original_flat))
+    rel_error = max_error / max_val if max_val > 0 else 0
+
+    return {
+        'mse': float(mse),
+        'max_error': float(max_error),
+        'rel_error': float(rel_error),
+        'max_val': float(max_val),
+    }
 
 
 def verify_quantization(original: np.ndarray, scale: float, quantized: np.ndarray) -> Dict:
@@ -154,6 +244,19 @@ def export_tensors(
                 f.write(quantized.tobytes())
                 data_size = 4 + len(quantized)
 
+            elif quant_format == QuantFormat.Q4_0:
+                scale, packed = quantize_q4_0(tensor)
+
+                # Verify if requested
+                if verify:
+                    stats = verify_quantization_q4(tensor, scale, packed)
+                    max_rel_error = max(max_rel_error, stats['rel_error'])
+
+                # Write: 4-byte scale + packed uint8 data
+                f.write(struct.pack('<f', scale))
+                f.write(packed.tobytes())
+                data_size = 4 + len(packed)
+
             else:
                 raise ValueError(f"Unsupported quantization format: {quant_format}")
 
@@ -176,14 +279,23 @@ def export_tensors(
         print(f"Compression: {overall_compression:.2f}x "
               f"({total_original / 1024 / 1024:.1f}MB -> {total_quantized / 1024 / 1024:.1f}MB)")
 
-    if verify and quant_format == QuantFormat.Q8_0:
+    if verify and quant_format in (QuantFormat.Q8_0, QuantFormat.Q4_0):
         print(f"Max relative error: {max_rel_error:.4%}")
-        if max_rel_error < 0.01:
-            print("Quantization accuracy: EXCELLENT (<1%)")
-        elif max_rel_error < 0.05:
-            print("Quantization accuracy: GOOD (<5%)")
-        else:
-            print("Quantization accuracy: WARNING (>5%)")
+        # Q4_0 has higher expected error due to fewer quantization levels
+        if quant_format == QuantFormat.Q4_0:
+            if max_rel_error < 0.08:
+                print("Quantization accuracy: EXCELLENT (<8%)")
+            elif max_rel_error < 0.15:
+                print("Quantization accuracy: GOOD (<15%)")
+            else:
+                print("Quantization accuracy: WARNING (>15%)")
+        else:  # Q8_0
+            if max_rel_error < 0.01:
+                print("Quantization accuracy: EXCELLENT (<1%)")
+            elif max_rel_error < 0.05:
+                print("Quantization accuracy: GOOD (<5%)")
+            else:
+                print("Quantization accuracy: WARNING (>5%)")
 
     return path
 
@@ -236,6 +348,15 @@ def load_tl_file(path: str) -> Tuple[Dict[str, np.ndarray], int]:
                 quantized = np.frombuffer(f.read(size - 4), dtype=np.int8)
                 # Dequantize for return
                 tensors[name] = dequantize_q8_0(scale, quantized).reshape(shape)
+            elif quant_format == QuantFormat.Q4_0:
+                scale = struct.unpack('<f', f.read(4))[0]
+                packed = np.frombuffer(f.read(size - 4), dtype=np.uint8)
+                # Calculate element count from shape
+                element_count = 1
+                for dim in shape:
+                    element_count *= dim
+                # Dequantize for return
+                tensors[name] = dequantize_q4_0(scale, packed, element_count).reshape(shape)
             else:
                 raise ValueError(f"Unsupported quant format: {quant_format}")
 
@@ -246,9 +367,9 @@ def add_quantize_args(parser):
     """Add standard quantization arguments to an argparse parser."""
     parser.add_argument(
         '--quantize', '-q',
-        choices=['f32', 'q8_0'],
+        choices=['f32', 'q8_0', 'q4_0'],
         default='f32',
-        help='Output format: f32 (default) or q8_0 (8-bit quantized)'
+        help='Output format: f32 (default), q8_0 (8-bit, ~4x), or q4_0 (4-bit, ~8x)'
     )
     parser.add_argument(
         '--no-verify',
