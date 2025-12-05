@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     quantization_module.addImport("tensor.zig", tensor_module);
+    quantization_module.addImport("ops.zig", ops_module);
 
     const loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
@@ -89,7 +90,9 @@ pub fn build(b: *std.Build) void {
     });
     loader_module.addImport("tensor.zig", tensor_module);
     loader_module.addImport("quantization.zig", quantization_module);
+    loader_module.addImport("ops.zig", ops_module);
 
+    // Attention module (supports F32, Q8, Q4, Q8_K via comptime generics)
     const attention_module = b.createModule(.{
         .root_source_file = b.path("src/core/attention.zig"),
         .target = target,
@@ -97,7 +100,9 @@ pub fn build(b: *std.Build) void {
     });
     attention_module.addImport("tensor.zig", tensor_module);
     attention_module.addImport("ops.zig", ops_module);
+    attention_module.addImport("quantization.zig", quantization_module);
 
+    // Transformer module (supports F32, Q8, Q4, Q8_K via comptime generics)
     const transformer_module = b.createModule(.{
         .root_source_file = b.path("src/core/transformer.zig"),
         .target = target,
@@ -105,6 +110,7 @@ pub fn build(b: *std.Build) void {
     });
     transformer_module.addImport("tensor.zig", tensor_module);
     transformer_module.addImport("ops.zig", ops_module);
+    transformer_module.addImport("quantization.zig", quantization_module);
     transformer_module.addImport("attention.zig", attention_module);
 
     // Create build options for bundled mode
@@ -141,6 +147,7 @@ pub fn build(b: *std.Build) void {
     exe_module.addImport("tensor.zig", tensor_module);
     exe_module.addImport("ops.zig", ops_module);
     exe_module.addImport("loader.zig", loader_module);
+    exe_module.addImport("quantization.zig", quantization_module);
     exe_module.addImport("attention.zig", attention_module);
     exe_module.addImport("transformer.zig", transformer_module);
     exe_module.addOptions("build_options", exe_options);
@@ -156,6 +163,7 @@ pub fn build(b: *std.Build) void {
         model_module.addImport("tensor.zig", tensor_module);
         model_module.addImport("ops.zig", ops_module);
         model_module.addImport("loader.zig", loader_module);
+        model_module.addImport("quantization.zig", quantization_module);
         model_module.addImport("attention.zig", attention_module);
         model_module.addImport("transformer.zig", transformer_module);
         exe_module.addImport("model.zig", model_module);
@@ -181,12 +189,18 @@ pub fn build(b: *std.Build) void {
     // ==========================================================================
     // Unit tests
     // ==========================================================================
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_module.addImport("tensor.zig", tensor_module);
+    test_module.addImport("ops.zig", ops_module);
+    test_module.addImport("loader.zig", loader_module);
+    test_module.addImport("quantization.zig", quantization_module);
+
     const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = test_module,
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -201,6 +215,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    tomoul_module.addImport("tensor.zig", tensor_module);
+    tomoul_module.addImport("ops.zig", ops_module);
+    tomoul_module.addImport("loader.zig", loader_module);
+    tomoul_module.addImport("quantization.zig", quantization_module);
 
     const integration_module = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),
@@ -254,6 +272,7 @@ pub fn build(b: *std.Build) void {
     wasm_loader_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_loader_module.addImport("quantization.zig", wasm_quantization_module);
 
+    // Generic attention module (supports F32, Q8, Q4, Q8_K) - WASM
     const wasm_attention_module = b.createModule(.{
         .root_source_file = b.path("src/core/attention.zig"),
         .target = wasm_target,
@@ -261,7 +280,9 @@ pub fn build(b: *std.Build) void {
     });
     wasm_attention_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_attention_module.addImport("ops.zig", wasm_ops_module);
+    wasm_attention_module.addImport("quantization.zig", wasm_quantization_module);
 
+    // Generic transformer module (supports F32, Q8, Q4, Q8_K) - WASM
     const wasm_transformer_module = b.createModule(.{
         .root_source_file = b.path("src/core/transformer.zig"),
         .target = wasm_target,
@@ -269,6 +290,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm_transformer_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_transformer_module.addImport("ops.zig", wasm_ops_module);
+    wasm_transformer_module.addImport("quantization.zig", wasm_quantization_module);
     wasm_transformer_module.addImport("attention.zig", wasm_attention_module);
 
     // Master wasm step that builds all models
@@ -295,6 +317,7 @@ pub fn build(b: *std.Build) void {
             wasm_tensor_module,
             wasm_ops_module,
             wasm_loader_module,
+            wasm_quantization_module,
             wasm_attention_module,
             wasm_transformer_module,
             wasm_step,
@@ -362,6 +385,7 @@ fn buildWasmModel(
     wasm_tensor_module: *std.Build.Module,
     wasm_ops_module: *std.Build.Module,
     wasm_loader_module: *std.Build.Module,
+    wasm_quantization_module: *std.Build.Module,
     wasm_attention_module: *std.Build.Module,
     wasm_transformer_module: *std.Build.Module,
     wasm_step: *std.Build.Step,
@@ -380,6 +404,7 @@ fn buildWasmModel(
     wasm_model_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_model_module.addImport("ops.zig", wasm_ops_module);
     wasm_model_module.addImport("loader.zig", wasm_loader_module);
+    wasm_model_module.addImport("quantization.zig", wasm_quantization_module);
     wasm_model_module.addImport("attention.zig", wasm_attention_module);
     wasm_model_module.addImport("transformer.zig", wasm_transformer_module);
 
@@ -465,6 +490,7 @@ fn buildNativeLib(
         .optimize = optimize,
     });
     quantization_module.addImport("tensor.zig", tensor_module);
+    quantization_module.addImport("ops.zig", ops_module);
 
     const loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
@@ -474,6 +500,7 @@ fn buildNativeLib(
     loader_module.addImport("tensor.zig", tensor_module);
     loader_module.addImport("quantization.zig", quantization_module);
 
+    // Generic attention module (supports F32, Q8, Q4, Q8_K) - Native
     const attention_module = b.createModule(.{
         .root_source_file = b.path("src/core/attention.zig"),
         .target = target,
@@ -481,7 +508,9 @@ fn buildNativeLib(
     });
     attention_module.addImport("tensor.zig", tensor_module);
     attention_module.addImport("ops.zig", ops_module);
+    attention_module.addImport("quantization.zig", quantization_module);
 
+    // Generic transformer module (supports F32, Q8, Q4, Q8_K) - Native
     const transformer_module = b.createModule(.{
         .root_source_file = b.path("src/core/transformer.zig"),
         .target = target,
@@ -489,6 +518,7 @@ fn buildNativeLib(
     });
     transformer_module.addImport("tensor.zig", tensor_module);
     transformer_module.addImport("ops.zig", ops_module);
+    transformer_module.addImport("quantization.zig", quantization_module);
     transformer_module.addImport("attention.zig", attention_module);
 
     // Create the model module
@@ -500,6 +530,7 @@ fn buildNativeLib(
     model_module.addImport("tensor.zig", tensor_module);
     model_module.addImport("ops.zig", ops_module);
     model_module.addImport("loader.zig", loader_module);
+    model_module.addImport("quantization.zig", quantization_module);
     model_module.addImport("attention.zig", attention_module);
     model_module.addImport("transformer.zig", transformer_module);
 
@@ -516,6 +547,7 @@ fn buildNativeLib(
             opt: std.builtin.OptimizeMode,
             tensor_mod: *std.Build.Module,
             model_mod: *std.Build.Module,
+            loader_mod: *std.Build.Module,
             opts: *std.Build.Step.Options,
             is_bundled: bool,
             supports_bundled: bool,
@@ -528,6 +560,7 @@ fn buildNativeLib(
             });
             c_mod.addImport("tensor", tensor_mod);
             c_mod.addImport("model", model_mod);
+            c_mod.addImport("loader", loader_mod);  // For QuantFormat access
             c_mod.addOptions("build_options", opts);
 
             // Embed model weights if bundled mode
@@ -549,6 +582,7 @@ fn buildNativeLib(
         optimize,
         tensor_module,
         model_module,
+        loader_module,
         options,
         bundled,
         model.supports_bundled,
@@ -578,6 +612,7 @@ fn buildNativeLib(
         optimize,
         tensor_module,
         model_module,
+        loader_module,
         options,
         bundled,
         model.supports_bundled,

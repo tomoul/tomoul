@@ -120,3 +120,18 @@ export fn tomoul_xlm_roberta_punctuation_is_ready() c_int {
 export fn tomoul_xlm_roberta_punctuation_version() [*:0]const u8 {
     return "xlm_roberta_punctuation-v1.0.0";
 }
+
+/// Get quantization format of loaded model
+/// Returns: 0 = not loaded, 1 = float32, 2 = Q8_0
+export fn tomoul_xlm_roberta_punctuation_quant_format() c_int {
+    if (!is_initialized) {
+        return 0;
+    }
+
+    return switch (model_instance.?.model.quant_format) {
+        .f32 => 1, // float32
+        .q8_0 => 2, // Q8_0 quantized
+        .q4_0 => 3, // Q4_0 quantized
+        .q8_k => 4, // Q8_K block-wise quantized
+    };
+}

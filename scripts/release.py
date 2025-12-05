@@ -132,6 +132,40 @@ def parse_model_registry():
         if re.search(r'\.release_mode\s*=\s*\.fast', block):
             release_mode = "fast"
 
+        # Parse weight_variants for quantized models
+        weight_variants = []
+        # Find .weight_variants = &.{ and extract content until matching closing brace
+        wv_start = block.find('.weight_variants')
+        if wv_start != -1:
+            # Find the &.{ start
+            array_start = block.find('&.{', wv_start)
+            if array_start != -1:
+                # Find matching closing } by counting braces
+                depth = 0
+                content_start = array_start + 3
+                content_end = content_start
+                for i, c in enumerate(block[array_start:]):
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            content_end = array_start + i
+                            break
+                variants_content = block[content_start:content_end]
+                # Parse each variant: .{ .suffix = "-q8", .path = "...", .description = "..." }
+                variant_blocks = re.findall(r'\.{[^}]+}', variants_content)
+                for vb in variant_blocks:
+                    suffix_match = re.search(r'\.suffix\s*=\s*"([^"]*)"', vb)
+                    path_match = re.search(r'\.path\s*=\s*"([^"]+)"', vb)
+                    desc_match = re.search(r'\.description\s*=\s*"([^"]*)"', vb)
+                    if suffix_match and path_match:
+                        weight_variants.append({
+                            "suffix": suffix_match.group(1),
+                            "path": path_match.group(1),
+                            "description": desc_match.group(1) if desc_match else "",
+                        })
+
         models[name] = {
             "hf_repo": paths["hf_repo"],
             "weights": paths["weights_path"],
@@ -142,6 +176,7 @@ def parse_model_registry():
             "has_cli": has_cli,
             "supports_bundled": supports_bundled,
             "release_mode": release_mode,
+            "weight_variants": weight_variants,
         }
 
     return models

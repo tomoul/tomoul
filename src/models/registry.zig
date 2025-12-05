@@ -12,6 +12,11 @@
 //   - hf_repo       → tomoul/silero-vad
 //
 // Override any path by setting it explicitly.
+//
+// Weight variants:
+// For models with multiple quantization levels (float32, q8, q4), use weight_variants
+// to define all variants. Each variant has a suffix and description.
+// Example: { .suffix = "-q8", .path = "artifacts/model_q8.tl", .description = "Q8 quantized" }
 
 const std = @import("std");
 
@@ -20,6 +25,13 @@ pub const ModelKind = enum { audio, text, vision };
 pub const ReleaseMode = enum {
     small, // ReleaseSmall - smaller binary, slightly slower
     fast, // ReleaseFast - larger binary, faster execution
+};
+
+/// Weight variant for quantized models
+pub const WeightVariant = struct {
+    suffix: []const u8, // e.g., "-q8", "-q4" (empty for default/float32)
+    path: []const u8, // e.g., "artifacts/model_q8.tl"
+    description: []const u8 = "", // e.g., "Q8 quantized - 4x smaller"
 };
 
 pub const ModelConfig = struct {
@@ -35,9 +47,13 @@ pub const ModelConfig = struct {
     c_binding: ?[]const u8 = null,
     model_module: ?[]const u8 = null,
     cli_module: ?[]const u8 = null, // CLI executable source
-    weights_path: ?[]const u8 = null,
+    weights_path: ?[]const u8 = null, // Default weights (float32)
     example_dir: ?[]const u8 = null,
     hf_repo: ?[]const u8 = null,
+
+    // Weight variants for quantized models (Q8, Q4, etc.)
+    // Each variant creates a separate build target: {name}{suffix}
+    weight_variants: []const WeightVariant = &.{},
 
     // Flags
     has_example: bool = false, // Whether to copy wasm to examples/{name-with-dashes}
@@ -98,6 +114,10 @@ pub const models = [_]ModelConfig{
             "reset",
             "is_ready",
             "get_version",
+        },
+        .weight_variants = &.{
+            .{ .suffix = "-q8", .path = "artifacts/fullstop_punctuation_multilang_large_q8.tl", .description = "Q8 quantized - 4x smaller, 1.9x faster" },
+            .{ .suffix = "-q4", .path = "artifacts/fullstop_punctuation_multilang_large_q4.tl", .description = "Q4 quantized - 8x smaller" },
         },
         .has_example = false,
         .supports_bundled = false, // Weights loaded separately at runtime

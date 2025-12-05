@@ -1,4 +1,5 @@
 const std = @import("std");
+// Use module import from build.zig
 const model_mod = @import("model.zig");
 const PunctuationModel = model_mod.PunctuationModel;
 

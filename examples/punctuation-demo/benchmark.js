@@ -29,7 +29,7 @@ if (platform === 'linux') {
 
 const PROJECT_ROOT = path.join(__dirname, '../..');
 const LIB_PATH = path.join(PROJECT_ROOT, 'release/lib', libName);
-const WEIGHTS_PATH = path.join(PROJECT_ROOT, 'artifacts/fullstop_punctuation_multilang_large.tl');
+const WEIGHTS_PATH = path.join(PROJECT_ROOT, 'artifacts/fullstop_punctuation_multilang_large_q8.tl');
 const VOCAB_PATH = path.join(PROJECT_ROOT, 'artifacts/fullstop_punctuation_multilang_large_vocab.txt');
 
 // Check if library exists

@@ -108,25 +108,21 @@ def export_transformer_model(
     print(f"  Num labels: {model.config.num_labels}")
     print(f"  Max position embeddings: {model.config.max_position_embeddings}")
 
-    # Collect all tensors with clean names
+    # Collect all tensors - keep original names for XLM-RoBERTa/RoBERTa
+    # (Zig loader expects roberta.* prefix for these models)
     tensors = {}
 
     # Extract all weights from the model
     print("\nModel weights:")
     for name, param in model.named_parameters():
-        # Remove model-specific prefixes for cleaner names
-        clean_name = name
-        for prefix in ["distilbert.", "roberta.", "xlm_roberta.", "bert."]:
-            if clean_name.startswith(prefix):
-                clean_name = clean_name[len(prefix):]
-                break
         tensor = param.detach().cpu().float().contiguous().numpy()
-        tensors[clean_name] = tensor
-        print(f"  {clean_name}: {list(tensor.shape)}")
+        tensors[name] = tensor
+        print(f"  {name}: {list(tensor.shape)}")
 
     # Export model weights with quantization support
     output_dir.mkdir(parents=True, exist_ok=True)
-    format_suffix = "_q8" if quant_format == QuantFormat.Q8_0 else ""
+    format_suffixes = {QuantFormat.Q8_0: "_q8", QuantFormat.Q4_0: "_q4", QuantFormat.Q8_K: "_q8k"}
+    format_suffix = format_suffixes.get(quant_format, "")
     model_path = output_dir / f"{short_name}{format_suffix}.tl"
     export_tensors(tensors, str(model_path), quant_format=quant_format, verify=verify)
 

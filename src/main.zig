@@ -1,10 +1,9 @@
 const std = @import("std");
 
-// Core modules
-pub const tensor = @import("core/tensor.zig");
-pub const ops = @import("core/ops.zig");
-pub const loader = @import("core/loader.zig");
-pub const quantization = @import("core/quantization.zig");
+// Core modules - use module imports from build.zig
+pub const tensor = @import("tensor.zig");
+pub const ops = @import("ops.zig");
+pub const loader = @import("loader.zig");
 
 // Re-export main types
 pub const Tensor = tensor.Tensor;
@@ -181,12 +180,11 @@ pub fn main() !void {
     print("Ready for Phase 3 (Data Bridge - PyTorch weight loading).\n\n", .{});
 }
 
-// Pull in tests from submodules
+// Pull in tests from submodules via module imports
 test {
-    _ = @import("core/tensor.zig");
-    _ = @import("core/ops.zig");
-    _ = @import("core/quantization.zig");
-    _ = @import("core/loader.zig");
+    _ = @import("tensor.zig");
+    _ = @import("ops.zig");
+    _ = @import("loader.zig");
     // Skipping model tests as they require full module imports
     // _ = @import("models/silero_vad/model.zig");
 }

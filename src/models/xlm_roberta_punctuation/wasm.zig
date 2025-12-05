@@ -146,3 +146,18 @@ export fn is_ready() u32 {
 export fn get_version() [*:0]const u8 {
     return "xlm_roberta_punctuation-v1.0.0";
 }
+
+/// Get quantization format of loaded model
+/// Returns: 0 = not loaded, 1 = float32, 2 = Q8_0
+export fn get_quant_format() u32 {
+    if (!is_initialized) {
+        return 0;
+    }
+
+    return switch (model_instance.?.model.quant_format) {
+        .f32 => 1, // float32
+        .q8_0 => 2, // Q8_0 quantized
+        .q4_0 => 3, // Q4_0 quantized
+        .q8_k => 4, // Q8_K block-wise quantized
+    };
+}

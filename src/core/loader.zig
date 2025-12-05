@@ -400,6 +400,123 @@ pub const ModelLoader = struct {
         return qtensor;
     }
 
+    /// Get tensor by name with automatic dequantization
+    /// For quantized files, dequantizes to float32. For float32 files, same as getTensor.
+    /// Useful for embeddings and layer norm weights that should remain float32.
+    pub fn getTensorDequantized(self: *Self, name: []const u8) !Tensor {
+        const info = self.tensors.get(name) orelse return LoadError.TensorNotFound;
+
+        // Validate data bounds
+        const end_offset = info.data_offset + info.data_size;
+        if (end_offset > self.file_data.len) {
+            return LoadError.CorruptedFile;
+        }
+
+        const offset: usize = @intCast(info.data_offset);
+
+        // Create output tensor
+        var tensor = try Tensor.init(self.allocator, info.shape);
+        errdefer tensor.deinit();
+
+        switch (self.quant_format) {
+            .f32 => {
+                // No quantization - read float32 directly
+                const expected_size = tensor.size() * @sizeOf(f32);
+                if (info.data_size != expected_size) {
+                    return LoadError.CorruptedFile;
+                }
+                const data_bytes = self.file_data[offset..][0..@intCast(info.data_size)];
+                for (tensor.data, 0..) |*out, i| {
+                    const byte_offset = i * 4;
+                    out.* = @bitCast([4]u8{
+                        data_bytes[byte_offset],
+                        data_bytes[byte_offset + 1],
+                        data_bytes[byte_offset + 2],
+                        data_bytes[byte_offset + 3],
+                    });
+                }
+            },
+            .q8_0 => {
+                // Q8_0: 4-byte scale + int8 data
+                const expected_size = 4 + tensor.size();
+                if (info.data_size != expected_size) {
+                    return LoadError.CorruptedFile;
+                }
+                // Read scale
+                const scale: f32 = @bitCast([4]u8{
+                    self.file_data[offset],
+                    self.file_data[offset + 1],
+                    self.file_data[offset + 2],
+                    self.file_data[offset + 3],
+                });
+                // Dequantize
+                const data_start = offset + 4;
+                for (tensor.data, 0..) |*out, i| {
+                    const q: i8 = @bitCast(self.file_data[data_start + i]);
+                    out.* = @as(f32, @floatFromInt(q)) * scale;
+                }
+            },
+            .q4_0 => {
+                // Q4_0: 4-byte scale + packed 4-bit data
+                const packed_size = (tensor.size() + 1) / 2;
+                const expected_size = 4 + packed_size;
+                if (info.data_size != expected_size) {
+                    return LoadError.CorruptedFile;
+                }
+                // Read scale
+                const scale: f32 = @bitCast([4]u8{
+                    self.file_data[offset],
+                    self.file_data[offset + 1],
+                    self.file_data[offset + 2],
+                    self.file_data[offset + 3],
+                });
+                // Dequantize packed data
+                const data_start = offset + 4;
+                for (tensor.data, 0..) |*out, i| {
+                    const byte_idx = i / 2;
+                    const packed_byte = self.file_data[data_start + byte_idx];
+                    const nibble: u4 = if (i % 2 == 0)
+                        @truncate(packed_byte & 0x0F)
+                    else
+                        @truncate((packed_byte >> 4) & 0x0F);
+                    // Sign-extend from 4-bit
+                    const value: i8 = if (nibble & 0x08 != 0)
+                        @as(i8, @intCast(nibble)) - 16
+                    else
+                        @as(i8, @intCast(nibble));
+                    out.* = @as(f32, @floatFromInt(value)) * scale;
+                }
+            },
+            .q8_k => {
+                // Q8_K: num_blocks + per-block scales + int8 data
+                const BLOCK_SIZE = 32;
+                const num_blocks = (tensor.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                const expected_size = 4 + num_blocks * 4 + tensor.size();
+                if (info.data_size != expected_size) {
+                    return LoadError.CorruptedFile;
+                }
+                // Skip num_blocks field
+                const scales_start = offset + 4;
+                const data_start = scales_start + num_blocks * 4;
+                // Dequantize with per-block scales
+                for (tensor.data, 0..) |*out, i| {
+                    const block_idx = i / BLOCK_SIZE;
+                    const scale_offset = scales_start + block_idx * 4;
+                    const scale: f32 = @bitCast([4]u8{
+                        self.file_data[scale_offset],
+                        self.file_data[scale_offset + 1],
+                        self.file_data[scale_offset + 2],
+                        self.file_data[scale_offset + 3],
+                    });
+                    const q: i8 = @bitCast(self.file_data[data_start + i]);
+                    out.* = @as(f32, @floatFromInt(q)) * scale;
+                }
+            },
+        }
+
+        return tensor;
+    }
+
     /// Check if a tensor exists
     pub fn hasTensor(self: *const Self, name: []const u8) bool {
         return self.tensors.contains(name);
