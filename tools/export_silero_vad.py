@@ -4,13 +4,14 @@ Tomoul Silero VAD Exporter
 Exports Silero VAD model weights to .tl binary format for Zig inference engine.
 
 Usage:
-    python export_vad.py           # Export full Silero VAD to artifacts/
-  python export_vad.py --tiny    # Export tiny fixture to tests/fixtures/silero_vad/
+    python export_silero_vad.py                    # Export full Silero VAD (f32)
+    python export_silero_vad.py --quantize q8_0   # Export quantized (4x smaller)
+    python export_silero_vad.py --tiny             # Export tiny fixture for CI/CD
 
 Binary Format (.tl):
 - Header (16 bytes): Magic "TOUL", Version (u32), Tensor count (u32), Reserved (u32)
 - Tensor Table: For each tensor - name, shape, data offset, data size
-- Data Section: Raw f32 data (little-endian)
+- Data Section: Raw f32 data or quantized (scale + int8)
 """
 
 import argparse
@@ -21,80 +22,36 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-MAGIC = b'TOUL'
-VERSION = 1
+# Import shared format utilities
+from tl_format import (
+    MAGIC, VERSION, QuantFormat,
+    export_tensors, add_quantize_args, get_quant_format
+)
 
 
 class TomoulExporter:
     """Export PyTorch tensors to Tomoul binary format."""
 
-    def __init__(self):
-        self.tensors: Dict[str, torch.Tensor] = {}
+    def __init__(self, quant_format: int = QuantFormat.F32, verify: bool = True):
+        self.tensors: Dict[str, np.ndarray] = {}
+        self.quant_format = quant_format
+        self.verify = verify
 
     def add_tensor(self, name: str, tensor: torch.Tensor):
         """Add a tensor to be exported."""
         # Ensure float32 and contiguous memory layout
-        t = tensor.detach().cpu().float().contiguous()
+        t = tensor.detach().cpu().float().contiguous().numpy()
         self.tensors[name] = t
-        print(f"  {name}: {list(t.shape)} ({t.numel()} params)")
+        print(f"  {name}: {list(t.shape)} ({t.size} params)")
 
     def export(self, output_path: str) -> Path:
-        """Write all tensors to .tl file."""
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tensor_count = len(self.tensors)
-
-        print(f"\nExporting {tensor_count} tensors to {path}")
-
-        with open(path, 'wb') as f:
-            # Write header (16 bytes)
-            f.write(MAGIC)                          # 4 bytes: Magic
-            f.write(struct.pack('<I', VERSION))     # 4 bytes: Version
-            f.write(struct.pack('<I', tensor_count)) # 4 bytes: Tensor count
-            f.write(struct.pack('<I', 0))           # 4 bytes: Reserved
-
-            # First pass: write tensor table with placeholder offsets
-            tensor_info: List[Tuple[str, torch.Tensor, int, int]] = []
-
-            for name, tensor in self.tensors.items():
-                name_bytes = name.encode('utf-8')
-                shape = list(tensor.shape)
-                data_size = tensor.numel() * 4  # f32 = 4 bytes
-
-                # Write name length and name
-                f.write(struct.pack('<I', len(name_bytes)))
-                f.write(name_bytes)
-
-                # Write number of dimensions and shape
-                f.write(struct.pack('<I', len(shape)))
-                for dim in shape:
-                    f.write(struct.pack('<I', dim))
-
-                # Record position for offset, write placeholder
-                offset_pos = f.tell()
-                f.write(struct.pack('<Q', 0))       # 8 bytes: Data offset (placeholder)
-                f.write(struct.pack('<Q', data_size)) # 8 bytes: Data size
-
-                tensor_info.append((name, tensor, offset_pos, data_size))
-
-            # Second pass: write data and update offsets
-            for name, tensor, offset_pos, data_size in tensor_info:
-                current_offset = f.tell()
-
-                # Go back and write the correct offset
-                f.seek(offset_pos)
-                f.write(struct.pack('<Q', current_offset))
-                f.seek(0, 2)  # Return to end of file
-
-                # Write tensor data as little-endian float32
-                data = tensor.numpy().astype(np.float32).tobytes()
-                f.write(data)
-
-        # Verification
-        file_size = path.stat().st_size
-        print(f"Exported successfully: {file_size} bytes")
-
-        return path
+        """Write all tensors to .tl file using shared export_tensors."""
+        return export_tensors(
+            self.tensors,
+            output_path,
+            quant_format=self.quant_format,
+            verify=self.verify
+        )
 
 
 class TinySileroVAD(nn.Module):
@@ -209,7 +166,7 @@ class TinySileroVAD(nn.Module):
         }
 
 
-def export_tiny_vad():
+def export_tiny_vad(quant_format: int = QuantFormat.F32, verify: bool = True):
     """
     Export a tiny VAD model fixture for CI/CD testing.
     Creates deterministic, small files that can be committed to git.
@@ -230,7 +187,7 @@ def export_tiny_vad():
     print(f"  Hidden size: {model.hidden_size}")
 
     # Export model weights
-    exporter = TomoulExporter()
+    exporter = TomoulExporter(quant_format=quant_format, verify=verify)
     print("\n=== Extracting Weights ===")
     for name, tensor in model.get_state_dict_for_export().items():
         exporter.add_tensor(name, tensor)
@@ -239,12 +196,12 @@ def export_tiny_vad():
     model_path = fixture_dir / "model_tiny.tl"
     exporter.export(str(model_path))
 
-    # Create validation data
+    # Create validation data (always f32 for reference values)
     print("\n" + "=" * 60)
     print("Creating Validation Data")
     print("=" * 60)
 
-    validation_exporter = TomoulExporter()
+    validation_exporter = TomoulExporter(quant_format=QuantFormat.F32)
 
     # Test 1: Zeros
     model.reset_states()
@@ -288,7 +245,7 @@ def export_tiny_vad():
     return model_path, validation_path
 
 
-def export_silero_vad():
+def export_silero_vad(quant_format: int = QuantFormat.F32, verify: bool = True):
     """Export full Silero VAD model."""
     print("=" * 60)
     print("Silero VAD Model Exporter")
@@ -313,7 +270,7 @@ def export_silero_vad():
         if name:
             print(f"  {name}: {type(module).__name__}")
 
-    exporter = TomoulExporter()
+    exporter = TomoulExporter(quant_format=quant_format, verify=verify)
 
     # Export state dict
     print("\n=== Extracting Weights ===")
@@ -324,8 +281,9 @@ def export_silero_vad():
         clean_name = name.replace("_orig_mod.", "")
         exporter.add_tensor(clean_name, param)
 
-    # Export to models directory
-    output_path = Path(__file__).parent.parent / "artifacts" / "silero_vad.tl"
+    # Determine output filename based on format
+    format_suffix = "_q8" if quant_format == QuantFormat.Q8_0 else ""
+    output_path = Path(__file__).parent.parent / "artifacts" / f"silero_vad{format_suffix}.tl"
     output_path.parent.mkdir(exist_ok=True)
     exporter.export(str(output_path))
 
@@ -344,7 +302,7 @@ def export_validation_data(model):
     print("Creating Validation Data")
     print("=" * 60)
 
-    validation_exporter = TomoulExporter()
+    validation_exporter = TomoulExporter(quant_format=QuantFormat.F32)
 
     # Reset model states
     model.reset_states()
@@ -437,32 +395,49 @@ def verify_export(model_path: Path):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export Silero VAD model")
+    parser = argparse.ArgumentParser(
+        description="Export Silero VAD model to .tl format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python export_silero_vad.py                    # Export full model (f32)
+    python export_silero_vad.py --quantize q8_0   # Export quantized (4x smaller)
+    python export_silero_vad.py --tiny             # Export tiny fixture for CI/CD
+    python export_silero_vad.py --tiny -q q8_0    # Tiny + quantized
+"""
+    )
     parser.add_argument("--tiny", action="store_true",
                         help="Export a tiny mock model for CI/CD testing")
+    add_quantize_args(parser)
     args = parser.parse_args()
+
+    quant_format = get_quant_format(args.quantize)
+    verify = not args.no_verify
 
     if args.tiny:
         # Export tiny fixture
-        model_path, validation_path = export_tiny_vad()
+        model_path, validation_path = export_tiny_vad(quant_format=quant_format, verify=verify)
         verify_export(model_path)
         verify_export(validation_path)
     else:
         # Export full model
-        model, exporter = export_silero_vad()
+        model, exporter = export_silero_vad(quant_format=quant_format, verify=verify)
 
         # Create validation data
         validation_results = export_validation_data(model)
 
         # Verify exported file
-        model_path = Path(__file__).parent.parent / "models" / "silero_vad.tl"
+        format_suffix = "_q8" if quant_format == QuantFormat.Q8_0 else ""
+        model_path = Path(__file__).parent.parent / "artifacts" / f"silero_vad{format_suffix}.tl"
         verify_export(model_path)
 
+        format_name = "q8_0 (quantized)" if quant_format == QuantFormat.Q8_0 else "f32 (float32)"
         print("\n" + "=" * 60)
         print("Export Complete!")
         print("=" * 60)
+        print(f"\nFormat: {format_name}")
         print(f"\nFiles created:")
-        print(f"  - artifacts/silero_vad.tl (model weights)")
+        print(f"  - {model_path} (model weights)")
         print(f"  - artifacts/vad_validation.tl (test vectors)")
         print(f"\nNext steps:")
         print(f"  1. Implement LSTM cell in src/core/ops.zig")

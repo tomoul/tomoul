@@ -1,33 +1,26 @@
 #!/usr/bin/env python3
 """
-Export XLM-RoBERTa punctuation models to .tl format for Zig inference.
+Export HuggingFace transformer models to .tl format for Zig inference.
 
-This script exports HuggingFace transformer-based punctuation models
-(XLM-RoBERTa, DistilBERT) to the Tomoul binary format.
-
-Supported models:
-  - oliverguhr/fullstop-punctuation-multilang-large (XLM-RoBERTa - punctuation)
-  - oliverguhr/fullstop-punctuation-multilang-small (DistilBERT - punctuation)
-  - kredor/punctuate-all (token classification)
-  - ProsusAI/finbert (DistilBERT - financial sentiment)
-  - Any XLM-RoBERTa or DistilBERT model from HuggingFace
+Supports transformer architectures: BERT, RoBERTa, XLM-RoBERTa, DistilBERT.
 
 Usage:
-    python tools/export_xlm_roberta_punctuation.py -m oliverguhr/fullstop-punctuation-multilang-large -o models/
-    python tools/export_xlm_roberta_punctuation.py -m oliverguhr/fullstop-punctuation-multilang-small -o models/
-    python tools/export_xlm_roberta_punctuation.py -m ProsusAI/finbert -o artifacts/
+    python tools/export_transformer.py -m oliverguhr/fullstop-punctuation-multilang-large -o artifacts/
+    python tools/export_transformer.py -m oliverguhr/fullstop-punctuation-multilang-large -o artifacts/ -q q8_0
+    python tools/export_transformer.py -m ProsusAI/finbert -o artifacts/
+    python tools/export_transformer.py --list-models
 """
 
 import torch
 from transformers import AutoModelForTokenClassification, AutoModelForSequenceClassification, AutoTokenizer, AutoConfig
-import struct
 import numpy as np
 from pathlib import Path
 import argparse
-import re
 
-MAGIC = b'TOUL'
-VERSION = 1
+# Import shared format utilities
+from tl_format import (
+    QuantFormat, export_tensors, add_quantize_args, get_quant_format
+)
 
 # Known model configurations for verification
 KNOWN_MODELS = {
@@ -94,10 +87,15 @@ def load_model(model_name: str):
     return model, tokenizer, task
 
 
-def export_distilbert_model(model_name: str, output_dir: Path, verify: bool = True):
-    """Export a DistilBERT model to .tl format."""
+def export_transformer_model(
+    model_name: str,
+    output_dir: Path,
+    verify: bool = True,
+    quant_format: int = QuantFormat.F32
+):
+    """Export a transformer model (XLM-RoBERTa, DistilBERT, etc.) to .tl format."""
     model, tokenizer, task = load_model(model_name)
-    
+
     short_name = get_model_short_name(model_name)
 
     print(f"\nModel config:")
@@ -116,16 +114,21 @@ def export_distilbert_model(model_name: str, output_dir: Path, verify: bool = Tr
     # Extract all weights from the model
     print("\nModel weights:")
     for name, param in model.named_parameters():
-        # Remove "distilbert." prefix for cleaner names
-        clean_name = name.replace("distilbert.", "")
-        tensor = param.detach().cpu().float().contiguous()
+        # Remove model-specific prefixes for cleaner names
+        clean_name = name
+        for prefix in ["distilbert.", "roberta.", "xlm_roberta.", "bert."]:
+            if clean_name.startswith(prefix):
+                clean_name = clean_name[len(prefix):]
+                break
+        tensor = param.detach().cpu().float().contiguous().numpy()
         tensors[clean_name] = tensor
         print(f"  {clean_name}: {list(tensor.shape)}")
 
-    # Export model weights
+    # Export model weights with quantization support
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_path = output_dir / f"{short_name}.tl"
-    export_tensors(tensors, model_path)
+    format_suffix = "_q8" if quant_format == QuantFormat.Q8_0 else ""
+    model_path = output_dir / f"{short_name}{format_suffix}.tl"
+    export_tensors(tensors, str(model_path), quant_format=quant_format, verify=verify)
 
     # Export vocabulary
     vocab_path = output_dir / f"{short_name}_vocab.txt"
@@ -165,58 +168,6 @@ def export_metadata(model, model_name: str, task: str, output_path: Path):
         f.write(f"max_position_embeddings={model.config.max_position_embeddings}\n")
         f.write(f"num_labels={model.config.num_labels}\n")
         f.write(f"labels={','.join(labels)}\n")
-
-
-def export_tensors(tensors: dict, output_path: Path):
-    """Export tensors to .tl binary format."""
-    tensor_count = len(tensors)
-
-    print(f"\nExporting {tensor_count} tensors to {output_path}")
-
-    with open(output_path, 'wb') as f:
-        # Header
-        f.write(MAGIC)
-        f.write(struct.pack('<I', VERSION))
-        f.write(struct.pack('<I', tensor_count))
-        f.write(struct.pack('<I', 0))  # Reserved
-
-        # Write tensor metadata
-        entries = []
-        for name, tensor in tensors.items():
-            name_bytes = name.encode('utf-8')
-            shape = list(tensor.shape)
-            data_size = tensor.numel() * 4  # float32
-
-            # Name
-            f.write(struct.pack('<I', len(name_bytes)))
-            f.write(name_bytes)
-
-            # Shape
-            f.write(struct.pack('<I', len(shape)))
-            for dim in shape:
-                f.write(struct.pack('<I', dim))
-
-            # Placeholder for offset (will fill later)
-            offset_pos = f.tell()
-            f.write(struct.pack('<Q', 0))  # offset
-            f.write(struct.pack('<Q', data_size))  # size
-
-            entries.append((tensor, offset_pos))
-
-        # Write tensor data
-        for tensor, offset_pos in entries:
-            current_pos = f.tell()
-
-            # Go back and write the offset
-            f.seek(offset_pos)
-            f.write(struct.pack('<Q', current_pos))
-            f.seek(0, 2)  # Back to end
-
-            # Write data
-            f.write(tensor.numpy().astype(np.float32).tobytes())
-
-    file_size = output_path.stat().st_size
-    print(f"Exported: {file_size / 1024 / 1024:.2f} MB")
 
 
 def export_vocab(tokenizer, output_path: Path):
@@ -333,14 +284,19 @@ def list_known_models():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export DistilBERT-based models to .tl format for Zig inference",
+        description="Export transformer models to .tl format for Zig inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python tools/export_distilbert.py -m oliverguhr/fullstop-punctuation-multilang-small -o artifacts/
-    python tools/export_distilbert.py -m ProsusAI/finbert -o artifacts/
-    python tools/export_distilbert.py --list-models
-    python tools/export_distilbert.py -m oliverguhr/fullstop-punctuation-multilang-small --architecture
+    # Export float32 (default)
+    python tools/export_transformer.py -m oliverguhr/fullstop-punctuation-multilang-large -o artifacts/
+
+    # Export quantized (4x smaller)
+    python tools/export_transformer.py -m oliverguhr/fullstop-punctuation-multilang-large -o artifacts/ -q q8_0
+
+    # Other models
+    python tools/export_transformer.py -m ProsusAI/finbert -o artifacts/
+    python tools/export_transformer.py --list-models
 """
     )
     parser.add_argument(
@@ -356,11 +312,6 @@ Examples:
         help="Output directory (default: artifacts)"
     )
     parser.add_argument(
-        "--no-verify",
-        action="store_true",
-        help="Skip verification"
-    )
-    parser.add_argument(
         "--architecture",
         action="store_true",
         help="Print model architecture details"
@@ -370,6 +321,7 @@ Examples:
         action="store_true",
         help="List known/supported models"
     )
+    add_quantize_args(parser)
 
     args = parser.parse_args()
 
@@ -381,7 +333,13 @@ Examples:
         print_model_architecture(args.model)
         return
 
-    export_distilbert_model(args.model, args.output, verify=not args.no_verify)
+    quant_format = get_quant_format(args.quantize)
+    export_transformer_model(
+        args.model,
+        args.output,
+        verify=not args.no_verify,
+        quant_format=quant_format
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+# Python dependencies for Tomoul export tools
+torch>=2.0.0
+numpy>=1.20.0
+
+# For transformer model exports (export_transformer.py)
+transformers>=4.30.0

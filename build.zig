@@ -75,12 +75,20 @@ pub fn build(b: *std.Build) void {
     });
     ops_module.addImport("tensor.zig", tensor_module);
 
+    const quantization_module = b.createModule(.{
+        .root_source_file = b.path("src/core/quantization.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quantization_module.addImport("tensor.zig", tensor_module);
+
     const loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
         .target = target,
         .optimize = optimize,
     });
     loader_module.addImport("tensor.zig", tensor_module);
+    loader_module.addImport("quantization.zig", quantization_module);
 
     const attention_module = b.createModule(.{
         .root_source_file = b.path("src/core/attention.zig"),
@@ -231,12 +239,20 @@ pub fn build(b: *std.Build) void {
     });
     wasm_ops_module.addImport("tensor.zig", wasm_tensor_module);
 
+    const wasm_quantization_module = b.createModule(.{
+        .root_source_file = b.path("src/core/quantization.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_quantization_module.addImport("tensor.zig", wasm_tensor_module);
+
     const wasm_loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall,
     });
     wasm_loader_module.addImport("tensor.zig", wasm_tensor_module);
+    wasm_loader_module.addImport("quantization.zig", wasm_quantization_module);
 
     const wasm_attention_module = b.createModule(.{
         .root_source_file = b.path("src/core/attention.zig"),
@@ -443,12 +459,20 @@ fn buildNativeLib(
     });
     ops_module.addImport("tensor.zig", tensor_module);
 
+    const quantization_module = b.createModule(.{
+        .root_source_file = b.path("src/core/quantization.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quantization_module.addImport("tensor.zig", tensor_module);
+
     const loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
         .target = target,
         .optimize = optimize,
     });
     loader_module.addImport("tensor.zig", tensor_module);
+    loader_module.addImport("quantization.zig", quantization_module);
 
     const attention_module = b.createModule(.{
         .root_source_file = b.path("src/core/attention.zig"),

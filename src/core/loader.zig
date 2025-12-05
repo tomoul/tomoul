@@ -1,5 +1,8 @@
 const std = @import("std");
-const Tensor = @import("tensor.zig").Tensor;
+const tensor_import = @import("tensor.zig");
+const Tensor = tensor_import.Tensor;
+const quantization = @import("quantization.zig");
+const QuantizedTensorQ8 = quantization.QuantizedTensorQ8;
 
 /// Error types for model loading operations
 pub const LoadError = error{
@@ -10,6 +13,14 @@ pub const LoadError = error{
     OutOfMemory,
     FileNotFound,
     InvalidShape,
+    UnsupportedQuantFormat,
+};
+
+/// Quantization format codes
+pub const QuantFormat = enum(u8) {
+    f32 = 0, // Float32 (no quantization) - version 1
+    q8_0 = 1, // Q8_0: symmetric 8-bit - version 1
+    q4_0 = 2, // Q4_0: symmetric 4-bit (future)
 };
 
 /// Information about a tensor stored in the file
@@ -21,7 +32,8 @@ pub const TensorInfo = struct {
 };
 
 /// Model loader for .tl binary files
-/// Loads PyTorch weights exported by tools/export_basic.py
+/// Loads PyTorch weights exported by tools/export_basic.py or export_quantized.py
+/// Version 1 supports both float32 and quantized formats (via quant_format byte)
 pub const ModelLoader = struct {
     allocator: std.mem.Allocator,
     file_data: []const u8,
@@ -29,6 +41,7 @@ pub const ModelLoader = struct {
     tensors: std.StringHashMap(TensorInfo),
     tensor_names: std.ArrayList([]const u8),
     version: u32,
+    quant_format: QuantFormat, // Quantization format
 
     const Self = @This();
     const MAGIC = [4]u8{ 'T', 'O', 'U', 'L' };
@@ -64,6 +77,7 @@ pub const ModelLoader = struct {
             .tensors = std.StringHashMap(TensorInfo).init(allocator),
             .tensor_names = .{},
             .version = 0,
+            .quant_format = .f32,
         };
 
         try loader.parseHeader();
@@ -84,6 +98,7 @@ pub const ModelLoader = struct {
             .tensors = std.StringHashMap(TensorInfo).init(allocator),
             .tensor_names = .{},
             .version = 0,
+            .quant_format = .f32,
         };
 
         try loader.parseHeader();
@@ -127,6 +142,7 @@ pub const ModelLoader = struct {
         self.version = std.mem.readInt(u32, self.file_data[pos..][0..4], .little);
         pos += 4;
 
+        // Support version 1 only
         if (self.version != 1) {
             return LoadError.UnsupportedVersion;
         }
@@ -135,8 +151,12 @@ pub const ModelLoader = struct {
         const tensor_count = std.mem.readInt(u32, self.file_data[pos..][0..4], .little);
         pos += 4;
 
-        // Skip reserved
-        pos += 4;
+        // Read quantization format from reserved byte (first byte)
+        const format_byte = self.file_data[pos];
+        self.quant_format = std.meta.intToEnum(QuantFormat, format_byte) catch {
+            return LoadError.UnsupportedQuantFormat;
+        };
+        pos += 4; // Skip full reserved field
 
         // Parse tensor table
         for (0..tensor_count) |_| {
@@ -237,9 +257,62 @@ pub const ModelLoader = struct {
         return tensor;
     }
 
+    /// Get a quantized tensor by name (for Q8_0 format files)
+    /// Returns the tensor in quantized form for weight-only inference
+    pub fn getQuantizedTensorQ8(self: *Self, name: []const u8) !QuantizedTensorQ8 {
+        if (self.quant_format != .q8_0) {
+            return LoadError.UnsupportedQuantFormat;
+        }
+
+        const info = self.tensors.get(name) orelse return LoadError.TensorNotFound;
+
+        // Validate data bounds
+        const end_offset = info.data_offset + info.data_size;
+        if (end_offset > self.file_data.len) {
+            return LoadError.CorruptedFile;
+        }
+
+        // Create quantized tensor with the stored shape
+        var qtensor = try QuantizedTensorQ8.init(self.allocator, info.shape);
+        errdefer qtensor.deinit();
+
+        // Q8_0 format: 4-byte scale + N bytes of int8 data
+        const expected_size = 4 + qtensor.numel();
+        if (info.data_size != expected_size) {
+            return LoadError.CorruptedFile;
+        }
+
+        // Read scale (first 4 bytes)
+        const offset: usize = @intCast(info.data_offset);
+        qtensor.scale = @bitCast([4]u8{
+            self.file_data[offset],
+            self.file_data[offset + 1],
+            self.file_data[offset + 2],
+            self.file_data[offset + 3],
+        });
+
+        // Read int8 data (remaining bytes)
+        const data_start = offset + 4;
+        for (qtensor.data, 0..) |*out, i| {
+            out.* = @bitCast(self.file_data[data_start + i]);
+        }
+
+        return qtensor;
+    }
+
     /// Check if a tensor exists
     pub fn hasTensor(self: *const Self, name: []const u8) bool {
         return self.tensors.contains(name);
+    }
+
+    /// Check if this is a quantized model
+    pub fn isQuantized(self: *const Self) bool {
+        return self.quant_format != .f32;
+    }
+
+    /// Get the quantization format
+    pub fn getQuantFormat(self: *const Self) QuantFormat {
+        return self.quant_format;
     }
 
     /// Get number of tensors in the file

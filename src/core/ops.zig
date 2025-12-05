@@ -206,10 +206,6 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
 
     // Validate: A columns must match B rows
     if (k_a != k_b) {
-        std.debug.print("CRITICAL MATMUL FAILURE:\n", .{});
-        std.debug.print("  Tensor A shape: [{d}, {d}]\n", .{ a.shape[0], a.shape[1] });
-        std.debug.print("  Tensor B shape: [{d}, {d}]\n", .{ b.shape[0], b.shape[1] });
-        std.debug.print("  A columns ({d}) must match B rows ({d})\n", .{ k_a, k_b });
         return OpsError.ShapeMismatch;
     }
 
