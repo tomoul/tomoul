@@ -528,54 +528,52 @@ pub fn matmulF32Q8KSimd(
     // Initialize result to zero
     @memset(result.data, 0.0);
 
-    // SIMD vector width
-    const VEC_WIDTH = 8;
-    const Vec8i8 = @Vector(VEC_WIDTH, i8);
-    const Vec8i32 = @Vector(VEC_WIDTH, i32);
-    const Vec8f32 = @Vector(VEC_WIDTH, f32);
+    // 32-wide SIMD vectors for AVX2 optimization
+    const VEC_WIDTH = 32;
+    const Vec32i8 = @Vector(VEC_WIDTH, i8);
+    const Vec32i16 = @Vector(VEC_WIDTH, i16);
+    const Vec32f32 = @Vector(VEC_WIDTH, f32);
 
+    // i,k,j loop order for cache-friendly row-major access
     for (0..m) |i| {
         for (0..k) |kk| {
             const a_val = a.data[i * k + kk];
-            const a_vec: Vec8f32 = @splat(a_val);
+            const a_vec: Vec32f32 = @splat(a_val);
+            const row_start = kk * n;
 
             var j: usize = 0;
 
-            // SIMD loop
+            // 32-wide SIMD loop
             while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
-                // Load 8 int8 weights
-                const w_ptr = b.data[kk * n + j ..];
-                const w_i8: Vec8i8 = w_ptr[0..VEC_WIDTH].*;
+                // Load 32 int8 weights contiguously
+                const w_i8: Vec32i8 = b.data[row_start + j ..][0..VEC_WIDTH].*;
 
-                // Get scales for each weight (may span multiple blocks)
-                var scale_vec: Vec8f32 = undefined;
+                // Get scales for each weight (Q8_K has per-block scales)
+                // block_size is typically 32, so we may span 1-2 blocks
+                var scale_vec: Vec32f32 = undefined;
                 inline for (0..VEC_WIDTH) |vi| {
-                    const w_idx = kk * n + j + vi;
+                    const w_idx = row_start + j + vi;
                     const block_idx = w_idx / b.block_size;
                     scale_vec[vi] = b.scales[block_idx];
                 }
 
-                // Convert to i32 then float32
-                const w_i32: Vec8i32 = w_i8;
-                const w_f32: Vec8f32 = @floatFromInt(w_i32);
+                // Convert i8 -> i16 -> f32 (widening conversion)
+                const w_i16: Vec32i16 = w_i8;
+                const w_f32: Vec32f32 = @floatFromInt(w_i16);
 
-                // Scale to dequantize
+                // Dequantize: w_float = w_int * scale
                 const w_scaled = w_f32 * scale_vec;
 
-                // Load current result
+                // Load current result, multiply-accumulate, store back
                 const result_ptr = result.data[i * n + j ..];
-                var result_vec: Vec8f32 = result_ptr[0..VEC_WIDTH].*;
-
-                // Multiply and accumulate
+                var result_vec: Vec32f32 = result_ptr[0..VEC_WIDTH].*;
                 result_vec += a_vec * w_scaled;
-
-                // Store back
                 result_ptr[0..VEC_WIDTH].* = result_vec;
             }
 
-            // Handle remainder
+            // Handle remainder (< 32 elements)
             while (j < n) : (j += 1) {
-                const w_idx = kk * n + j;
+                const w_idx = row_start + j;
                 const block_idx = w_idx / b.block_size;
                 const scale = b.scales[block_idx];
                 const w_int = b.data[w_idx];

@@ -24,15 +24,18 @@ const attention = @import("attention.zig");
 const TransformerBlockWeights = transformer.TransformerBlockWeightsF32;
 const TransformerBlockWeightsQ8 = transformer.TransformerBlockWeightsQ8;
 const TransformerBlockWeightsQ4 = transformer.TransformerBlockWeightsQ4;
+const TransformerBlockWeightsQ8K = transformer.TransformerBlockWeightsQ8K;
 const TransformerConfig = transformer.TransformerConfig;
 const AttentionWeights = attention.AttentionWeightsF32;
 const AttentionWeightsQ8 = attention.AttentionWeightsQ8;
 const AttentionWeightsQ4 = attention.AttentionWeightsQ4;
+const AttentionWeightsQ8K = attention.AttentionWeightsQ8K;
 
 // Quantization support
 const quant = @import("quantization.zig");
 const QuantizedTensorQ8 = quant.QuantizedTensorQ8;
 const QuantizedTensorQ4 = quant.QuantizedTensorQ4;
+const QuantizedTensorQ8K = quant.QuantizedTensorQ8K;
 
 // =============================================================================
 // Tokenizer (SentencePiece for XLM-RoBERTa)
@@ -367,7 +370,7 @@ pub const CONFIG_LARGE = XLMRobertaConfig{
     .num_heads = 16,
 };
 
-/// Weight storage that can be float32, Q8_0, or Q4_0 quantized
+/// Weight storage that can be float32, Q8_0, Q4_0, or Q8_K quantized
 pub const WeightStorage = union(enum) {
     f32: struct {
         blocks: []TransformerBlockWeights,
@@ -380,6 +383,10 @@ pub const WeightStorage = union(enum) {
     q4: struct {
         blocks: []TransformerBlockWeightsQ4,
         classifier_weight: QuantizedTensorQ4,
+    },
+    q8k: struct {
+        blocks: []TransformerBlockWeightsQ8K,
+        classifier_weight: QuantizedTensorQ8K,
     },
 
     pub fn deinit(self: *WeightStorage, allocator: std.mem.Allocator) void {
@@ -395,6 +402,11 @@ pub const WeightStorage = union(enum) {
                 q.classifier_weight.deinit();
             },
             .q4 => |*q| {
+                for (q.blocks) |*block| block.deinit();
+                allocator.free(q.blocks);
+                q.classifier_weight.deinit();
+            },
+            .q8k => |*q| {
                 for (q.blocks) |*block| block.deinit();
                 allocator.free(q.blocks);
                 q.classifier_weight.deinit();
@@ -448,46 +460,48 @@ pub const XLMRobertaModel = struct {
     }
 
     /// Internal: Initialize from a ModelLoader
-    /// Auto-detects quantization format (float32, Q8_0, or Q4_0) from file header
+    /// Auto-detects quantization format (float32, Q8_0, Q4_0, or Q8_K) from file header
     fn initFromLoader(allocator: std.mem.Allocator, loader: *ModelLoader, config_opt: ?XLMRobertaConfig) !Self {
         // Auto-detect config from model weights if not provided
         const config = config_opt orelse try detectConfig(loader);
         const quant_format = loader.quant_format;
 
         // Load embeddings - always as float32 (for lookups)
-        // For Q8_0 files, getTensorDequantized handles conversion
-        var word_embeddings = if (quant_format == .q8_0 or quant_format == .q4_0)
+        // For quantized files, getTensorDequantized handles conversion
+        const is_quantized = quant_format == .q8_0 or quant_format == .q4_0 or quant_format == .q8_k;
+
+        var word_embeddings = if (is_quantized)
             try loader.getTensorDequantized("roberta.embeddings.word_embeddings.weight")
         else
             try loader.getTensor("roberta.embeddings.word_embeddings.weight");
         errdefer word_embeddings.deinit();
 
-        var position_embeddings = if (quant_format == .q8_0 or quant_format == .q4_0)
+        var position_embeddings = if (is_quantized)
             try loader.getTensorDequantized("roberta.embeddings.position_embeddings.weight")
         else
             try loader.getTensor("roberta.embeddings.position_embeddings.weight");
         errdefer position_embeddings.deinit();
 
-        var token_type_embeddings = if (quant_format == .q8_0 or quant_format == .q4_0)
+        var token_type_embeddings = if (is_quantized)
             try loader.getTensorDequantized("roberta.embeddings.token_type_embeddings.weight")
         else
             try loader.getTensor("roberta.embeddings.token_type_embeddings.weight");
         errdefer token_type_embeddings.deinit();
 
-        var embed_ln_gamma = if (quant_format == .q8_0 or quant_format == .q4_0)
+        var embed_ln_gamma = if (is_quantized)
             try loader.getTensorDequantized("roberta.embeddings.LayerNorm.weight")
         else
             try loader.getTensor("roberta.embeddings.LayerNorm.weight");
         errdefer embed_ln_gamma.deinit();
 
-        var embed_ln_beta = if (quant_format == .q8_0 or quant_format == .q4_0)
+        var embed_ln_beta = if (is_quantized)
             try loader.getTensorDequantized("roberta.embeddings.LayerNorm.bias")
         else
             try loader.getTensor("roberta.embeddings.LayerNorm.bias");
         errdefer embed_ln_beta.deinit();
 
         // Classification bias (always float32)
-        var classifier_bias = if (quant_format == .q8_0 or quant_format == .q4_0)
+        var classifier_bias = if (is_quantized)
             try loader.getTensorDequantized("classifier.bias")
         else
             try loader.getTensor("classifier.bias");
@@ -539,6 +553,28 @@ pub const XLMRobertaModel = struct {
                 .blocks = blocks,
                 .classifier_weight = classifier_weight,
             } };
+        } else if (quant_format == .q8_k) {
+            // Load Q8_K block-wise quantized weights
+            var blocks = try allocator.alloc(TransformerBlockWeightsQ8K, config.num_layers);
+            var loaded_blocks: usize = 0;
+            errdefer {
+                for (blocks[0..loaded_blocks]) |*b| b.deinit();
+                allocator.free(blocks);
+            }
+
+            for (0..config.num_layers) |i| {
+                blocks[i] = try loadTransformerBlockQ8K(allocator, loader, i);
+                loaded_blocks += 1;
+            }
+
+            // Classifier weight (quantized + transposed)
+            var classifier_weight = try loadQuantizedTransposedQ8K(allocator, loader, "classifier.weight");
+            errdefer classifier_weight.deinit();
+
+            weights = .{ .q8k = .{
+                .blocks = blocks,
+                .classifier_weight = classifier_weight,
+            } };
         } else {
             // Load float32 weights
             var blocks = try allocator.alloc(TransformerBlockWeights, config.num_layers);
@@ -582,8 +618,9 @@ pub const XLMRobertaModel = struct {
     /// Auto-detect configuration from model weights
     fn detectConfig(loader: *ModelLoader) !XLMRobertaConfig {
         // Try to detect hidden_dim from word embeddings shape
-        // Handle float32, Q8_0, and Q4_0 formats
-        var word_emb = if (loader.quant_format == .q8_0 or loader.quant_format == .q4_0)
+        // Handle float32, Q8_0, Q4_0, and Q8_K formats
+        const is_quantized = loader.quant_format == .q8_0 or loader.quant_format == .q4_0 or loader.quant_format == .q8_k;
+        var word_emb = if (is_quantized)
             try loader.getTensorDequantized("roberta.embeddings.word_embeddings.weight")
         else
             try loader.getTensor("roberta.embeddings.word_embeddings.weight");
@@ -596,7 +633,7 @@ pub const XLMRobertaModel = struct {
         var buf: [128]u8 = undefined;
         while (num_layers < 48) : (num_layers += 1) {
             const layer_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.self.query.weight", .{num_layers}) catch unreachable;
-            if (loader.quant_format == .q8_0 or loader.quant_format == .q4_0) {
+            if (is_quantized) {
                 var tensor = loader.getTensorDequantized(layer_name) catch break;
                 tensor.deinit();
             } else {
@@ -918,6 +955,101 @@ pub const XLMRobertaModel = struct {
         };
     }
 
+    /// Load a single Q8_K block-wise quantized transformer block
+    fn loadTransformerBlockQ8K(allocator: std.mem.Allocator, loader: *ModelLoader, layer_idx: usize) !TransformerBlockWeightsQ8K {
+        var buf: [128]u8 = undefined;
+
+        // Attention weights (transposed for SIMD matmul)
+        const q_weight_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.self.query.weight", .{layer_idx}) catch unreachable;
+        var q_weight = try loadQuantizedTransposedQ8K(allocator, loader, q_weight_name);
+        errdefer q_weight.deinit();
+
+        const k_weight_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.self.key.weight", .{layer_idx}) catch unreachable;
+        var k_weight = try loadQuantizedTransposedQ8K(allocator, loader, k_weight_name);
+        errdefer k_weight.deinit();
+
+        const v_weight_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.self.value.weight", .{layer_idx}) catch unreachable;
+        var v_weight = try loadQuantizedTransposedQ8K(allocator, loader, v_weight_name);
+        errdefer v_weight.deinit();
+
+        const o_weight_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.output.dense.weight", .{layer_idx}) catch unreachable;
+        var o_weight = try loadQuantizedTransposedQ8K(allocator, loader, o_weight_name);
+        errdefer o_weight.deinit();
+
+        // Biases (dequantized to float32)
+        const q_bias_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.self.query.bias", .{layer_idx}) catch unreachable;
+        var q_bias = try loader.getTensorDequantized(q_bias_name);
+        errdefer q_bias.deinit();
+
+        const k_bias_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.self.key.bias", .{layer_idx}) catch unreachable;
+        var k_bias = try loader.getTensorDequantized(k_bias_name);
+        errdefer k_bias.deinit();
+
+        const v_bias_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.self.value.bias", .{layer_idx}) catch unreachable;
+        var v_bias = try loader.getTensorDequantized(v_bias_name);
+        errdefer v_bias.deinit();
+
+        const o_bias_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.output.dense.bias", .{layer_idx}) catch unreachable;
+        var o_bias = try loader.getTensorDequantized(o_bias_name);
+        errdefer o_bias.deinit();
+
+        // Layer norm (float32)
+        const attn_ln_gamma_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.output.LayerNorm.weight", .{layer_idx}) catch unreachable;
+        var attn_ln_gamma = try loader.getTensorDequantized(attn_ln_gamma_name);
+        errdefer attn_ln_gamma.deinit();
+
+        const attn_ln_beta_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.attention.output.LayerNorm.bias", .{layer_idx}) catch unreachable;
+        var attn_ln_beta = try loader.getTensorDequantized(attn_ln_beta_name);
+        errdefer attn_ln_beta.deinit();
+
+        // FFN weights (transposed and quantized)
+        const ff1_weight_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.intermediate.dense.weight", .{layer_idx}) catch unreachable;
+        var ff1_weight = try loadQuantizedTransposedQ8K(allocator, loader, ff1_weight_name);
+        errdefer ff1_weight.deinit();
+
+        const ff1_bias_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.intermediate.dense.bias", .{layer_idx}) catch unreachable;
+        var ff1_bias = try loader.getTensorDequantized(ff1_bias_name);
+        errdefer ff1_bias.deinit();
+
+        const ff2_weight_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.output.dense.weight", .{layer_idx}) catch unreachable;
+        var ff2_weight = try loadQuantizedTransposedQ8K(allocator, loader, ff2_weight_name);
+        errdefer ff2_weight.deinit();
+
+        const ff2_bias_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.output.dense.bias", .{layer_idx}) catch unreachable;
+        var ff2_bias = try loader.getTensorDequantized(ff2_bias_name);
+        errdefer ff2_bias.deinit();
+
+        // Output layer norm (float32)
+        const ff_ln_gamma_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.output.LayerNorm.weight", .{layer_idx}) catch unreachable;
+        var ff_ln_gamma = try loader.getTensorDequantized(ff_ln_gamma_name);
+        errdefer ff_ln_gamma.deinit();
+
+        const ff_ln_beta_name = std.fmt.bufPrint(&buf, "roberta.encoder.layer.{d}.output.LayerNorm.bias", .{layer_idx}) catch unreachable;
+        var ff_ln_beta = try loader.getTensorDequantized(ff_ln_beta_name);
+        errdefer ff_ln_beta.deinit();
+
+        return TransformerBlockWeightsQ8K{
+            .attention = AttentionWeightsQ8K{
+                .q_weight = q_weight,
+                .k_weight = k_weight,
+                .v_weight = v_weight,
+                .o_weight = o_weight,
+                .q_bias = q_bias,
+                .k_bias = k_bias,
+                .v_bias = v_bias,
+                .o_bias = o_bias,
+            },
+            .attn_ln_gamma = attn_ln_gamma,
+            .attn_ln_beta = attn_ln_beta,
+            .ff_linear1_weight = ff1_weight,
+            .ff_linear1_bias = ff1_bias,
+            .ff_linear2_weight = ff2_weight,
+            .ff_linear2_bias = ff2_bias,
+            .ff_ln_gamma = ff_ln_gamma,
+            .ff_ln_beta = ff_ln_beta,
+        };
+    }
+
     /// Run inference on token IDs
     /// Returns predicted punctuation labels for each token
     pub fn forward(self: *Self, input_ids: []const u32) ![]PunctuationLabel {
@@ -1009,6 +1141,20 @@ pub const XLMRobertaModel = struct {
                     hidden = new_hidden;
                 }
                 logits = try quant.matmulF32Q4Simd(self.allocator, &hidden, &q.classifier_weight);
+            },
+            .q8k => |q| {
+                // Quantized Q8_K block-wise path
+                for (q.blocks) |*block| {
+                    const new_hidden = try transformer.transformerBlockQ8K(
+                        self.allocator,
+                        &hidden,
+                        block,
+                        transformer_config,
+                    );
+                    hidden.deinit();
+                    hidden = new_hidden;
+                }
+                logits = try quant.matmulF32Q8KSimd(self.allocator, &hidden, &q.classifier_weight);
             },
         }
         defer logits.deinit();
@@ -1183,6 +1329,36 @@ pub fn loadQuantizedTransposedQ4(allocator: std.mem.Allocator, loader: *ModelLoa
 
     // Re-quantize to Q4
     return quant.quantizeQ4(allocator, &transposed);
+}
+
+/// Helper: Load a Q8_K block-wise quantized tensor and transpose it for matmul
+/// PyTorch stores [out, in], we need [in, out] for A @ W
+/// This is done at load time (once), so overhead is acceptable.
+pub fn loadQuantizedTransposedQ8K(allocator: std.mem.Allocator, loader: *ModelLoader, name: []const u8) !QuantizedTensorQ8K {
+    // Load as Q8_K
+    var qt = try loader.getQuantizedTensorQ8K(name);
+    errdefer qt.deinit();
+
+    // For transpose: dequantize, transpose, re-quantize
+    // Dequantize to float32
+    var tensor_f32 = try Tensor.init(allocator, qt.shape);
+    defer tensor_f32.deinit();
+
+    // Q8_K has per-block scales
+    const total_elements = qt.shape[0] * qt.shape[1];
+    for (0..total_elements) |i| {
+        const block_idx = i / qt.block_size;
+        const scale = qt.scales[block_idx];
+        tensor_f32.data[i] = @as(f32, @floatFromInt(qt.data[i])) * scale;
+    }
+    qt.deinit(); // Free original after copying
+
+    // Transpose
+    var transposed = try ops.transpose(allocator, &tensor_f32);
+    defer transposed.deinit();
+
+    // Re-quantize to Q8_K
+    return quant.quantizeQ8K(allocator, &transposed);
 }
 
 // Tests

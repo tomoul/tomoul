@@ -367,7 +367,7 @@ pub const ModelLoader = struct {
         errdefer qtensor.deinit();
 
         // Q8_K format: 4-byte num_blocks + (num_blocks * 4) bytes scales + N bytes int8 data
-        const expected_size = 4 + qtensor.num_blocks * 4 + qtensor.element_count;
+        const expected_size: u64 = 4 + @as(u64, qtensor.num_blocks) * 4 + @as(u64, qtensor.element_count);
         if (info.data_size != expected_size) {
             return LoadError.CorruptedFile;
         }
@@ -491,7 +491,7 @@ pub const ModelLoader = struct {
                 // Q8_K: num_blocks + per-block scales + int8 data
                 const BLOCK_SIZE = 32;
                 const num_blocks = (tensor.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                const expected_size = 4 + num_blocks * 4 + tensor.size();
+                const expected_size: u64 = 4 + @as(u64, num_blocks) * 4 + tensor.size();
                 if (info.data_size != expected_size) {
                     return LoadError.CorruptedFile;
                 }

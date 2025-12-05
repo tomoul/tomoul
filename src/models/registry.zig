@@ -117,6 +117,7 @@ pub const models = [_]ModelConfig{
         },
         .weight_variants = &.{
             .{ .suffix = "-q8", .path = "artifacts/fullstop_punctuation_multilang_large_q8.tl", .description = "Q8 quantized - 4x smaller, 1.9x faster" },
+            .{ .suffix = "-q8k", .path = "artifacts/fullstop_punctuation_multilang_large_q8k.tl", .description = "Q8_K block-wise - 3.5x smaller, better accuracy" },
             .{ .suffix = "-q4", .path = "artifacts/fullstop_punctuation_multilang_large_q4.tl", .description = "Q4 quantized - 8x smaller" },
         },
         .has_example = false,
