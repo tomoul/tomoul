@@ -21,6 +21,7 @@ __pycache__/
 Thumbs.db
 
 # Model weights (will be generated)
+artifacts/
 *.tl
 
 # But allow test fixtures

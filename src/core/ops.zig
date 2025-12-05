@@ -192,7 +192,7 @@ pub fn negateInPlace(a: *Tensor) void {
 
 /// Matrix multiplication: C = A @ B
 /// For A with shape [M, K] and B with shape [K, N], result has shape [M, N].
-/// Uses naive triple-loop implementation O(n^3).
+/// Uses SIMD-optimized implementation with cache-friendly loop ordering.
 pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) !Tensor {
     // Validate: both must be 2D matrices
     if (a.shape.len != 2 or b.shape.len != 2) {
@@ -206,6 +206,10 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
 
     // Validate: A columns must match B rows
     if (k_a != k_b) {
+        std.debug.print("CRITICAL MATMUL FAILURE:\n", .{});
+        std.debug.print("  Tensor A shape: [{d}, {d}]\n", .{ a.shape[0], a.shape[1] });
+        std.debug.print("  Tensor B shape: [{d}, {d}]\n", .{ b.shape[0], b.shape[1] });
+        std.debug.print("  A columns ({d}) must match B rows ({d})\n", .{ k_a, k_b });
         return OpsError.ShapeMismatch;
     }
 
@@ -216,19 +220,46 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
     var result = try Tensor.init(allocator, &result_shape);
     errdefer result.deinit();
 
-    // Triple loop: C[i,j] = sum_k(A[i,k] * B[k,j])
+    // Initialize result to zero
+    @memset(result.data, 0.0);
+
+    // SIMD vector width (process 8 floats at once)
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+
+    // Optimized loop order: i, k, j
+    // This improves cache locality by accessing B's row consecutively
     for (0..m) |i| {
-        for (0..n) |j| {
-            var dot: f32 = 0.0;
-            for (0..k) |kk| {
-                // A[i, kk] is at index i * k + kk
-                // B[kk, j] is at index kk * n + j
-                const a_val = a.data[i * k + kk];
-                const b_val = b.data[kk * n + j];
-                dot += a_val * b_val;
+        for (0..k) |kk| {
+            // Broadcast A[i, kk] to all lanes of a vector
+            const a_val = a.data[i * k + kk];
+            const a_vec: Vec = @splat(a_val);
+
+            // Process B's row in chunks of VEC_WIDTH
+            var j: usize = 0;
+
+            // SIMD vectorized loop
+            while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
+                // Load 8 elements from B[kk, j..j+8]
+                const b_ptr = b.data[kk * n + j ..];
+                const b_vec: Vec = b_ptr[0..VEC_WIDTH].*;
+
+                // Load 8 elements from result[i, j..j+8]
+                const result_ptr = result.data[i * n + j ..];
+                var result_vec: Vec = result_ptr[0..VEC_WIDTH].*;
+
+                // Multiply and accumulate: result += a_val * b_vec
+                result_vec += a_vec * b_vec;
+
+                // Store back
+                result_ptr[0..VEC_WIDTH].* = result_vec;
             }
-            // C[i, j] is at index i * n + j
-            result.data[i * n + j] = dot;
+
+            // Handle remaining elements (tail loop)
+            while (j < n) : (j += 1) {
+                const b_val = b.data[kk * n + j];
+                result.data[i * n + j] += a_val * b_val;
+            }
         }
     }
 
@@ -549,7 +580,7 @@ test "reduction operations" {
 }
 
 // ============================================================================
-// Phase 2 Tests: Matrix Multiplication & Activations
+// Tests: Matrix Multiplication & Activations
 // ============================================================================
 
 test "transpose 2x3 -> 3x2" {
@@ -817,7 +848,7 @@ test "in-place activations" {
 }
 
 // ============================================================================
-// Phase 4: LSTM Operations
+// LSTM Operations
 // ============================================================================
 
 /// LSTM State holds hidden state (h) and cell state (c)
@@ -952,7 +983,7 @@ pub fn lstmCell(
 }
 
 // ============================================================================
-// Phase 4: Conv1D Operations
+// Conv1D Operations
 // ============================================================================
 
 /// 1D Convolution operation
@@ -1071,7 +1102,7 @@ pub fn addBias2d(input: *Tensor, bias: *const Tensor) OpsError!void {
 }
 
 // ============================================================================
-// Phase 4 Tests: LSTM and Conv1D
+// Tests: LSTM and Conv1D
 // ============================================================================
 
 test "lstm state init and reset" {
@@ -1268,4 +1299,620 @@ test "slice1d" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), sliced.data[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), sliced.data[1], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), sliced.data[2], 0.001);
+}
+
+// ============================================================================
+// Transformer Primitives
+// ============================================================================
+
+/// Embedding lookup: convert token IDs to vectors
+/// input_ids: array of token indices
+/// weight: [vocab_size, embedding_dim] embedding table
+/// Returns: [input_len, embedding_dim] tensor
+pub fn embedding(
+    allocator: std.mem.Allocator,
+    input_ids: []const u32,
+    weight: *const Tensor,
+) !Tensor {
+    if (weight.shape.len != 2) {
+        return OpsError.InvalidShape;
+    }
+
+    const vocab_size = weight.shape[0];
+    const embed_dim = weight.shape[1];
+    const seq_len = input_ids.len;
+
+    var result_shape = [_]usize{ seq_len, embed_dim };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    for (input_ids, 0..) |token_id, i| {
+        if (token_id >= vocab_size) return OpsError.OutOfBounds;
+
+        // Copy row from embedding table
+        const src_start = token_id * embed_dim;
+        const dst_start = i * embed_dim;
+        @memcpy(
+            result.data[dst_start..][0..embed_dim],
+            weight.data[src_start..][0..embed_dim],
+        );
+    }
+
+    return result;
+}
+
+/// Layer Normalization
+/// Normalizes across the last dimension (features)
+/// y = (x - mean) / sqrt(var + eps) * gamma + beta
+pub fn layerNorm(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    gamma: *const Tensor,
+    beta: *const Tensor,
+    epsilon: f32,
+) !Tensor {
+    if (input.shape.len != 2) {
+        return OpsError.InvalidShape;
+    }
+
+    const seq_len = input.shape[0];
+    const hidden_dim = input.shape[1];
+
+    if (gamma.shape.len != 1 or gamma.shape[0] != hidden_dim) {
+        return OpsError.ShapeMismatch;
+    }
+    if (beta.shape.len != 1 or beta.shape[0] != hidden_dim) {
+        return OpsError.ShapeMismatch;
+    }
+
+    var result = try input.clone(allocator);
+    errdefer result.deinit();
+
+    for (0..seq_len) |row| {
+        const row_start = row * hidden_dim;
+        const row_data = result.data[row_start..][0..hidden_dim];
+
+        // Calculate mean
+        var mean_val: f32 = 0.0;
+        for (row_data) |v| mean_val += v;
+        mean_val /= @floatFromInt(hidden_dim);
+
+        // Calculate variance
+        var variance: f32 = 0.0;
+        for (row_data) |v| {
+            const diff = v - mean_val;
+            variance += diff * diff;
+        }
+        variance /= @floatFromInt(hidden_dim);
+
+        // Normalize, scale, and shift
+        const std_dev = @sqrt(variance + epsilon);
+        for (row_data, 0..) |*v, i| {
+            const normalized = (v.* - mean_val) / std_dev;
+            v.* = normalized * gamma.data[i] + beta.data[i];
+        }
+    }
+
+    return result;
+}
+
+/// In-place layer normalization
+pub fn layerNormInPlace(
+    input: *Tensor,
+    gamma: *const Tensor,
+    beta: *const Tensor,
+    epsilon: f32,
+) OpsError!void {
+    if (input.shape.len != 2) {
+        return OpsError.InvalidShape;
+    }
+
+    const seq_len = input.shape[0];
+    const hidden_dim = input.shape[1];
+
+    if (gamma.shape.len != 1 or gamma.shape[0] != hidden_dim) {
+        return OpsError.ShapeMismatch;
+    }
+    if (beta.shape.len != 1 or beta.shape[0] != hidden_dim) {
+        return OpsError.ShapeMismatch;
+    }
+
+    for (0..seq_len) |row| {
+        const row_start = row * hidden_dim;
+        const row_data = input.data[row_start..][0..hidden_dim];
+
+        var mean_val: f32 = 0.0;
+        for (row_data) |v| mean_val += v;
+        mean_val /= @floatFromInt(hidden_dim);
+
+        var variance: f32 = 0.0;
+        for (row_data) |v| {
+            const diff = v - mean_val;
+            variance += diff * diff;
+        }
+        variance /= @floatFromInt(hidden_dim);
+
+        const std_dev = @sqrt(variance + epsilon);
+        for (row_data, 0..) |*v, i| {
+            const normalized = (v.* - mean_val) / std_dev;
+            v.* = normalized * gamma.data[i] + beta.data[i];
+        }
+    }
+}
+
+/// GELU activation (Gaussian Error Linear Unit)
+/// Used by BERT/DistilBERT instead of ReLU
+/// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+pub fn gelu(tensor: *Tensor) void {
+    const sqrt_2_over_pi: f32 = 0.7978845608; // sqrt(2/pi)
+    const coeff: f32 = 0.044715;
+
+    for (tensor.data) |*x| {
+        const x3 = x.* * x.* * x.*;
+        const inner = sqrt_2_over_pi * (x.* + coeff * x3);
+        x.* = 0.5 * x.* * (1.0 + std.math.tanh(inner));
+    }
+}
+
+/// Allocating version of GELU
+pub fn geluAlloc(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
+    var result = try tensor.clone(allocator);
+    gelu(&result);
+    return result;
+}
+
+/// Softmax along last dimension (rows)
+/// Uses stable softmax: subtract max before exp to prevent overflow
+pub fn softmax(tensor: *Tensor) void {
+    if (tensor.shape.len != 2) {
+        return; // Only support 2D tensors for now
+    }
+
+    const rows = tensor.shape[0];
+    const cols = tensor.shape[1];
+
+    for (0..rows) |row| {
+        const row_start = row * cols;
+        const row_data = tensor.data[row_start..][0..cols];
+
+        // Find max for numerical stability
+        var max_val: f32 = row_data[0];
+        for (row_data[1..]) |v| {
+            if (v > max_val) max_val = v;
+        }
+
+        // Compute exp(x - max) and sum
+        var sum_val: f32 = 0.0;
+        for (row_data) |*v| {
+            v.* = @exp(v.* - max_val);
+            sum_val += v.*;
+        }
+
+        // Normalize
+        for (row_data) |*v| {
+            v.* /= sum_val;
+        }
+    }
+}
+
+/// Allocating softmax
+pub fn softmaxAlloc(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
+    var result = try tensor.clone(allocator);
+    softmax(&result);
+    return result;
+}
+
+/// Add bias to each row of a 2D tensor
+/// input: [seq_len, hidden_dim], bias: [hidden_dim]
+/// Modifies input in place
+pub fn addBiasInPlace(input: *Tensor, bias: *const Tensor) OpsError!void {
+    if (input.shape.len != 2 or bias.shape.len != 1) {
+        return OpsError.InvalidShape;
+    }
+
+    const seq_len = input.shape[0];
+    const hidden_dim = input.shape[1];
+
+    if (bias.shape[0] != hidden_dim) {
+        return OpsError.ShapeMismatch;
+    }
+
+    for (0..seq_len) |row| {
+        const row_start = row * hidden_dim;
+        for (0..hidden_dim) |col| {
+            input.data[row_start + col] += bias.data[col];
+        }
+    }
+}
+
+/// Slice columns from a 2D tensor
+/// Returns a new tensor with columns [start, end)
+pub fn sliceColumns(
+    allocator: std.mem.Allocator,
+    t: *const Tensor,
+    start: usize,
+    end: usize,
+) !Tensor {
+    if (t.shape.len != 2) {
+        return OpsError.InvalidShape;
+    }
+    if (start >= end or end > t.shape[1]) {
+        return OpsError.OutOfBounds;
+    }
+
+    const rows = t.shape[0];
+    const orig_cols = t.shape[1];
+    const new_cols = end - start;
+
+    var out_shape = [_]usize{ rows, new_cols };
+    var result = try Tensor.init(allocator, &out_shape);
+    errdefer result.deinit();
+
+    for (0..rows) |row| {
+        const src_row_start = row * orig_cols + start;
+        const dst_row_start = row * new_cols;
+        @memcpy(
+            result.data[dst_row_start..][0..new_cols],
+            t.data[src_row_start..][0..new_cols],
+        );
+    }
+
+    return result;
+}
+
+/// Concatenate multiple tensors along columns (axis 1)
+/// All tensors must have the same number of rows
+pub fn concatColumns(
+    allocator: std.mem.Allocator,
+    tensors: []const Tensor,
+) !Tensor {
+    if (tensors.len == 0) {
+        return OpsError.InvalidShape;
+    }
+
+    // Verify all tensors are 2D with same number of rows
+    const rows = tensors[0].shape[0];
+    var total_cols: usize = 0;
+
+    for (tensors) |t| {
+        if (t.shape.len != 2) {
+            return OpsError.InvalidShape;
+        }
+        if (t.shape[0] != rows) {
+            return OpsError.ShapeMismatch;
+        }
+        total_cols += t.shape[1];
+    }
+
+    var out_shape = [_]usize{ rows, total_cols };
+    var result = try Tensor.init(allocator, &out_shape);
+    errdefer result.deinit();
+
+    for (0..rows) |row| {
+        var col_offset: usize = 0;
+        for (tensors) |t| {
+            const t_cols = t.shape[1];
+            const src_start = row * t_cols;
+            const dst_start = row * total_cols + col_offset;
+            @memcpy(
+                result.data[dst_start..][0..t_cols],
+                t.data[src_start..][0..t_cols],
+            );
+            col_offset += t_cols;
+        }
+    }
+
+    return result;
+}
+
+/// Argmax along last dimension (rows)
+/// Returns indices of maximum values for each row
+pub fn argmax(allocator: std.mem.Allocator, tensor: *const Tensor) ![]usize {
+    if (tensor.shape.len != 2) {
+        return OpsError.InvalidShape;
+    }
+
+    const rows = tensor.shape[0];
+    const cols = tensor.shape[1];
+
+    var indices = try allocator.alloc(usize, rows);
+    errdefer allocator.free(indices);
+
+    for (0..rows) |row| {
+        const row_start = row * cols;
+        var max_idx: usize = 0;
+        var max_val = tensor.data[row_start];
+
+        for (1..cols) |col| {
+            if (tensor.data[row_start + col] > max_val) {
+                max_val = tensor.data[row_start + col];
+                max_idx = col;
+            }
+        }
+        indices[row] = max_idx;
+    }
+
+    return indices;
+}
+
+// ============================================================================
+// Tests: Transformer Primitives
+// ============================================================================
+
+test "embedding lookup" {
+    const allocator = std.testing.allocator;
+
+    // Embedding table: 3 tokens, 2 dims each
+    // [[1,1], [2,2], [3,3]]
+    var weight_shape = [_]usize{ 3, 2 };
+    var weight = try Tensor.init(allocator, &weight_shape);
+    defer weight.deinit();
+    weight.data[0] = 1;
+    weight.data[1] = 1; // token 0
+    weight.data[2] = 2;
+    weight.data[3] = 2; // token 1
+    weight.data[4] = 3;
+    weight.data[5] = 3; // token 2
+
+    // Look up tokens [2, 0]
+    const ids = [_]u32{ 2, 0 };
+    var result = try embedding(allocator, &ids, &weight);
+    defer result.deinit();
+
+    // Expect [[3,3], [1,1]]
+    try std.testing.expectEqual(@as(usize, 2), result.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), result.shape[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), result.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), result.data[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), result.data[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), result.data[3], 0.001);
+}
+
+test "embedding invalid token" {
+    const allocator = std.testing.allocator;
+
+    var weight_shape = [_]usize{ 3, 2 };
+    var weight = try Tensor.init(allocator, &weight_shape);
+    defer weight.deinit();
+
+    // Token ID 5 is out of bounds for vocab size 3
+    const ids = [_]u32{5};
+    const result = embedding(allocator, &ids, &weight);
+    try std.testing.expectError(OpsError.OutOfBounds, result);
+}
+
+test "layer normalization" {
+    const allocator = std.testing.allocator;
+
+    // Input: [1, 2, 3]
+    var input_shape = [_]usize{ 1, 3 };
+    var input = try Tensor.init(allocator, &input_shape);
+    defer input.deinit();
+    input.data[0] = 1.0;
+    input.data[1] = 2.0;
+    input.data[2] = 3.0;
+
+    // gamma = [1, 1, 1], beta = [0, 0, 0] (no scaling/shifting)
+    var param_shape = [_]usize{3};
+    var gamma_tensor = try Tensor.init(allocator, &param_shape);
+    defer gamma_tensor.deinit();
+    gamma_tensor.fill(1.0);
+
+    var beta_tensor = try Tensor.init(allocator, &param_shape);
+    defer beta_tensor.deinit();
+    beta_tensor.fill(0.0);
+
+    var result = try layerNorm(allocator, &input, &gamma_tensor, &beta_tensor, 1e-5);
+    defer result.deinit();
+
+    // After normalization: mean ≈ 0, std ≈ 1
+    var sum_val: f32 = 0.0;
+    for (result.data) |v| sum_val += v;
+    const mean_val = sum_val / 3.0;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mean_val, 0.001);
+
+    // Values should be approximately [-1.22, 0, 1.22]
+    try std.testing.expectApproxEqAbs(@as(f32, -1.2247), result.data[0], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), result.data[1], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2247), result.data[2], 0.01);
+}
+
+test "gelu activation" {
+    const allocator = std.testing.allocator;
+
+    var shape = [_]usize{5};
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    tensor.data[0] = -2.0;
+    tensor.data[1] = -1.0;
+    tensor.data[2] = 0.0;
+    tensor.data[3] = 1.0;
+    tensor.data[4] = 2.0;
+
+    gelu(&tensor);
+
+    // GELU(-2) ≈ -0.0454
+    // GELU(-1) ≈ -0.1588
+    // GELU(0) = 0
+    // GELU(1) ≈ 0.8412
+    // GELU(2) ≈ 1.9545
+    try std.testing.expectApproxEqAbs(@as(f32, -0.0454), tensor.data[0], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.1588), tensor.data[1], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), tensor.data[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8412), tensor.data[3], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.9545), tensor.data[4], 0.01);
+}
+
+test "softmax" {
+    const allocator = std.testing.allocator;
+
+    var shape = [_]usize{ 1, 2 };
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    tensor.data[0] = 0.0;
+    tensor.data[1] = 1.0;
+
+    softmax(&tensor);
+
+    // softmax([0, 1]) ≈ [0.2689, 0.7311]
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2689), tensor.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7311), tensor.data[1], 0.001);
+
+    // Sum should be 1.0
+    const sum_val = tensor.data[0] + tensor.data[1];
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum_val, 0.0001);
+}
+
+test "softmax numerical stability" {
+    const allocator = std.testing.allocator;
+
+    var shape = [_]usize{ 1, 3 };
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    // Large values that would overflow without max subtraction
+    tensor.data[0] = 1000.0;
+    tensor.data[1] = 1001.0;
+    tensor.data[2] = 1002.0;
+
+    softmax(&tensor);
+
+    // Should still sum to 1.0 and not produce inf/nan
+    var sum_val: f32 = 0.0;
+    for (tensor.data) |v| {
+        try std.testing.expect(!std.math.isNan(v));
+        try std.testing.expect(!std.math.isInf(v));
+        sum_val += v;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum_val, 0.0001);
+}
+
+test "slice columns" {
+    const allocator = std.testing.allocator;
+
+    // 2x4 tensor
+    var shape = [_]usize{ 2, 4 };
+    var t = try Tensor.init(allocator, &shape);
+    defer t.deinit();
+    // Row 0: [0, 1, 2, 3]
+    // Row 1: [4, 5, 6, 7]
+    for (t.data, 0..) |*v, i| {
+        v.* = @floatFromInt(i);
+    }
+
+    // Slice columns [1:3]
+    var sliced = try sliceColumns(allocator, &t, 1, 3);
+    defer sliced.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), sliced.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), sliced.shape[1]);
+    // Row 0: [1, 2]
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sliced.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), sliced.data[1], 0.001);
+    // Row 1: [5, 6]
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), sliced.data[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), sliced.data[3], 0.001);
+}
+
+test "concat columns" {
+    const allocator = std.testing.allocator;
+
+    // Tensor 1: 2x2
+    var shape1 = [_]usize{ 2, 2 };
+    var t1 = try Tensor.init(allocator, &shape1);
+    defer t1.deinit();
+    t1.data[0] = 1.0;
+    t1.data[1] = 2.0;
+    t1.data[2] = 5.0;
+    t1.data[3] = 6.0;
+
+    // Tensor 2: 2x3
+    var shape2 = [_]usize{ 2, 3 };
+    var t2 = try Tensor.init(allocator, &shape2);
+    defer t2.deinit();
+    t2.data[0] = 3.0;
+    t2.data[1] = 4.0;
+    t2.data[2] = 0.0;
+    t2.data[3] = 7.0;
+    t2.data[4] = 8.0;
+    t2.data[5] = 0.0;
+
+    const tensors = [_]Tensor{ t1, t2 };
+    var concat = try concatColumns(allocator, &tensors);
+    defer concat.deinit();
+
+    // Result: 2x5
+    try std.testing.expectEqual(@as(usize, 2), concat.shape[0]);
+    try std.testing.expectEqual(@as(usize, 5), concat.shape[1]);
+
+    // Row 0: [1, 2, 3, 4, 0]
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), concat.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), concat.data[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), concat.data[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), concat.data[3], 0.001);
+    // Row 1: [5, 6, 7, 8, 0]
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), concat.data[5], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), concat.data[6], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), concat.data[7], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), concat.data[8], 0.001);
+}
+
+test "argmax" {
+    const allocator = std.testing.allocator;
+
+    var shape = [_]usize{ 3, 4 };
+    var t = try Tensor.init(allocator, &shape);
+    defer t.deinit();
+
+    // Row 0: max at index 2
+    t.data[0] = 0.1;
+    t.data[1] = 0.2;
+    t.data[2] = 0.9;
+    t.data[3] = 0.3;
+    // Row 1: max at index 0
+    t.data[4] = 0.8;
+    t.data[5] = 0.2;
+    t.data[6] = 0.1;
+    t.data[7] = 0.3;
+    // Row 2: max at index 3
+    t.data[8] = 0.1;
+    t.data[9] = 0.2;
+    t.data[10] = 0.3;
+    t.data[11] = 0.7;
+
+    const indices = try argmax(allocator, &t);
+    defer allocator.free(indices);
+
+    try std.testing.expectEqual(@as(usize, 2), indices[0]);
+    try std.testing.expectEqual(@as(usize, 0), indices[1]);
+    try std.testing.expectEqual(@as(usize, 3), indices[2]);
+}
+
+test "add bias in place" {
+    const allocator = std.testing.allocator;
+
+    var input_shape = [_]usize{ 2, 3 };
+    var input = try Tensor.init(allocator, &input_shape);
+    defer input.deinit();
+    input.fill(1.0);
+
+    var bias_shape = [_]usize{3};
+    var bias = try Tensor.init(allocator, &bias_shape);
+    defer bias.deinit();
+    bias.data[0] = 0.1;
+    bias.data[1] = 0.2;
+    bias.data[2] = 0.3;
+
+    try addBiasInPlace(&input, &bias);
+
+    // Row 0: [1.1, 1.2, 1.3]
+    try std.testing.expectApproxEqAbs(@as(f32, 1.1), input.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), input.data[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.3), input.data[2], 0.001);
+    // Row 1: [1.1, 1.2, 1.3]
+    try std.testing.expectApproxEqAbs(@as(f32, 1.1), input.data[3], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), input.data[4], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.3), input.data[5], 0.001);
 }

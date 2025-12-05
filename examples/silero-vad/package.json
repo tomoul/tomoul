@@ -1,0 +1,22 @@
+{
+  "name": "tomoul-silero-vad-demo",
+  "version": "1.0.0",
+  "description": "Silero VAD WebAssembly demo server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js 8000"
+  },
+  "keywords": [
+    "vad",
+    "voice-activity-detection",
+    "wasm",
+    "webassembly",
+    "silero"
+  ],
+  "author": "Tomoul",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

@@ -1,349 +1,512 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tomoul VAD - WebAssembly Demo</title>
+    <link rel="icon" type="image/png" href="../../tomoul-dark.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+        rel="stylesheet">
     <style>
+        :root {
+            --color-primary: #ceff00;
+            /* Updated Neon Yellow */
+            --color-text: #111111;
+            --color-bg-light: #FFFFFF;
+            --color-bg-dark: #111111;
+            --color-text-light: #EEEEEE;
+            --color-border: #333333;
+            --color-success: #00C853;
+            --color-error: #FF3D00;
+            --font-main: 'Inter', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            --font-brand: 'Space Grotesk', sans-serif;
+            --radius: 12px;
+        }
+
         * {
             box-sizing: border-box;
             margin: 0;
             padding: 0;
         }
+
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a2e;
-            color: #eee;
+            font-family: var(--font-main);
+            color: var(--color-text);
+            background: var(--color-bg-light);
             min-height: 100vh;
             display: flex;
             flex-direction: column;
+        }
+
+        /* Top Section - Yellow */
+        .hero-section {
+            background-color: var(--color-primary);
+            padding: 1.5rem 5%;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+        }
+
+        .header {
+            display: flex;
+            justify-content: center;
+            /* Centered */
             align-items: center;
-            padding: 2rem;
+            max-width: 900px;
+            margin: 0 auto;
         }
-        h1 {
-            color: #00d9ff;
-            margin-bottom: 0.5rem;
+
+        .logo {
+            height: 40px;
+            width: auto;
         }
-        .subtitle {
-            color: #888;
-            margin-bottom: 2rem;
+
+        .menu-icon {
+            width: 32px;
+            height: 20px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            cursor: pointer;
         }
-        .container {
-            max-width: 600px;
+
+        .menu-line {
             width: 100%;
+            height: 2px;
+            background-color: var(--color-text);
         }
-        .status-card {
-            background: #252547;
-            border-radius: 12px;
-            padding: 1.5rem;
+
+        .hero-content {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            font-size: 3.5rem;
+            font-weight: 600;
+            line-height: 1.1;
+            letter-spacing: -0.03em;
+            margin-bottom: 1.5rem;
+            max-width: 25ch;
+        }
+
+        .subtitle {
+            font-size: 1.1rem;
+            line-height: 1.5;
+            max-width: 60ch;
+            opacity: 0.8;
+        }
+
+        /* Bottom Section - Dark */
+        .main-content {
+            padding: 3rem 5%;
+            flex: 1;
+            background: var(--color-bg-dark);
+            color: var(--color-text-light);
+        }
+
+        .section-label {
+            font-family: var(--font-brand);
+            font-size: 0.9rem;
+            font-weight: 600;
+            margin-bottom: 2rem;
+            display: block;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            text-align: center;
+            /* Centered */
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 3rem;
+            max-width: 900px;
+            /* More compact */
+            margin: 0 auto;
+            /* Centered */
+        }
+
+        @media (max-width: 900px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+                gap: 2rem;
+            }
+
+            h1 {
+                font-size: 2.5rem;
+            }
+        }
+
+        /* Cards & Controls */
+        .control-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+        }
+
+        .mic-wrapper {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 1rem;
+        }
+
+        .big-button {
+            background: var(--color-text-light);
+            color: var(--color-bg-dark);
+            border: none;
+            padding: 0.85rem 1.75rem;
+            font-size: 1rem;
+            font-weight: 600;
+            font-family: var(--font-main);
+            border-radius: 50px;
+            cursor: pointer;
+            transition: transform 0.2s, opacity 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .big-button:hover {
+            transform: translateY(-2px);
+            opacity: 0.95;
+        }
+
+        .big-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+            background: #ccc;
+            color: #666;
+        }
+
+        .big-button.recording {
+            background: var(--color-error);
+            color: white;
+        }
+
+        .indicator-row {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            font-family: 'Monaco', monospace;
+            font-size: 0.9rem;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ddd;
+            transition: background 0.2s;
+        }
+
+        .status-dot.active {
+            background: var(--color-success);
+            box-shadow: 0 0 10px var(--color-success);
+        }
+
+        .prob-container {
+            width: 100%;
+            max-width: 400px;
+        }
+
+        .prob-bar-bg {
+            height: 4px;
+            background: #333;
+            width: 100%;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 0.5rem;
+        }
+
+        .prob-bar-fill {
+            height: 100%;
+            background: var(--color-primary);
+            width: 0%;
+            transition: width 0.1s linear;
+        }
+
+        .prob-value {
+            font-family: 'Monaco', monospace;
+            font-size: 2.5rem;
+            font-weight: 600;
+            letter-spacing: -0.05em;
+        }
+
+        /* Info Panel */
+        .info-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .info-card {
+            background: #1a1a1a;
+            padding: 1.25rem;
+            border-radius: var(--radius);
+            border: 1px solid var(--color-border);
+        }
+
+        .info-card h3 {
             margin-bottom: 1rem;
+            font-size: 1rem;
+            font-family: var(--font-main);
+            font-weight: 600;
         }
-        .status-row {
+
+        .info-row {
             display: flex;
             justify-content: space-between;
-            align-items: center;
             margin-bottom: 0.5rem;
+            font-size: 0.85rem;
         }
-        .status-label {
+
+        .info-label {
             color: #888;
         }
-        .status-value {
-            font-family: 'Monaco', 'Consolas', monospace;
+
+        .info-value {
+            font-family: var(--font-mono);
+            font-weight: 600;
+            color: var(--color-text-light);
         }
-        .status-value.ready {
-            color: #00ff88;
-        }
-        .status-value.loading {
-            color: #ffaa00;
-        }
-        .status-value.error {
-            color: #ff4444;
-        }
-        .prob-display {
-            text-align: center;
-            padding: 2rem;
-        }
-        .prob-value {
-            font-size: 4rem;
-            font-weight: bold;
-            color: #00d9ff;
-            font-family: 'Monaco', 'Consolas', monospace;
-        }
-        .prob-bar {
-            height: 20px;
-            background: #333;
-            border-radius: 10px;
-            margin: 1rem 0;
-            overflow: hidden;
-        }
-        .prob-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #00d9ff, #00ff88);
-            border-radius: 10px;
-            transition: width 0.1s ease;
-            width: 0%;
-        }
-        .controls {
+
+        .test-controls {
             display: flex;
-            gap: 1rem;
-            justify-content: center;
+            flex-wrap: wrap;
+            gap: 0.5rem;
             margin-top: 1rem;
         }
-        button {
-            background: #00d9ff;
-            color: #1a1a2e;
-            border: none;
-            padding: 0.75rem 1.5rem;
-            border-radius: 8px;
-            font-size: 1rem;
-            font-weight: bold;
+
+        .btn-small {
+            background: transparent;
+            border: 1px solid #444;
+            color: #ccc;
+            padding: 0.4rem 0.8rem;
+            border-radius: 6px;
+            font-size: 0.8rem;
             cursor: pointer;
-            transition: opacity 0.2s;
+            transition: all 0.2s;
         }
-        button:hover {
-            opacity: 0.9;
+
+        .btn-small:hover {
+            border-color: var(--color-primary);
+            color: var(--color-primary);
+            background: rgba(206, 255, 0, 0.05);
         }
-        button:disabled {
+
+        .btn-small:disabled {
             opacity: 0.5;
             cursor: not-allowed;
         }
-        .log {
-            background: #16162a;
-            border-radius: 8px;
-            padding: 1rem;
-            font-family: 'Monaco', 'Consolas', monospace;
-            font-size: 0.85rem;
-            max-height: 200px;
-            overflow-y: auto;
-        }
-        .log-entry {
-            margin-bottom: 0.25rem;
-            color: #888;
-        }
-        .log-entry.info {
-            color: #00d9ff;
-        }
-        .log-entry.success {
-            color: #00ff88;
-        }
-        .log-entry.error {
-            color: #ff4444;
-        }
-        .footer {
-            margin-top: 2rem;
-            color: #666;
-            font-size: 0.85rem;
+
+        /* File Upload */
+        .file-upload-area {
+            border: 2px dashed #333;
+            padding: 1.5rem;
+            border-radius: var(--radius);
             text-align: center;
-        }
-        .footer a {
-            color: #00d9ff;
-            text-decoration: none;
-        }
-        /* Speech indicator */
-        .speech-indicator {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-            margin-bottom: 1rem;
-        }
-        .recording-dot {
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            background: #444;
-            transition: background 0.1s;
-        }
-        .recording-dot.listening {
-            background: #888;
-            animation: pulse 1.5s infinite;
-        }
-        .recording-dot.speech {
-            background: #00ff88;
-            animation: pulse-fast 0.3s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        @keyframes pulse-fast {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.2); }
-        }
-        .speech-label {
-            font-weight: bold;
-            color: #888;
-            transition: color 0.1s;
-        }
-        .speech-label.speech {
-            color: #00ff88;
-        }
-        .prob-value.speech {
-            color: #00ff88;
-        }
-        .prob-value.silence {
-            color: #888;
-        }
-        button.recording {
-            background: #ff4444;
-        }
-        .mic-controls {
-            display: flex;
-            gap: 1rem;
-            justify-content: center;
-            margin-bottom: 1rem;
-            padding-bottom: 1rem;
-            border-bottom: 1px solid #333;
-        }
-        .file-upload {
-            border: 2px dashed #444;
-            border-radius: 8px;
-            padding: 1rem;
-            text-align: center;
-            margin-bottom: 1rem;
             cursor: pointer;
-            transition: border-color 0.2s, background 0.2s;
-        }
-        .file-upload:hover {
-            border-color: #00d9ff;
-            background: rgba(0, 217, 255, 0.05);
-        }
-        .file-upload.dragover {
-            border-color: #00ff88;
-            background: rgba(0, 255, 136, 0.1);
-        }
-        .file-upload input {
-            display: none;
-        }
-        .file-info {
-            margin-top: 0.5rem;
-            font-size: 0.85rem;
-            color: #888;
-        }
-        .file-results {
-            background: #16162a;
-            border-radius: 8px;
-            padding: 1rem;
+            transition: border-color 0.2s;
             margin-top: 1rem;
+            background: #1a1a1a;
+            font-family: var(--font-main);
+        }
+
+        .file-upload-area:hover {
+            border-color: var(--color-primary);
+            background: #222;
+        }
+
+        .file-upload-area input {
             display: none;
         }
-        .file-results.visible {
-            display: block;
+
+        /* Logs */
+        .log-container {
+            background: #111;
+            color: #eee;
+            padding: 1rem;
+            border-radius: var(--radius);
+            font-family: 'Monaco', monospace;
+            font-size: 0.8rem;
+            height: 200px;
+            overflow-y: auto;
+            margin-top: 2rem;
         }
-        .result-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 0.25rem 0;
-            border-bottom: 1px solid #333;
+
+        .log-entry {
+            margin-bottom: 4px;
+            opacity: 0.7;
         }
-        .result-row:last-child {
-            border-bottom: none;
+
+        .log-entry.success {
+            color: var(--color-success);
+            opacity: 1;
         }
-        .result-label {
-            color: #888;
+
+        .log-entry.error {
+            color: var(--color-error);
+            opacity: 1;
         }
-        .result-value {
-            font-family: 'Monaco', 'Consolas', monospace;
-            color: #00d9ff;
+
+        .log-entry.info {
+            color: #4FC3F7;
         }
-        .result-value.speech {
-            color: #00ff88;
+
+        /* Footer */
+        .footer {
+            padding: 2rem 5%;
+            text-align: center;
+            color: #444;
+            font-size: 0.8rem;
+            border-top: 1px solid #222;
+            background: var(--color-bg-dark);
+        }
+
+        /* Animations */
+        @keyframes pulse {
+            0% {
+                transform: scale(1);
+                opacity: 1;
+            }
+
+            50% {
+                transform: scale(1.2);
+                opacity: 0.8;
+            }
+
+            100% {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        .animate-pulse {
+            animation: pulse 2s infinite;
         }
     </style>
 </head>
+
 <body>
-    <h1>TOMOUL VAD</h1>
-    <p class="subtitle">Voice Activity Detection in WebAssembly</p>
 
-    <div class="container">
-        <div class="status-card">
-            <div class="status-row">
-                <span class="status-label">Wasm Status:</span>
-                <span id="wasm-status" class="status-value loading">Loading...</span>
-            </div>
-            <div class="status-row">
-                <span class="status-label">Model Size:</span>
-                <span id="model-size" class="status-value">--</span>
-            </div>
-            <div class="status-row">
-                <span class="status-label">API Version:</span>
-                <span id="api-version" class="status-value">--</span>
+    <!-- Yellow Hero Section -->
+    <section class="hero-section">
+        <div class="header">
+            <div style="display: flex; align-items: center; gap: 1rem;">
+                <img src="tomoul.png" alt="Tomoul" class="logo">
+                <span
+                    style="font-family: var(--font-brand); font-weight: 700; font-size: 1.25rem; opacity: 1.0; letter-spacing: -0.02em;">Tomoul
+                    Silero VAD Demo</span>
             </div>
         </div>
+    </section>
 
-        <div class="status-card">
-            <div class="speech-indicator">
-                <div class="recording-dot" id="recording-dot"></div>
-                <span class="speech-label" id="speech-label">Idle</span>
-            </div>
-            <div class="prob-display">
-                <div class="prob-value" id="prob-value">0.0000</div>
-                <div class="prob-bar">
-                    <div class="prob-fill" id="prob-fill"></div>
+    <!-- White Content Section -->
+    <section class="main-content">
+        <span class="section-label">Live Demonstration</span>
+
+        <div class="dashboard-grid">
+            <!-- Left Column: Primary Interaction -->
+            <div class="control-panel">
+                <div class="mic-wrapper">
+                    <button id="start-mic" class="big-button" disabled>
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                            <line x1="12" y1="19" x2="12" y2="23"></line>
+                            <line x1="8" y1="23" x2="16" y2="23"></line>
+                        </svg>
+                        Start Microphone
+                    </button>
+                    <button id="stop-mic" class="big-button recording" style="display: none;">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        </svg>
+                        Stop Microphone
+                    </button>
+
+                    <div class="indicator-row">
+                        <div id="recording-dot" class="status-dot"></div>
+                        <span id="speech-label">Idle</span>
+                    </div>
                 </div>
-                <p style="color: #888; margin-top: 0.5rem;">Speech Probability</p>
+
+                <div class="prob-container">
+                    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                        <span style="color: #888; font-size: 0.9rem;">Speech Probability</span>
+                        <span id="prob-value" class="prob-value">0.00</span>
+                    </div>
+                    <div class="prob-bar-bg">
+                        <div id="prob-fill" class="prob-bar-fill"></div>
+                    </div>
+                </div>
+
+                <div class="file-upload-area" id="file-upload">
+                    <input type="file" id="audio-file" accept=".wav,.mp3,.ogg,.webm,audio/*">
+                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📁</div>
+                    <p style="font-weight: 500;">Drop audio file here</p>
+                    <p style="font-size: 0.85rem; color: #888; margin-top: 0.25rem;">Supports WAV, MP3, OGG, WebM</p>
+                </div>
+
+                <div id="file-results" class="info-card" style="display: none;">
+                    <div class="info-row"><span class="info-label">File</span><span class="info-value"
+                            id="result-filename">--</span></div>
+                    <div class="info-row"><span class="info-label">Duration</span><span class="info-value"
+                            id="result-duration">--</span></div>
+                    <div class="info-row"><span class="info-label">Avg Prob</span><span class="info-value"
+                            id="result-avg-prob">--</span></div>
+                    <div class="info-row"><span class="info-label">Speech</span><span class="info-value"
+                            id="result-speech">--</span></div>
+                </div>
             </div>
-            <div class="mic-controls">
-                <button id="start-mic" disabled>Start Microphone</button>
-                <button id="stop-mic" disabled style="display: none;">Stop Microphone</button>
-            </div>
-            <div class="controls">
-                <button id="test-silence" disabled>Test Silence</button>
-                <button id="test-noise" disabled>Test Noise</button>
-                <button id="test-tone" disabled>Test Tone</button>
-                <button id="reset-state" disabled>Reset State</button>
+
+            <!-- Right Column: Technical Details & Logs -->
+            <div class="info-panel">
+                <div class="info-card">
+                    <h3 style="margin-bottom: 1rem; font-size: 1rem;">System Status</h3>
+                    <div class="info-row">
+                        <span class="info-label">Wasm Status</span>
+                        <span id="wasm-status" class="info-value" style="color: #f59e0b;">Loading...</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Model Size</span>
+                        <span id="model-size" class="info-value">--</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">API Version</span>
+                        <span id="api-version" class="info-value">--</span>
+                    </div>
+
+                    <div style="margin-top: 1.5rem;">
+                        <p style="font-size: 0.85rem; color: #888; margin-bottom: 0.5rem;">Diagnostics</p>
+                        <div class="test-controls">
+                            <button id="test-silence" class="btn-small" disabled>Test Silence</button>
+                            <button id="test-noise" class="btn-small" disabled>Test Noise</button>
+                            <button id="test-speech" class="btn-small" disabled>Test Speech</button>
+                            <button id="reset-state" class="btn-small" disabled>Reset</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="log-container" id="log">
+                    <div class="log-entry info">System initialized. Waiting for Wasm...</div>
+                </div>
             </div>
         </div>
+    </section>
 
-        <div class="status-card">
-            <h3 style="margin-bottom: 0.5rem; color: #00d9ff;">Test with Audio File</h3>
-            <div class="file-upload" id="file-upload">
-                <input type="file" id="audio-file" accept=".wav,.mp3,.ogg,.webm,audio/*">
-                <p>📁 Drop audio file here or click to browse</p>
-                <p class="file-info">Supports WAV, MP3, OGG, WebM (will be resampled to 16kHz)</p>
-            </div>
-            <div class="file-results" id="file-results">
-                <div class="result-row">
-                    <span class="result-label">File:</span>
-                    <span class="result-value" id="result-filename">--</span>
-                </div>
-                <div class="result-row">
-                    <span class="result-label">Duration:</span>
-                    <span class="result-value" id="result-duration">--</span>
-                </div>
-                <div class="result-row">
-                    <span class="result-label">Sample Rate:</span>
-                    <span class="result-value" id="result-samplerate">--</span>
-                </div>
-                <div class="result-row">
-                    <span class="result-label">Chunks Processed:</span>
-                    <span class="result-value" id="result-chunks">--</span>
-                </div>
-                <div class="result-row">
-                    <span class="result-label">Average Probability:</span>
-                    <span class="result-value" id="result-avg-prob">--</span>
-                </div>
-                <div class="result-row">
-                    <span class="result-label">Max Probability:</span>
-                    <span class="result-value" id="result-max-prob">--</span>
-                </div>
-                <div class="result-row">
-                    <span class="result-label">Speech Detected:</span>
-                    <span class="result-value" id="result-speech">--</span>
-                </div>
-            </div>
-        </div>
-
-        <div class="status-card">
-            <h3 style="margin-bottom: 0.5rem; color: #00d9ff;">Console Log</h3>
-            <div class="log" id="log"></div>
-        </div>
-    </div>
-
-    <div class="footer">
-        <p>Tomoul - Minimalist AI Inference Engine in Zig</p>
-        <p>Running Silero VAD (~2MB) entirely in browser</p>
-    </div>
+    <footer class="footer">
+        <p>Tomoul &copy; 2025. Powered by Zig & WebAssembly.</p>
+    </footer>
 
     <script>
         // DOM elements
@@ -355,7 +518,7 @@
         const logDiv = document.getElementById('log');
         const testSilenceBtn = document.getElementById('test-silence');
         const testNoiseBtn = document.getElementById('test-noise');
-        const testToneBtn = document.getElementById('test-tone');
+        const testSpeechBtn = document.getElementById('test-speech');
         const resetStateBtn = document.getElementById('reset-state');
         const startMicBtn = document.getElementById('start-mic');
         const stopMicBtn = document.getElementById('stop-mic');
@@ -384,7 +547,7 @@
         function log(msg, type = 'info') {
             const entry = document.createElement('div');
             entry.className = `log-entry ${type}`;
-            entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            entry.textContent = `> ${msg}`;
             logDiv.appendChild(entry);
             logDiv.scrollTop = logDiv.scrollHeight;
         }
@@ -396,10 +559,17 @@
             // Update speech indicator
             const isSpeech = prob >= SPEECH_THRESHOLD;
             if (isRecording) {
-                recordingDot.className = 'recording-dot ' + (isSpeech ? 'speech' : 'listening');
-                speechLabel.className = 'speech-label ' + (isSpeech ? 'speech' : '');
-                speechLabel.textContent = isSpeech ? 'Speech Detected' : 'Listening...';
-                probValue.className = 'prob-value ' + (isSpeech ? 'speech' : 'silence');
+                if (isSpeech) {
+                    recordingDot.classList.add('active');
+                    speechLabel.textContent = 'Speech Detected';
+                    speechLabel.style.color = 'var(--color-success)';
+                    speechLabel.style.fontWeight = '600';
+                } else {
+                    recordingDot.classList.remove('active');
+                    speechLabel.textContent = 'Listening...';
+                    speechLabel.style.color = '#888';
+                    speechLabel.style.fontWeight = '400';
+                }
             }
         }
 
@@ -443,7 +613,7 @@
                 }
 
                 const nativeSampleRate = audioContext.sampleRate;
-                log(`Audio context: ${nativeSampleRate} Hz, state: ${audioContext.state}`, 'info');
+                log(`Audio context: ${nativeSampleRate} Hz`, 'info');
 
                 // Create source from microphone
                 sourceNode = audioContext.createMediaStreamSource(mediaStream);
@@ -454,7 +624,7 @@
                         await setupAudioWorklet(nativeSampleRate);
                         return;
                     } catch (workletErr) {
-                        log(`AudioWorklet failed: ${workletErr.message}, using fallback`, 'error');
+                        log(`AudioWorklet failed, using fallback`, 'error');
                         useAudioWorklet = false;
                     }
                 }
@@ -493,11 +663,6 @@
                     if (prob >= 0) {
                         updateProb(prob);
                     }
-
-                    // Log periodically
-                    if (frameCount % 30 === 0) {
-                        log(`Chunk ${frameCount}: prob=${prob.toFixed(4)}`, 'info');
-                    }
                 }
             };
 
@@ -510,12 +675,12 @@
             frameCount = 0;
 
             startMicBtn.style.display = 'none';
-            stopMicBtn.style.display = 'inline-block';
+            stopMicBtn.style.display = 'flex';
             stopMicBtn.disabled = false;
-            recordingDot.className = 'recording-dot listening';
+            recordingDot.style.background = '#888';
             speechLabel.textContent = 'Listening...';
 
-            log(`Microphone active via AudioWorklet (${nativeSampleRate} Hz -> ${TARGET_SAMPLE_RATE} Hz)`, 'success');
+            log(`Microphone active`, 'success');
         }
 
         // Fallback: Setup ScriptProcessorNode (deprecated but works on older browsers)
@@ -557,15 +722,6 @@
                         updateProb(prob);
                     }
                 }
-
-                // Log periodically
-                if (frameCount % 50 === 0) {
-                    let peak = 0;
-                    for (let i = 0; i < inputData.length; i++) {
-                        peak = Math.max(peak, Math.abs(inputData[i]));
-                    }
-                    log(`Frame ${frameCount}: peak=${peak.toFixed(3)}, ctx=${audioContext?.state}`, 'info');
-                }
             };
 
             // Connect: source -> gain -> processor -> destination
@@ -582,12 +738,12 @@
             frameCount = 0;
 
             startMicBtn.style.display = 'none';
-            stopMicBtn.style.display = 'inline-block';
+            stopMicBtn.style.display = 'flex';
             stopMicBtn.disabled = false;
-            recordingDot.className = 'recording-dot listening';
+            recordingDot.style.background = '#888';
             speechLabel.textContent = 'Listening...';
 
-            log(`Microphone active via ScriptProcessor (${nativeSampleRate} Hz -> ${TARGET_SAMPLE_RATE} Hz)`, 'success');
+            log(`Microphone active`, 'success');
         }
 
         // Stop microphone capture
@@ -630,11 +786,13 @@
                 wasm.reset_state();
             }
 
-            startMicBtn.style.display = 'inline-block';
+            startMicBtn.style.display = 'flex';
             stopMicBtn.style.display = 'none';
-            recordingDot.className = 'recording-dot';
+            recordingDot.style.background = '#ddd';
+            recordingDot.classList.remove('active');
             speechLabel.textContent = 'Idle';
-            probValue.className = 'prob-value';
+            speechLabel.style.color = '#888';
+            updateProb(0);
 
             log('Microphone stopped', 'info');
         }
@@ -667,14 +825,14 @@
 
                 if (initResult === 1) {
                     wasmStatus.textContent = 'Ready';
-                    wasmStatus.className = 'status-value ready';
+                    wasmStatus.style.color = 'var(--color-success)';
                     apiVersion.textContent = `v${wasm.get_version()}`;
                     log('VAD model initialized successfully!', 'success');
 
                     // Enable buttons
                     testSilenceBtn.disabled = false;
                     testNoiseBtn.disabled = false;
-                    testToneBtn.disabled = false;
+                    testSpeechBtn.disabled = false;
                     resetStateBtn.disabled = false;
                     startMicBtn.disabled = false;
                 } else {
@@ -683,7 +841,7 @@
 
             } catch (err) {
                 wasmStatus.textContent = 'Error';
-                wasmStatus.className = 'status-value error';
+                wasmStatus.style.color = 'var(--color-error)';
                 log(`Error: ${err.message}`, 'error');
                 console.error(err);
             }
@@ -709,73 +867,109 @@
             return prob;
         }
 
-        // Test with silence (zeros)
-        testSilenceBtn.addEventListener('click', () => {
-            log('Testing with 512 samples of silence...');
-            const silence = new Float32Array(512).fill(0);
-            const prob = processAudio(silence);
+        // Track currently playing source to stop it if needed
+        let currentSource = null;
 
-            if (prob >= 0) {
-                updateProb(prob);
-                log(`Silence probability: ${prob.toFixed(6)}`, 'success');
-            } else {
-                log('Error processing audio', 'error');
-            }
-        });
-
-        // Test with random noise
-        testNoiseBtn.addEventListener('click', () => {
-            log('Testing with 512 samples of random noise...');
-            const noise = new Float32Array(512);
-            for (let i = 0; i < noise.length; i++) {
-                noise[i] = (Math.random() * 2 - 1) * 0.5; // Random values between -0.5 and 0.5
-            }
-            const prob = processAudio(noise);
-
-            if (prob >= 0) {
-                updateProb(prob);
-                log(`Noise probability: ${prob.toFixed(6)}`, 'success');
-            } else {
-                const errCodes = {'-1': 'not initialized', '-2': 'invalid sample count', '-3': 'tensor alloc failed', '-4': 'forward pass failed'};
-                log(`Error processing audio: ${errCodes[prob.toFixed(0)] || prob}`, 'error');
-            }
-        });
-
-        // Test with speech-like tone (vowel-like formants)
-        testToneBtn.addEventListener('click', () => {
-            log('Testing with speech-like tone (multiple chunks)...');
-            // Generate a vowel-like sound with fundamental + harmonics
-            // F0 = 150Hz (typical male fundamental), with formants
-            const sampleRate = 16000;
-            const samples = new Float32Array(512);
-            const f0 = 150; // Fundamental frequency
-
-            for (let i = 0; i < samples.length; i++) {
-                const t = i / sampleRate;
-                // Fundamental + harmonics to simulate vowel
-                let sample = 0;
-                sample += 0.5 * Math.sin(2 * Math.PI * f0 * t);        // F0
-                sample += 0.3 * Math.sin(2 * Math.PI * f0 * 2 * t);    // 2nd harmonic
-                sample += 0.2 * Math.sin(2 * Math.PI * f0 * 3 * t);    // 3rd harmonic
-                sample += 0.1 * Math.sin(2 * Math.PI * f0 * 4 * t);    // 4th harmonic
-                sample += 0.05 * Math.sin(2 * Math.PI * 800 * t);      // Formant F1
-                sample += 0.03 * Math.sin(2 * Math.PI * 1200 * t);     // Formant F2
-                samples[i] = sample * 0.3; // Scale down
-            }
-
-            // Process multiple chunks to build up LSTM state
-            let lastProb = 0;
-            for (let chunk = 0; chunk < 5; chunk++) {
-                const prob = processAudio(samples);
-                if (prob >= 0) {
-                    lastProb = prob;
-                    log(`Chunk ${chunk + 1}: prob = ${prob.toFixed(6)}`, prob > 0.3 ? 'success' : 'info');
-                } else {
-                    log(`Error on chunk ${chunk + 1}`, 'error');
-                    break;
+        // Helper to process a URL (wav file)
+        async function testUrl(url, label) {
+            log(`Fetching ${label} (${url})...`);
+            try {
+                // Stop previous audio if playing
+                if (currentSource) {
+                    try { currentSource.stop(); } catch (e) { }
+                    currentSource = null;
                 }
+
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`Failed to fetch ${url}`);
+                const arrayBuffer = await response.arrayBuffer();
+
+                // Use global context or create new if needed
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
+                // Decode
+                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+                log(`Processing & Playing ${label} (${audioBuffer.duration.toFixed(2)}s)...`);
+
+                // 1. Play Audio
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.start();
+                currentSource = source;
+
+                source.onended = () => {
+                    if (currentSource === source) {
+                        currentSource = null;
+                        updateProb(0); // Reset slider
+                    }
+                };
+
+                // 2. Process VAD (Offline for speed)
+                // Downsample to 16kHz
+                const offlineCtx = new OfflineAudioContext(1, audioBuffer.duration * 16000, 16000);
+                const offlineSource = offlineCtx.createBufferSource();
+                offlineSource.buffer = audioBuffer;
+                offlineSource.connect(offlineCtx.destination);
+                offlineSource.start();
+
+                const renderedBuffer = await offlineCtx.startRendering();
+                const data = renderedBuffer.getChannelData(0);
+
+                // Process
+                let totalProb = 0;
+                let maxProb = 0;
+                let chunks = 0;
+                let speechChunks = 0;
+
+                // Reset state before processing
+                if (wasm) wasm.reset_state();
+
+                for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+                    if (i + CHUNK_SIZE > data.length) break;
+
+                    const chunk = data.slice(i, i + CHUNK_SIZE);
+                    const prob = processAudio(chunk);
+
+                    if (prob >= 0) {
+                        totalProb += prob;
+                        maxProb = Math.max(maxProb, prob);
+                        chunks++;
+                        if (prob > SPEECH_THRESHOLD) speechChunks++;
+
+                        // Visual feedback for the last chunk
+                        updateProb(prob);
+                    }
+                }
+
+                const avgProb = chunks > 0 ? totalProb / chunks : 0;
+                log(`${label} Result: Avg=${avgProb.toFixed(4)}, Max=${maxProb.toFixed(4)}, Speech=${speechChunks > 0 ? 'Yes' : 'No'}`, speechChunks > 0 ? 'success' : 'info');
+
+            } catch (err) {
+                log(`Error testing ${label}: ${err.message}`, 'error');
+                console.error(err);
             }
-            updateProb(lastProb);
+        }
+
+        // Test with silence.wav
+        testSilenceBtn.addEventListener('click', () => {
+            testUrl('silence.wav', 'Silence');
+        });
+
+        // Test with noise.wav
+        testNoiseBtn.addEventListener('click', () => {
+            testUrl('noise.wav', 'Noise');
+        });
+
+        // Test with speech.wav
+        testSpeechBtn.addEventListener('click', () => {
+            testUrl('speech.wav', 'Speech');
         });
 
         // Reset state
@@ -795,106 +989,96 @@
         const fileUpload = document.getElementById('file-upload');
         const audioFileInput = document.getElementById('audio-file');
         const fileResults = document.getElementById('file-results');
+        const resultFilename = document.getElementById('result-filename');
+        const resultDuration = document.getElementById('result-duration');
+        const resultAvgProb = document.getElementById('result-avg-prob');
+        const resultSpeech = document.getElementById('result-speech');
 
         // File upload handling
         fileUpload.addEventListener('click', () => audioFileInput.click());
 
         fileUpload.addEventListener('dragover', (e) => {
             e.preventDefault();
-            fileUpload.classList.add('dragover');
+            fileUpload.style.borderColor = 'var(--color-primary)';
+            fileUpload.style.background = '#f9f9f9';
         });
 
-        fileUpload.addEventListener('dragleave', () => {
-            fileUpload.classList.remove('dragover');
+        fileUpload.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            fileUpload.style.borderColor = '#ddd';
+            fileUpload.style.background = 'transparent';
         });
 
         fileUpload.addEventListener('drop', (e) => {
             e.preventDefault();
-            fileUpload.classList.remove('dragover');
-            const file = e.dataTransfer.files[0];
-            if (file) processAudioFile(file);
+            fileUpload.style.borderColor = '#ddd';
+            fileUpload.style.background = 'transparent';
+            if (e.dataTransfer.files.length > 0) {
+                handleFile(e.dataTransfer.files[0]);
+            }
         });
 
         audioFileInput.addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (file) processAudioFile(file);
+            if (e.target.files.length > 0) {
+                handleFile(e.target.files[0]);
+            }
         });
 
-        async function processAudioFile(file) {
-            if (!wasm) {
-                log('VAD not initialized', 'error');
-                return;
-            }
-
-            log(`Processing file: ${file.name}`, 'info');
+        async function handleFile(file) {
+            log(`Processing file: ${file.name}...`);
+            fileResults.style.display = 'block';
+            resultFilename.textContent = file.name;
+            resultDuration.textContent = 'Processing...';
 
             try {
-                // Reset VAD state first
-                wasm.reset_state();
-
-                // Create offline audio context to decode the file
                 const arrayBuffer = await file.arrayBuffer();
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
-                // Decode audio using AudioContext
-                const tempContext = new (window.AudioContext || window.webkitAudioContext)();
-                const audioBuffer = await tempContext.decodeAudioData(arrayBuffer);
-                await tempContext.close();
-
-                const nativeSampleRate = audioBuffer.sampleRate;
                 const duration = audioBuffer.duration;
-                const channelData = audioBuffer.getChannelData(0); // Mono, first channel
-
-                log(`Decoded: ${duration.toFixed(2)}s @ ${nativeSampleRate}Hz, ${channelData.length} samples`, 'info');
+                resultDuration.textContent = `${duration.toFixed(2)}s`;
 
                 // Downsample to 16kHz
-                const downsampled = downsampleBuffer(channelData, nativeSampleRate, TARGET_SAMPLE_RATE);
-                log(`Downsampled to ${downsampled.length} samples @ ${TARGET_SAMPLE_RATE}Hz`, 'info');
+                const offlineCtx = new OfflineAudioContext(1, duration * 16000, 16000);
+                const source = offlineCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(offlineCtx.destination);
+                source.start();
 
-                // Process in 512-sample chunks
-                let numChunks = 0;
+                const renderedBuffer = await offlineCtx.startRendering();
+                const data = renderedBuffer.getChannelData(0);
+
+                // Process
                 let totalProb = 0;
                 let maxProb = 0;
+                let chunks = 0;
                 let speechChunks = 0;
 
-                for (let offset = 0; offset + CHUNK_SIZE <= downsampled.length; offset += CHUNK_SIZE) {
-                    const chunk = downsampled.slice(offset, offset + CHUNK_SIZE);
+                // Reset state before processing file
+                if (wasm) wasm.reset_state();
+
+                for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+                    if (i + CHUNK_SIZE > data.length) break;
+
+                    const chunk = data.slice(i, i + CHUNK_SIZE);
                     const prob = processAudio(chunk);
 
                     if (prob >= 0) {
-                        numChunks++;
                         totalProb += prob;
                         maxProb = Math.max(maxProb, prob);
-                        if (prob >= SPEECH_THRESHOLD) {
-                            speechChunks++;
-                        }
-                        updateProb(prob);
-                    } else {
-                        log(`Error at offset ${offset}: ${prob}`, 'error');
+                        chunks++;
+                        if (prob > SPEECH_THRESHOLD) speechChunks++;
                     }
                 }
 
-                const avgProb = numChunks > 0 ? totalProb / numChunks : 0;
-                const speechRatio = numChunks > 0 ? speechChunks / numChunks : 0;
+                const avgProb = chunks > 0 ? totalProb / chunks : 0;
+                resultAvgProb.textContent = avgProb.toFixed(4);
 
-                log(`Done: ${numChunks} chunks, avg=${avgProb.toFixed(4)}, max=${maxProb.toFixed(4)}, speech=${(speechRatio * 100).toFixed(1)}%`, 'success');
+                const isSpeech = speechChunks > 0; // Simple detection
+                resultSpeech.textContent = isSpeech ? 'Yes' : 'No';
+                resultSpeech.style.color = isSpeech ? 'var(--color-success)' : '#888';
 
-                // Update results display
-                document.getElementById('result-filename').textContent = file.name;
-                document.getElementById('result-duration').textContent = `${duration.toFixed(2)}s`;
-                document.getElementById('result-samplerate').textContent = `${nativeSampleRate}Hz → ${TARGET_SAMPLE_RATE}Hz`;
-                document.getElementById('result-chunks').textContent = numChunks;
-                document.getElementById('result-avg-prob').textContent = avgProb.toFixed(4);
-                document.getElementById('result-max-prob').textContent = maxProb.toFixed(4);
-
-                const speechDetected = maxProb >= SPEECH_THRESHOLD;
-                const speechElement = document.getElementById('result-speech');
-                speechElement.textContent = speechDetected ? `YES (${(speechRatio * 100).toFixed(1)}% of chunks)` : 'NO';
-                speechElement.className = 'result-value' + (speechDetected ? ' speech' : '');
-
-                document.getElementById('result-avg-prob').className = 'result-value' + (avgProb >= SPEECH_THRESHOLD ? ' speech' : '');
-                document.getElementById('result-max-prob').className = 'result-value' + (maxProb >= SPEECH_THRESHOLD ? ' speech' : '');
-
-                fileResults.classList.add('visible');
+                log(`File processed: Avg Prob=${avgProb.toFixed(4)}, Max=${maxProb.toFixed(4)}`, 'success');
 
             } catch (err) {
                 log(`Error processing file: ${err.message}`, 'error');
@@ -902,8 +1086,9 @@
             }
         }
 
-        // Start loading
-        loadWasm();
+        // Initialize
+        window.addEventListener('load', loadWasm);
     </script>
 </body>
+
 </html>

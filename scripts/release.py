@@ -37,7 +37,8 @@ def derive_paths(model_name):
       - wasm_binding  → src/models/silero_vad/wasm.zig
       - c_binding     → src/models/silero_vad/c.zig
       - model_module  → src/models/silero_vad/model.zig
-      - weights_path  → models/silero_vad.tl
+      - cli_module    → src/models/silero_vad/cli.zig
+      - weights_path  → artifacts/silero_vad.tl
       - example_dir   → examples/silero-vad (underscores → dashes)
       - hf_repo       → tomoul/silero-vad (underscores → dashes)
     """
@@ -46,7 +47,8 @@ def derive_paths(model_name):
         "wasm_binding": f"src/models/{model_name}/wasm.zig",
         "c_binding": f"src/models/{model_name}/c.zig",
         "model_module": f"src/models/{model_name}/model.zig",
-        "weights_path": f"models/{model_name}.tl",
+        "cli_module": f"src/models/{model_name}/cli.zig",
+        "weights_path": f"artifacts/{model_name}.tl",
         "example_dir": f"examples/{dashed_name}",
         "hf_repo": f"tomoul/{dashed_name}",
     }
@@ -113,12 +115,33 @@ def parse_model_registry():
         # Derive paths from model name (convention over configuration)
         paths = derive_paths(name)
 
+        # Check for explicit path overrides in the registry
+        for field in ['wasm_binding', 'c_binding', 'model_module', 'cli_module', 'weights_path', 'hf_repo']:
+            override_match = re.search(rf'\.{field}\s*=\s*"([^"]+)"', block)
+            if override_match:
+                paths[field] = override_match.group(1)
+
+        # Check for has_cli flag
+        has_cli = bool(re.search(r'\.has_cli\s*=\s*true', block))
+
+        # Check for supports_bundled flag (defaults to true)
+        supports_bundled = not bool(re.search(r'\.supports_bundled\s*=\s*false', block))
+
+        # Check for release_mode flag (defaults to small)
+        release_mode = "small"
+        if re.search(r'\.release_mode\s*=\s*\.fast', block):
+            release_mode = "fast"
+
         models[name] = {
             "hf_repo": paths["hf_repo"],
             "weights": paths["weights_path"],
             "description": description,
             "export_symbols": symbols,
             "c_binding": paths["c_binding"],
+            "cli_module": paths["cli_module"],
+            "has_cli": has_cli,
+            "supports_bundled": supports_bundled,
+            "release_mode": release_mode,
         }
 
     return models
@@ -179,15 +202,30 @@ def build_native(model_name, platform, arch, zig_target, suffix, output_dir):
     """Build native artifact."""
     print(f"\n[BUILD] {platform}/{arch} for {model_name}")
 
-    # For now, build the main executable (not model-specific)
-    # In the future, we could have model-specific native builds
-    result = run(f"zig build -Dtarget={zig_target} -Doptimize=ReleaseFast")
+    # Check if model supports bundled weights
+    model_info = MODELS.get(model_name, {})
+    supports_bundled = model_info.get('supports_bundled', True)
+    variant = "bundled" if supports_bundled else "lite"
+
+    # Use release_mode from model config (defaults to small)
+    # small: ReleaseSmall - smaller binary, slightly slower (~15% for large models)
+    # fast: ReleaseFast - larger binary, faster execution (recommended for large transformers)
+    release_mode = model_info.get('release_mode', 'small')
+    optimize = "ReleaseFast" if release_mode == "fast" else "ReleaseSmall"
+
+    bundled_flag = "-Dbundled=true" if supports_bundled else ""
+    result = run(f"zig build -Dmodel={model_name} -Dtarget={zig_target} -Doptimize={optimize} {bundled_flag}".strip())
     if result is None:
         return False
 
-    src = Path("zig-out/bin/tomoul")
-    if src.exists():
-        dst = output_dir / f"tomoul_{platform}_{arch}_bundled{suffix}"
+    # Check for model-specific executable
+    src_specific = Path(f"zig-out/bin/tomoul_{model_name}")
+    src_generic = Path("zig-out/bin/tomoul")
+
+    src = src_specific if src_specific.exists() else (src_generic if src_generic.exists() else None)
+
+    if src:
+        dst = output_dir / f"tomoul_{model_name}_{platform}_{arch}_{variant}{suffix}"
         shutil.copy(src, dst)
         # Make executable
         if not suffix:
@@ -195,7 +233,7 @@ def build_native(model_name, platform, arch, zig_target, suffix, output_dir):
         print(f"  -> {dst}")
         return True
     else:
-        print(f"  WARNING: {src} not found (native build may not be configured)")
+        print(f"  WARNING: No executable found (model may be library-only)")
         return False
 
 
@@ -209,10 +247,13 @@ def build_library(model_name, platform, arch, zig_target, static_ext, shared_ext
     mode = "bundled" if bundled else "lite"
     print(f"\n[BUILD] Libraries {platform}/{arch} for {model_name} ({mode})")
 
-    # Use ReleaseSmall for smallest binaries (strips debug symbols)
-    # bundled libs: ~2.2MB (engine + weights), lite libs: ~30KB
+    # Use release_mode from model config (defaults to small)
+    model_info = MODELS.get(model_name, {})
+    release_mode = model_info.get('release_mode', 'small')
+    optimize = "ReleaseFast" if release_mode == "fast" else "ReleaseSmall"
+
     bundled_flag = "-Dbundled=true" if bundled else ""
-    result = run(f"zig build lib -Dmodel={model_name} -Dtarget={zig_target} -Doptimize=ReleaseSmall {bundled_flag}".strip())
+    result = run(f"zig build lib -Dmodel={model_name} -Dtarget={zig_target} -Doptimize={optimize} {bundled_flag}".strip())
     if result is None:
         print(f"  WARNING: Library build failed for {platform}/{arch}")
         return
@@ -246,10 +287,11 @@ def parse_c_binding_functions(c_binding_path):
 
     # Match: export fn name(params) return_type { or export fn name(params) void {
     # Also capture the doc comment above
+    # Note: params can span multiple lines, return type can be complex like [*:0]const u8
     pattern = re.compile(
         r'((?:///[^\n]*\n)*)' +  # Optional doc comments
-        r'export fn (\w+)\(([^)]*)\)\s*(\w+)',
-        re.MULTILINE
+        r'export fn (\w+)\s*\(([^)]*(?:\n[^)]*)*)\)\s*([^\{]+?)\s*\{',
+        re.MULTILINE | re.DOTALL
     )
 
     for match in pattern.finditer(content):
@@ -265,7 +307,8 @@ def parse_c_binding_functions(c_binding_path):
                 param = param.strip()
                 if param:
                     # Zig params: name: type
-                    parts = param.split(':')
+                    # Split on first colon only (type may contain : like [*:0]const)
+                    parts = param.split(':', 1)
                     if len(parts) == 2:
                         param_name = parts[0].strip()
                         param_type = parts[1].strip()
@@ -290,6 +333,8 @@ def parse_c_binding_functions(c_binding_path):
 
 def zig_type_to_c(zig_type):
     """Convert Zig type to C type."""
+    zig_type = zig_type.strip()
+
     type_map = {
         'bool': 'bool',
         'void': 'void',
@@ -305,14 +350,29 @@ def zig_type_to_c(zig_type):
         'i64': 'int64_t',
         'usize': 'size_t',
         'isize': 'ptrdiff_t',
+        'c_int': 'int',
     }
 
-    # Handle pointer types
-    if zig_type.startswith('[*]const '):
-        inner = zig_type[9:]
+    # Handle null-terminated pointer: [*:0]const u8 -> const char*
+    if zig_type.startswith('[*:0]const '):
+        inner = zig_type[11:].strip()
+        if inner == 'u8':
+            return 'const char*'
         return f'const {zig_type_to_c(inner)}*'
+
+    if zig_type.startswith('[*:0]'):
+        inner = zig_type[5:].strip()
+        if inner == 'u8':
+            return 'char*'
+        return f'{zig_type_to_c(inner)}*'
+
+    # Handle many-item pointer: [*]const u8 -> const uint8_t*
+    if zig_type.startswith('[*]const '):
+        inner = zig_type[9:].strip()
+        return f'const {zig_type_to_c(inner)}*'
+
     if zig_type.startswith('[*]'):
-        inner = zig_type[3:]
+        inner = zig_type[3:].strip()
         return f'{zig_type_to_c(inner)}*'
 
     return type_map.get(zig_type, zig_type)
@@ -353,13 +413,16 @@ def generate_c_header(model_name, include_dir):
 
     func_decls_str = '\n'.join(func_decls)
 
+    # Convert model name to valid C identifier (replace dashes with underscores)
+    guard_name = model_name.upper().replace('-', '_')
+
     header_content = f"""/**
  * Tomoul {model_name} - C API
  * Auto-generated from {c_binding_path.name if c_binding_path else 'model registry'}
  */
 
-#ifndef TOMOUL_{model_name.upper()}_H
-#define TOMOUL_{model_name.upper()}_H
+#ifndef TOMOUL_{guard_name}_H
+#define TOMOUL_{guard_name}_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -374,7 +437,7 @@ extern "C" {{
 }}
 #endif
 
-#endif /* TOMOUL_{model_name.upper()}_H */
+#endif /* TOMOUL_{guard_name}_H */
 """
 
     header_path = include_dir / f"tomoul_{model_name}.h"
@@ -452,6 +515,24 @@ tags:
 
 Built with [Tomoul](https://github.com/tomoul/tomoul) - the minimalist AI inference engine in Zig.
 
+## Quick Start (CLI)
+
+Download and run the bundled executable (2.2 MB, includes model weights):
+
+```bash
+# Linux x64
+wget https://huggingface.co/{model_info["hf_repo"]}/resolve/main/bin/tomoul_{model_name}_linux_x86_64_bundled
+chmod +x tomoul_{model_name}_linux_x86_64_bundled
+./tomoul_{model_name}_linux_x86_64_bundled audio.wav
+
+# macOS Apple Silicon
+wget https://huggingface.co/{model_info["hf_repo"]}/resolve/main/bin/tomoul_{model_name}_mac_aarch64_bundled
+chmod +x tomoul_{model_name}_mac_aarch64_bundled
+./tomoul_{model_name}_mac_aarch64_bundled audio.wav
+```
+
+Supports WAV (16kHz mono 16-bit PCM) and RAW (16kHz mono 32-bit float) audio files.
+
 ## Quick Start (Browser)
 
 ```javascript
@@ -463,14 +544,18 @@ const prob = wasm.instance.exports.process_audio(512);
 {symbols_doc}
 ## Files
 
-| File | Description |
-|------|-------------|
-| `{model_name}.tl` | Raw model weights |
-| `bin/tomoul_{model_name}_web_wasm32_bundled.wasm` | Browser WASM |
-| `bin/tomoul_linux_x86_64_bundled` | Linux x64 |
-| `bin/tomoul_linux_aarch64_bundled` | Linux ARM64 |
-| `bin/tomoul_mac_x86_64_bundled` | macOS Intel |
-| `bin/tomoul_mac_aarch64_bundled` | macOS Apple Silicon |
+| File | Description | Size |
+|------|-------------|------|
+| `{model_name}.tl` | Raw model weights | 2.1 MB |
+| `bin/tomoul_{model_name}_web_wasm32_bundled.wasm` | Browser WASM (bundled) | ~2.2 MB |
+| `bin/tomoul_{model_name}_linux_x86_64_bundled` | Linux x64 CLI (bundled) | 2.2 MB |
+| `bin/tomoul_{model_name}_linux_aarch64_bundled` | Linux ARM64 CLI (bundled) | 2.2 MB |
+| `bin/tomoul_{model_name}_mac_x86_64_bundled` | macOS Intel CLI (bundled) | 2.2 MB |
+| `bin/tomoul_{model_name}_mac_aarch64_bundled` | macOS Apple Silicon CLI (bundled) | 2.2 MB |
+| `lib/*` | C libraries (static .a and shared .so/.dylib) | ~2.2 MB |
+| `include/tomoul_{model_name}.h` | C header file | <1 KB |
+
+All binaries built with ReleaseSmall optimization for minimal size while maintaining excellent performance.
 
 ## License
 

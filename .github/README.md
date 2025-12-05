@@ -9,9 +9,7 @@ The [release.yml](workflows/release.yml) workflow triggers on:
 - **Single model**: `{model}-v*` tags (e.g., `silero_vad-v1.0.0`) - builds only that model
 - **Manual dispatch**: Via GitHub Actions UI
 
-### Tag-Based Release (Recommended for Scale)
-
-For a community project with many contributed models, use per-model tags to avoid rebuilding everything:
+### Tag-Based Release
 
 ```bash
 # Release a single model (9 jobs instead of 9 × N models)
@@ -95,14 +93,6 @@ This approach:
 - **Always fresh** - uses latest upstream weights
 - **Reproducible** - same export script, same output
 
-## Current Models
-
-From `model_registry.zig`:
-
-| Model | Kind | HF Repo | Description |
-|-------|------|---------|-------------|
-| `silero_vad` | audio | [tomoul/silero-vad](https://huggingface.co/tomoul/silero-vad) | Voice Activity Detection |
-
 ## Files Uploaded to Hugging Face
 
 For each model, the workflow uploads:
@@ -133,15 +123,6 @@ For each model, the workflow uploads:
     └── libtomoul_{model}_android_x86_64.a            # Android x64 static
 ```
 
-## Setup
-
-### GitHub Secrets
-
-Add `HF_TOKEN` to repository secrets:
-1. Create token at https://huggingface.co/settings/tokens (write access)
-2. Go to repo Settings → Secrets → Actions
-3. Add `HF_TOKEN` with your token
-
 ### Adding New Models
 
 1. Create the model folder with all files:
@@ -167,12 +148,12 @@ Add `HF_TOKEN` to repository secrets:
    - `src/models/new_model/wasm.zig` ← wasm binding
    - `src/models/new_model/c.zig` ← c binding
    - `src/models/new_model/model.zig` ← model implementation
-   - `models/new_model.tl` ← weights file
+   - `artifacts/new_model.tl` ← weights file
    - `tomoul/new-model` ← HuggingFace repo (underscores → dashes)
 
 3. Create export script at `tools/export_new_model.py`:
    - Downloads model from upstream (e.g., torch.hub)
-   - Exports weights to `models/new_model.tl`
+   - Exports weights to `artifacts/new_model.tl`
    - See `tools/export_silero_vad.py` as reference
 
 4. Push a model-specific tag to release:
@@ -187,7 +168,7 @@ Add `HF_TOKEN` to repository secrets:
 
 ```
 src/
-├── models/                 # Each model gets its own folder
+├── artifacts/                 # Each model gets its own folder
 │   ├── silero_vad/
 │   │   ├── model.zig       # Model implementation (LSTM, layers, etc.)
 │   │   ├── wasm.zig        # WASM binding for browser
@@ -218,41 +199,4 @@ python scripts/release.py --model silero_vad --build-only
 
 # WASM only
 python scripts/release.py --model silero_vad --wasm-only --build-only
-```
-
-## Using the Artifacts
-
-### Browser (WASM)
-```javascript
-const response = await fetch('https://huggingface.co/tomoul/silero-vad/resolve/main/bin/tomoul_silero_vad_web_wasm32_bundled.wasm');
-const wasm = await WebAssembly.instantiate(await response.arrayBuffer());
-wasm.instance.exports.init();
-```
-
-### C/C++ (Static Library)
-```c
-#include "tomoul_silero_vad.h"
-
-int main() {
-    tomoul_init();
-    float* buf = tomoul_get_input_buffer_ptr();
-    // Fill buf with audio samples
-    float prob = tomoul_process_audio(512);
-    return 0;
-}
-```
-
-Compile with:
-```bash
-gcc -o myapp myapp.c -L. -ltomoul_silero_vad_linux_x86_64 -lm
-```
-
-### iOS (Static Library)
-Link `libtomoul_silero_vad_ios_aarch64.a` in Xcode and include the header.
-
-### Android (Static Library)
-Add to your `CMakeLists.txt`:
-```cmake
-add_library(tomoul STATIC IMPORTED)
-set_target_properties(tomoul PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/libs/${ANDROID_ABI}/libtomoul_silero_vad_android_${ANDROID_ABI}.a)
 ```

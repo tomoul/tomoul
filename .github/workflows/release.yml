@@ -103,7 +103,7 @@ jobs:
           def derive_paths(name):
               dashed = name.replace('_', '-')
               return {
-                  'weights_path': f'models/{name}.tl',
+                  'weights_path': f'artifacts/{name}.tl',
                   'hf_repo': f'tomoul/{dashed}',
                   'c_binding': f'src/models/{name}/c.zig',
               }
@@ -206,7 +206,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: weights-${{ matrix.model }}
-          path: models/*.tl
+          path: artifacts/*.tl
 
   # ==========================================================================
   # Job 2: Generate C Header (from C binding file)
@@ -267,7 +267,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: weights-${{ matrix.model }}
-          path: models/
+          path: artifacts/
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
@@ -307,7 +307,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: weights-${{ matrix.model }}
-          path: models/
+          path: artifacts/
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
@@ -373,7 +373,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: weights-${{ matrix.model }}
-          path: models/
+          path: artifacts/
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
@@ -439,7 +439,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: weights-${{ matrix.model }}
-          path: models/
+          path: artifacts/
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
@@ -488,7 +488,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: weights-${{ matrix.model }}
-          path: models/
+          path: artifacts/
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2

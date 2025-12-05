@@ -1,0 +1,27 @@
+{
+  "name": "tomoul-punctuation-demo",
+  "version": "1.0.0",
+  "description": "Punctuation restoration demo using Tomoul native library",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "punctuation",
+    "nlp",
+    "transformers",
+    "xlm-roberta"
+  ],
+  "author": "Tomoul",
+  "license": "MIT",
+  "dependencies": {
+    "koffi": "^2.8.11"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

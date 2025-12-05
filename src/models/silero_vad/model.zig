@@ -1,7 +1,7 @@
 const std = @import("std");
-const Tensor = @import("../../core/tensor.zig").Tensor;
-const ops = @import("../../core/ops.zig");
-const loader_mod = @import("../../core/loader.zig");
+const Tensor = @import("tensor.zig").Tensor;
+const ops = @import("ops.zig");
+const loader_mod = @import("loader.zig");
 const ModelLoader = loader_mod.ModelLoader;
 const LoadError = loader_mod.LoadError;
 
@@ -405,9 +405,9 @@ test "vad model load" {
     const allocator = std.testing.allocator;
 
     // Try to load the model
-    var vad = SileroVAD.init(allocator, "models/silero_vad.tl") catch |err| {
+    var vad = SileroVAD.init(allocator, "artifacts/silero_vad.tl") catch |err| {
         if (err == LoadError.FileNotFound) {
-            std.debug.print("\nSkipping test: models/silero_vad.tl not found. Run 'python3 tools/export_vad.py' first.\n", .{});
+            std.debug.print("\nSkipping test: artifacts/silero_vad.tl not found. Run 'python3 tools/export_vad.py -o artifacts/' first.\n", .{});
             return;
         }
         return err;
@@ -427,9 +427,9 @@ test "vad forward pass" {
     const allocator = std.testing.allocator;
 
     // Try to load the model
-    var vad = SileroVAD.init(allocator, "models/silero_vad.tl") catch |err| {
+    var vad = SileroVAD.init(allocator, "artifacts/silero_vad.tl") catch |err| {
         if (err == LoadError.FileNotFound) {
-            std.debug.print("\nSkipping test: models/silero_vad.tl not found.\n", .{});
+            std.debug.print("\nSkipping test: artifacts/silero_vad.tl not found.\n", .{});
             return;
         }
         return err;
@@ -457,9 +457,9 @@ test "vad forward pass" {
 test "vad multiple chunks" {
     const allocator = std.testing.allocator;
 
-    var vad = SileroVAD.init(allocator, "models/silero_vad.tl") catch |err| {
+    var vad = SileroVAD.init(allocator, "artifacts/silero_vad.tl") catch |err| {
         if (err == LoadError.FileNotFound) {
-            std.debug.print("\nSkipping test: models/silero_vad.tl not found.\n", .{});
+            std.debug.print("\nSkipping test: artifacts/silero_vad.tl not found.\n", .{});
             return;
         }
         return err;
@@ -487,9 +487,9 @@ test "vad multiple chunks" {
 test "vad speech detection - real audio" {
     const allocator = std.testing.allocator;
 
-    var vad = SileroVAD.init(allocator, "models/silero_vad.tl") catch |err| {
+    var vad = SileroVAD.init(allocator, "artifacts/silero_vad.tl") catch |err| {
         if (err == LoadError.FileNotFound) {
-            std.debug.print("\nSkipping test: models/silero_vad.tl not found.\n", .{});
+            std.debug.print("\nSkipping test: artifacts/silero_vad.tl not found.\n", .{});
             return;
         }
         return err;

@@ -17,15 +17,145 @@ pub fn build(b: *std.Build) void {
     const bundled = b.option(bool, "bundled", "Embed model weights in native libraries") orelse false;
 
     // ==========================================================================
-    // Main executable
+    // Main executable (model-specific or generic demo)
     // ==========================================================================
-    const exe = b.addExecutable(.{
-        .name = "tomoul",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+    const exe_name = if (filter) |model_name| b.fmt("tomoul_{s}", .{model_name}) else "tomoul";
+
+    // Try to find model in registry to get module path
+    var model_module_path: ?[]const u8 = null;
+    if (filter) |model_name| {
+        for (registry.models) |model_config| {
+            if (std.mem.eql(u8, model_config.name, model_name)) {
+                model_module_path = model_config.model_module;
+                break;
+            }
+        }
+    }
+
+    const exe_source = if (filter) |model_name| blk: {
+        // Derive CLI path from model module path
+        const base_path = if (model_module_path) |path| blk2: {
+            // Replace model.zig with cli.zig
+            const model_zig = "/model.zig";
+            if (std.mem.endsWith(u8, path, model_zig)) {
+                const dir_path = path[0 .. path.len - model_zig.len];
+                break :blk2 b.fmt("{s}/cli.zig", .{dir_path});
+            }
+            break :blk2 null;
+        } else blk3: {
+            // Fallback: derive from model name
+            const model_name_underscore = b.allocator.alloc(u8, model_name.len) catch break :blk b.path("src/main.zig");
+            @memcpy(model_name_underscore, model_name);
+            for (model_name_underscore) |*c| {
+                if (c.* == '-') c.* = '_';
+            }
+            break :blk3 b.fmt("src/models/{s}/cli.zig", .{model_name_underscore});
+        };
+
+        // Check if CLI exists
+        if (base_path) |cli_path| {
+            const cli_file = std.fs.cwd().openFile(cli_path, .{}) catch break :blk b.path("src/main.zig");
+            cli_file.close();
+            break :blk b.path(cli_path);
+        }
+        break :blk b.path("src/main.zig");
+    } else b.path("src/main.zig");
+
+    // Create core modules for native executable
+    const tensor_module = b.createModule(.{
+        .root_source_file = b.path("src/core/tensor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const ops_module = b.createModule(.{
+        .root_source_file = b.path("src/core/ops.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ops_module.addImport("tensor.zig", tensor_module);
+
+    const loader_module = b.createModule(.{
+        .root_source_file = b.path("src/core/loader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    loader_module.addImport("tensor.zig", tensor_module);
+
+    const attention_module = b.createModule(.{
+        .root_source_file = b.path("src/core/attention.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    attention_module.addImport("tensor.zig", tensor_module);
+    attention_module.addImport("ops.zig", ops_module);
+
+    const transformer_module = b.createModule(.{
+        .root_source_file = b.path("src/core/transformer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transformer_module.addImport("tensor.zig", tensor_module);
+    transformer_module.addImport("ops.zig", ops_module);
+    transformer_module.addImport("attention.zig", attention_module);
+
+    // Create build options for bundled mode
+    const exe_options = b.addOptions();
+    exe_options.addOption(bool, "bundled", bundled);
+
+    // If bundled, read and embed the model weights
+    var embedded_weights: ?[]const u8 = null;
+    if (bundled and filter != null) {
+        for (registry.models) |model_config| {
+            if (std.mem.eql(u8, model_config.name, filter.?) and model_config.supports_bundled) {
+                const weights_path = model_config.weights_path orelse deriveWeightsPath(b, model_config.name);
+                // Read the weights file at build time
+                const weights_file = std.fs.cwd().readFileAlloc(
+                    b.allocator,
+                    weights_path,
+                    100 * 1024 * 1024, // 100MB max
+                ) catch |err| {
+                    std.debug.print("Failed to read weights file {s}: {}\n", .{ weights_path, err });
+                    break;
+                };
+                embedded_weights = weights_file;
+                break;
+            }
+        }
+    }
+    exe_options.addOption(?[]const u8, "embedded_weights", embedded_weights);
+
+    const exe_module = b.createModule(.{
+        .root_source_file = exe_source,
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_module.addImport("tensor.zig", tensor_module);
+    exe_module.addImport("ops.zig", ops_module);
+    exe_module.addImport("loader.zig", loader_module);
+    exe_module.addImport("attention.zig", attention_module);
+    exe_module.addImport("transformer.zig", transformer_module);
+    exe_module.addOptions("build_options", exe_options);
+
+    // Add model-specific imports if building for a specific model
+    if (filter != null and model_module_path != null) {
+        const model_path = model_module_path.?;
+        const model_module = b.createModule(.{
+            .root_source_file = b.path(model_path),
             .target = target,
             .optimize = optimize,
-        }),
+        });
+        model_module.addImport("tensor.zig", tensor_module);
+        model_module.addImport("ops.zig", ops_module);
+        model_module.addImport("loader.zig", loader_module);
+        model_module.addImport("attention.zig", attention_module);
+        model_module.addImport("transformer.zig", transformer_module);
+        exe_module.addImport("model.zig", model_module);
+    }
+
+    const exe = b.addExecutable(.{
+        .name = exe_name,
+        .root_module = exe_module,
     });
 
     b.installArtifact(exe);
@@ -108,6 +238,23 @@ pub fn build(b: *std.Build) void {
     });
     wasm_loader_module.addImport("tensor.zig", wasm_tensor_module);
 
+    const wasm_attention_module = b.createModule(.{
+        .root_source_file = b.path("src/core/attention.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_attention_module.addImport("tensor.zig", wasm_tensor_module);
+    wasm_attention_module.addImport("ops.zig", wasm_ops_module);
+
+    const wasm_transformer_module = b.createModule(.{
+        .root_source_file = b.path("src/core/transformer.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_transformer_module.addImport("tensor.zig", wasm_tensor_module);
+    wasm_transformer_module.addImport("ops.zig", wasm_ops_module);
+    wasm_transformer_module.addImport("attention.zig", wasm_attention_module);
+
     // Master wasm step that builds all models
     const wasm_step = b.step("wasm", "Build all WebAssembly targets");
 
@@ -118,6 +265,12 @@ pub fn build(b: *std.Build) void {
             if (!std.mem.eql(u8, f, model.name)) continue;
         }
 
+        // Skip WASM build for models that don't support bundled weights
+        // (WASM requires embedded weights, can't load at runtime)
+        if (!model.supports_bundled) {
+            continue;
+        }
+
         // Build wasm target for this model
         buildWasmModel(
             b,
@@ -126,6 +279,8 @@ pub fn build(b: *std.Build) void {
             wasm_tensor_module,
             wasm_ops_module,
             wasm_loader_module,
+            wasm_attention_module,
+            wasm_transformer_module,
             wasm_step,
         );
     }
@@ -168,7 +323,7 @@ fn deriveModelModule(b: *std.Build, name: []const u8) []const u8 {
 }
 
 fn deriveWeightsPath(b: *std.Build, name: []const u8) []const u8 {
-    return b.fmt("models/{s}.tl", .{name});
+    return b.fmt("artifacts/{s}.tl", .{name});
 }
 
 fn deriveExampleDir(b: *std.Build, name: []const u8) []const u8 {
@@ -191,12 +346,14 @@ fn buildWasmModel(
     wasm_tensor_module: *std.Build.Module,
     wasm_ops_module: *std.Build.Module,
     wasm_loader_module: *std.Build.Module,
+    wasm_attention_module: *std.Build.Module,
+    wasm_transformer_module: *std.Build.Module,
     wasm_step: *std.Build.Step,
 ) void {
-    // Derive paths from model name (convention over configuration)
-    const model_module_path = deriveModelModule(b, model.name);
-    const wasm_binding_path = deriveWasmBinding(b, model.name);
-    const weights_path = deriveWeightsPath(b, model.name);
+    // Use explicit paths from registry, or derive from model name (convention over configuration)
+    const model_module_path = model.model_module orelse deriveModelModule(b, model.name);
+    const wasm_binding_path = model.wasm_binding orelse deriveWasmBinding(b, model.name);
+    const weights_path = model.weights_path orelse deriveWeightsPath(b, model.name);
 
     // Create the model module for Wasm
     const wasm_model_module = b.createModule(.{
@@ -204,10 +361,11 @@ fn buildWasmModel(
         .target = wasm_target,
         .optimize = .ReleaseSmall,
     });
-    // Map relative imports to our wasm modules
-    wasm_model_module.addImport("../../core/tensor.zig", wasm_tensor_module);
-    wasm_model_module.addImport("../../core/ops.zig", wasm_ops_module);
-    wasm_model_module.addImport("../../core/loader.zig", wasm_loader_module);
+    wasm_model_module.addImport("tensor.zig", wasm_tensor_module);
+    wasm_model_module.addImport("ops.zig", wasm_ops_module);
+    wasm_model_module.addImport("loader.zig", wasm_loader_module);
+    wasm_model_module.addImport("attention.zig", wasm_attention_module);
+    wasm_model_module.addImport("transformer.zig", wasm_transformer_module);
 
     // Create the binding module
     const wasm_binding = b.createModule(.{
@@ -216,7 +374,7 @@ fn buildWasmModel(
         .optimize = .ReleaseSmall,
     });
     wasm_binding.addImport("tensor", wasm_tensor_module);
-    wasm_binding.addImport("vad", wasm_model_module);
+    wasm_binding.addImport("model", wasm_model_module);
 
     // Embed model weights if bundled
     if (model.supports_bundled) {
@@ -266,10 +424,10 @@ fn buildNativeLib(
     bundled: bool,
     lib_step: *std.Build.Step,
 ) void {
-    // Derive paths from model name (convention over configuration)
-    const c_binding_path = deriveCBinding(b, model.name);
-    const model_module_path = deriveModelModule(b, model.name);
-    const weights_path = deriveWeightsPath(b, model.name);
+    // Use explicit paths from registry, or derive from model name (convention over configuration)
+    const c_binding_path = model.c_binding orelse deriveCBinding(b, model.name);
+    const model_module_path = model.model_module orelse deriveModelModule(b, model.name);
+    const weights_path = model.weights_path orelse deriveWeightsPath(b, model.name);
 
     // Create shared modules for native builds
     const tensor_module = b.createModule(.{
@@ -292,15 +450,34 @@ fn buildNativeLib(
     });
     loader_module.addImport("tensor.zig", tensor_module);
 
+    const attention_module = b.createModule(.{
+        .root_source_file = b.path("src/core/attention.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    attention_module.addImport("tensor.zig", tensor_module);
+    attention_module.addImport("ops.zig", ops_module);
+
+    const transformer_module = b.createModule(.{
+        .root_source_file = b.path("src/core/transformer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transformer_module.addImport("tensor.zig", tensor_module);
+    transformer_module.addImport("ops.zig", ops_module);
+    transformer_module.addImport("attention.zig", attention_module);
+
     // Create the model module
     const model_module = b.createModule(.{
         .root_source_file = b.path(model_module_path),
         .target = target,
         .optimize = optimize,
     });
-    model_module.addImport("../../core/tensor.zig", tensor_module);
-    model_module.addImport("../../core/ops.zig", ops_module);
-    model_module.addImport("../../core/loader.zig", loader_module);
+    model_module.addImport("tensor.zig", tensor_module);
+    model_module.addImport("ops.zig", ops_module);
+    model_module.addImport("loader.zig", loader_module);
+    model_module.addImport("attention.zig", attention_module);
+    model_module.addImport("transformer.zig", transformer_module);
 
     // Create build options for bundled/lite mode
     const options = b.addOptions();
@@ -366,8 +543,8 @@ fn buildNativeLib(
     const static_install = b.addInstallArtifact(static_lib, .{});
     lib_step.dependOn(&static_install.step);
 
-    // Note: C header generation is handled by release.py
-    // Zig's -femit-h doesn't work reliably with complex module dependencies
+    // Note: C header generation is handled by scripts/release.py
+    // which parses export functions from c.zig and generates proper C declarations
 
     // Create C binding module for shared library (modules can only be used once)
     const c_binding_module_shared = configureBindingModule(

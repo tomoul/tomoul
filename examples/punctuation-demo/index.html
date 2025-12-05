@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tomoul Punctuation - Demo</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+            color: white;
+        }
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        .subtitle {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+        .container {
+            max-width: 900px;
+            width: 100%;
+        }
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.15);
+        }
+        .section-title {
+            color: #667eea;
+            font-size: 1.3rem;
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+        textarea {
+            width: 100%;
+            padding: 1rem;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 150px;
+            transition: border-color 0.3s;
+        }
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .output-box {
+            background: #f8f9fa;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            padding: 1rem;
+            min-height: 150px;
+            font-size: 1rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .output-box.empty {
+            color: #999;
+            font-style: italic;
+        }
+        .output-box.error {
+            color: #ff4444;
+            border-color: #ff4444;
+        }
+        .button-group {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        button {
+            flex: 1;
+            padding: 1rem 2rem;
+            font-size: 1.1rem;
+            font-weight: 600;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-family: inherit;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+        .btn-secondary {
+            background: #e0e0e0;
+            color: #666;
+        }
+        .btn-secondary:hover:not(:disabled) {
+            background: #d0d0d0;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .examples {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        .example-card {
+            background: #f8f9fa;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            padding: 1rem;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .example-card:hover {
+            border-color: #667eea;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .example-title {
+            font-weight: 600;
+            color: #667eea;
+            margin-bottom: 0.5rem;
+        }
+        .example-text {
+            font-size: 0.9rem;
+            color: #666;
+            line-height: 1.4;
+        }
+        .info-banner {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+            color: #856404;
+        }
+        .info-banner strong {
+            color: #856404;
+        }
+        .stats {
+            display: flex;
+            justify-content: space-around;
+            gap: 1rem;
+            margin-top: 1rem;
+            padding: 1rem;
+            background: #f8f9fa;
+            border-radius: 12px;
+        }
+        .stat {
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #667eea;
+        }
+        .stat-label {
+            font-size: 0.9rem;
+            color: #666;
+            margin-top: 0.25rem;
+        }
+        .footer {
+            margin-top: 2rem;
+            text-align: center;
+            color: white;
+            opacity: 0.8;
+        }
+        .footer a {
+            color: white;
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎯 Punctuation Restoration</h1>
+        <p class="subtitle">Add proper punctuation and capitalization to unpunctuated text</p>
+    </div>
+
+    <div class="container">
+        <div class="info-banner">
+            <strong>🚀 Live Demo:</strong> This demo uses the actual XLM-RoBERTa Large model (2.1GB) running via native library.
+            Start the server: <code>npm start</code>
+        </div>
+
+        <div class="card">
+            <div class="section-title">📝 Input Text (without punctuation)</div>
+            <textarea id="inputText" placeholder="Enter text without punctuation, e.g., 'hello world how are you doing today'"></textarea>
+
+            <div class="button-group">
+                <button class="btn-primary" onclick="processText()">✨ Add Punctuation</button>
+                <button class="btn-secondary" onclick="clearText()">🗑️ Clear</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="section-title">✅ Output Text (with punctuation)</div>
+            <div id="outputText" class="output-box empty">Your punctuated text will appear here...</div>
+
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value" id="charCount">0</div>
+                    <div class="stat-label">Characters</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="wordCount">0</div>
+                    <div class="stat-label">Words</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="punctCount">0</div>
+                    <div class="stat-label">Punctuation Added</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="section-title">💡 Example Inputs (click to try)</div>
+            <div class="examples">
+                <div class="example-card" onclick="loadExample(0)">
+                    <div class="example-title">Simple Greeting</div>
+                    <div class="example-text">hello world how are you doing today</div>
+                </div>
+                <div class="example-card" onclick="loadExample(1)">
+                    <div class="example-title">Introduction</div>
+                    <div class="example-text">my name is john i live in new york city i work as a software engineer</div>
+                </div>
+                <div class="example-card" onclick="loadExample(2)">
+                    <div class="example-title">Question</div>
+                    <div class="example-text">what time is it can you tell me please i need to catch my train</div>
+                </div>
+                <div class="example-card" onclick="loadExample(3)">
+                    <div class="example-title">Complex Sentence</div>
+                    <div class="example-text">this is a test however i am not sure if it works correctly we will find out soon</div>
+                </div>
+                <div class="example-card" onclick="loadExample(4)">
+                    <div class="example-title">Business Context</div>
+                    <div class="example-text">the meeting is scheduled for tomorrow at 3 pm please make sure to bring all the documents</div>
+                </div>
+                <div class="example-card" onclick="loadExample(5)">
+                    <div class="example-title">Multiple Questions</div>
+                    <div class="example-text">where are you going why are you in such a hurry is everything alright</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        <p>Powered by <strong>Tomoul</strong> | XLM-RoBERTa Punctuation Model</p>
+        <p><a href="https://github.com/tomoul/tomoul" target="_blank">View on GitHub</a></p>
+    </div>
+
+    <script>
+        const examples = [
+            "hello world how are you doing today",
+            "my name is john i live in new york city i work as a software engineer",
+            "what time is it can you tell me please i need to catch my train",
+            "this is a test however i am not sure if it works correctly we will find out soon",
+            "the meeting is scheduled for tomorrow at 3 pm please make sure to bring all the documents",
+            "where are you going why are you in such a hurry is everything alright"
+        ];
+
+        function loadExample(index) {
+            document.getElementById('inputText').value = examples[index];
+        }
+
+        function clearText() {
+            document.getElementById('inputText').value = '';
+            document.getElementById('outputText').innerText = 'Your punctuated text will appear here...';
+            document.getElementById('outputText').classList.add('empty');
+            updateStats('', '');
+        }
+
+        function updateStats(input, output) {
+            const charCount = output.length;
+            const wordCount = output.trim() ? output.trim().split(/\s+/).length : 0;
+            const inputPunct = (input.match(/[.!?,;:]/g) || []).length;
+            const outputPunct = (output.match(/[.!?,;:]/g) || []).length;
+            const punctAdded = Math.max(0, outputPunct - inputPunct);
+
+            document.getElementById('charCount').innerText = charCount;
+            document.getElementById('wordCount').innerText = wordCount;
+            document.getElementById('punctCount').innerText = punctAdded;
+        }
+
+        async function processText() {
+            const input = document.getElementById('inputText').value.trim();
+
+            if (!input) {
+                alert('Please enter some text first!');
+                return;
+            }
+
+            const outputBox = document.getElementById('outputText');
+            outputBox.innerText = 'Processing...';
+            outputBox.classList.remove('empty');
+
+            try {
+                // Call the actual punctuation API (relative URL works with both servers)
+                const response = await fetch('/api/punctuate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ text: input })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Processing failed');
+                }
+
+                const data = await response.json();
+                outputBox.innerText = data.output;
+                updateStats(input, data.output);
+
+            } catch (error) {
+                outputBox.innerText = `Error: ${error.message}`;
+                outputBox.classList.add('error');
+                console.error('Punctuation error:', error);
+            }
+        }
+
+        // Add Enter key support for textarea
+        document.getElementById('inputText').addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key === 'Enter') {
+                processText();
+            }
+        });
+    </script>
+</body>
+</html>

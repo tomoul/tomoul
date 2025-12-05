@@ -4,7 +4,7 @@ Tomoul Silero VAD Exporter
 Exports Silero VAD model weights to .tl binary format for Zig inference engine.
 
 Usage:
-  python export_vad.py           # Export full Silero VAD to models/
+    python export_vad.py           # Export full Silero VAD to artifacts/
   python export_vad.py --tiny    # Export tiny fixture to tests/fixtures/silero_vad/
 
 Binary Format (.tl):
@@ -325,7 +325,7 @@ def export_silero_vad():
         exporter.add_tensor(clean_name, param)
 
     # Export to models directory
-    output_path = Path(__file__).parent.parent / "models" / "silero_vad.tl"
+    output_path = Path(__file__).parent.parent / "artifacts" / "silero_vad.tl"
     output_path.parent.mkdir(exist_ok=True)
     exporter.export(str(output_path))
 
@@ -462,8 +462,8 @@ if __name__ == "__main__":
         print("Export Complete!")
         print("=" * 60)
         print(f"\nFiles created:")
-        print(f"  - models/silero_vad.tl (model weights)")
-        print(f"  - models/vad_validation.tl (test vectors)")
+        print(f"  - artifacts/silero_vad.tl (model weights)")
+        print(f"  - artifacts/vad_validation.tl (test vectors)")
         print(f"\nNext steps:")
         print(f"  1. Implement LSTM cell in src/core/ops.zig")
         print(f"  2. Create SileroVAD struct in src/models/silero_vad.zig")

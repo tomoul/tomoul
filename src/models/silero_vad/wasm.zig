@@ -13,7 +13,7 @@ const std = @import("std");
 
 // Import core modules (provided by build.zig)
 const tensor_mod = @import("tensor");
-const vad_mod = @import("vad");
+const vad_mod = @import("model");
 
 const Tensor = tensor_mod.Tensor;
 const SileroVAD = vad_mod.SileroVAD;
