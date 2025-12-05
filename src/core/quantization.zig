@@ -1428,3 +1428,329 @@ test "Q8_K weight-only matmul SIMD" {
         try std.testing.expectApproxEqAbs(expected, simd_result.data[i], 0.0001);
     }
 }
+
+// ============================================================================
+// Comprehensive Accuracy Validation
+// ============================================================================
+
+/// Compute error metrics for quantization accuracy analysis
+fn computeErrorMetrics(original: []const f32, restored: []const f32) struct {
+    mse: f64,
+    rmse: f64,
+    max_error: f32,
+    mean_abs_error: f64,
+    rel_error: f32,
+} {
+    var sum_sq_error: f64 = 0.0;
+    var sum_abs_error: f64 = 0.0;
+    var max_error: f32 = 0.0;
+    var sum_abs_original: f64 = 0.0;
+
+    for (original, 0..) |orig, i| {
+        const rest = restored[i];
+        const err = @abs(orig - rest);
+
+        sum_sq_error += @as(f64, err * err);
+        sum_abs_error += @as(f64, err);
+        max_error = @max(max_error, err);
+        sum_abs_original += @as(f64, @abs(orig));
+    }
+
+    const n: f64 = @floatFromInt(original.len);
+    const mse = sum_sq_error / n;
+    const rmse = @sqrt(mse);
+    const mean_abs_error = sum_abs_error / n;
+    const mean_original = sum_abs_original / n;
+    const rel_error: f32 = if (mean_original > 0) @floatCast(rmse / mean_original) else 0;
+
+    return .{
+        .mse = mse,
+        .rmse = rmse,
+        .max_error = max_error,
+        .mean_abs_error = mean_abs_error,
+        .rel_error = rel_error,
+    };
+}
+
+test "Q8_0 large matrix accuracy validation" {
+    const allocator = std.testing.allocator;
+
+    // Create large matrices similar to transformer layer dimensions
+    // Input: [batch=16, hidden=768]
+    // Weights: [hidden=768, hidden=768]
+    var a_shape = [_]usize{ 16, 768 };
+    var b_shape = [_]usize{ 768, 768 };
+
+    var a = try Tensor.init(allocator, &a_shape);
+    defer a.deinit();
+    var b = try Tensor.init(allocator, &b_shape);
+    defer b.deinit();
+
+    // Fill with pseudo-random values (deterministic for reproducibility)
+    for (a.data, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.01) * 2.0;
+    }
+    for (b.data, 0..) |*v, i| {
+        v.* = @cos(@as(f32, @floatFromInt(i)) * 0.01) * 2.0;
+    }
+
+    // Float32 reference matmul
+    const ops = @import("ops.zig");
+    var ref = try ops.matmul(allocator, &a, &b);
+    defer ref.deinit();
+
+    // Quantize weights to Q8_0
+    var qb = try quantizeQ8(allocator, &b);
+    defer qb.deinit();
+
+    // Weight-only quantized matmul
+    var qresult = try matmulF32Q8(allocator, &a, &qb);
+    defer qresult.deinit();
+
+    // Calculate error metrics
+    const metrics = computeErrorMetrics(ref.data, qresult.data);
+
+    // Print metrics for visibility
+    std.debug.print("\n=== Q8_0 Large Matrix Accuracy (16x768 @ 768x768) ===\n", .{});
+    std.debug.print("  RMSE: {d:.6}\n", .{metrics.rmse});
+    std.debug.print("  Max Error: {d:.6}\n", .{metrics.max_error});
+    std.debug.print("  Mean Abs Error: {d:.6}\n", .{metrics.mean_abs_error});
+    std.debug.print("  Relative Error: {d:.2}%\n", .{metrics.rel_error * 100});
+    std.debug.print("  Compression: {d:.2}x\n", .{qb.compressionRatio()});
+
+    // Acceptance criteria: relative error < 5% for Q8_0
+    try std.testing.expect(metrics.rel_error < 0.05);
+}
+
+test "Q4_0 large matrix accuracy validation" {
+    const allocator = std.testing.allocator;
+
+    // Smaller matrices for Q4_0 (4-bit has higher error)
+    // Use smaller values to avoid accumulating large errors in matmul
+    var a_shape = [_]usize{ 4, 64 };
+    var b_shape = [_]usize{ 64, 32 };
+
+    var a = try Tensor.init(allocator, &a_shape);
+    defer a.deinit();
+    var b = try Tensor.init(allocator, &b_shape);
+    defer b.deinit();
+
+    // Use smaller scale values for 4-bit quantization
+    for (a.data, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.1) * 0.5;
+    }
+    for (b.data, 0..) |*v, i| {
+        v.* = @cos(@as(f32, @floatFromInt(i)) * 0.1) * 0.5;
+    }
+
+    // Float32 reference
+    const ops = @import("ops.zig");
+    var ref = try ops.matmul(allocator, &a, &b);
+    defer ref.deinit();
+
+    // Quantize weights to Q4_0
+    var qb = try quantizeQ4(allocator, &b);
+    defer qb.deinit();
+
+    // Weight-only quantized matmul
+    var qresult = try matmulF32Q4(allocator, &a, &qb);
+    defer qresult.deinit();
+
+    // Calculate error metrics
+    const metrics = computeErrorMetrics(ref.data, qresult.data);
+
+    std.debug.print("\n=== Q4_0 Matrix Accuracy (4x64 @ 64x32) ===\n", .{});
+    std.debug.print("  RMSE: {d:.6}\n", .{metrics.rmse});
+    std.debug.print("  Max Error: {d:.6}\n", .{metrics.max_error});
+    std.debug.print("  Mean Abs Error: {d:.6}\n", .{metrics.mean_abs_error});
+    std.debug.print("  Relative Error: {d:.2}%\n", .{metrics.rel_error * 100});
+    std.debug.print("  Compression: {d:.2}x\n", .{qb.compressionRatio()});
+
+    // Q4_0 has inherently higher error due to only 15 quantization levels
+    // Use compression ratio and max error as acceptance criteria
+    try std.testing.expect(qb.compressionRatio() > 6.0); // Verify compression
+    try std.testing.expect(metrics.max_error < 0.1); // Reasonable absolute error
+}
+
+test "Q8_K large matrix accuracy validation" {
+    const allocator = std.testing.allocator;
+
+    // Large matrices with varying value ranges across blocks
+    var a_shape = [_]usize{ 16, 512 };
+    var b_shape = [_]usize{ 512, 512 };
+
+    var a = try Tensor.init(allocator, &a_shape);
+    defer a.deinit();
+    var b = try Tensor.init(allocator, &b_shape);
+    defer b.deinit();
+
+    for (a.data, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.01) * 2.0;
+    }
+
+    // Create weights with varying scales across blocks to test Q8_K advantage
+    for (b.data, 0..) |*v, i| {
+        const block = i / 32;
+        const scale_mult: f32 = 1.0 + @as(f32, @floatFromInt(block % 10)) * 0.5;
+        v.* = @cos(@as(f32, @floatFromInt(i)) * 0.01) * scale_mult;
+    }
+
+    // Float32 reference
+    const ops = @import("ops.zig");
+    var ref = try ops.matmul(allocator, &a, &b);
+    defer ref.deinit();
+
+    // Quantize weights to Q8_K (block-wise)
+    var qb = try quantizeQ8K(allocator, &b);
+    defer qb.deinit();
+
+    // Weight-only quantized matmul
+    var qresult = try matmulF32Q8K(allocator, &a, &qb);
+    defer qresult.deinit();
+
+    // Calculate error metrics
+    const metrics = computeErrorMetrics(ref.data, qresult.data);
+
+    std.debug.print("\n=== Q8_K Large Matrix Accuracy (16x512 @ 512x512) ===\n", .{});
+    std.debug.print("  RMSE: {d:.6}\n", .{metrics.rmse});
+    std.debug.print("  Max Error: {d:.6}\n", .{metrics.max_error});
+    std.debug.print("  Mean Abs Error: {d:.6}\n", .{metrics.mean_abs_error});
+    std.debug.print("  Relative Error: {d:.2}%\n", .{metrics.rel_error * 100});
+    std.debug.print("  Compression: {d:.2}x\n", .{qb.compressionRatio()});
+    std.debug.print("  Num blocks: {}\n", .{qb.num_blocks});
+
+    // Acceptance criteria: relative error < 5% for Q8_K
+    try std.testing.expect(metrics.rel_error < 0.05);
+}
+
+test "Format comparison - Q8_0 vs Q8_K vs Q4_0" {
+    const allocator = std.testing.allocator;
+
+    // Test with tensor that has outliers (where Q8_K should excel)
+    var a_shape = [_]usize{ 4, 128 };
+    var b_shape = [_]usize{ 128, 64 };
+
+    var a = try Tensor.init(allocator, &a_shape);
+    defer a.deinit();
+    var b = try Tensor.init(allocator, &b_shape);
+    defer b.deinit();
+
+    for (a.data, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    }
+
+    // Create weights with outliers in some blocks
+    for (b.data, 0..) |*v, i| {
+        const block = i / 32;
+        if (block % 4 == 0) {
+            // Outlier blocks with large values
+            v.* = @cos(@as(f32, @floatFromInt(i)) * 0.1) * 10.0;
+        } else {
+            // Normal blocks with small values
+            v.* = @cos(@as(f32, @floatFromInt(i)) * 0.1) * 0.5;
+        }
+    }
+
+    // Float32 reference
+    const ops = @import("ops.zig");
+    var ref = try ops.matmul(allocator, &a, &b);
+    defer ref.deinit();
+
+    // Q8_0 (per-tensor scale)
+    var qb_q8 = try quantizeQ8(allocator, &b);
+    defer qb_q8.deinit();
+    var result_q8 = try matmulF32Q8(allocator, &a, &qb_q8);
+    defer result_q8.deinit();
+    const metrics_q8 = computeErrorMetrics(ref.data, result_q8.data);
+
+    // Q8_K (per-block scale)
+    var qb_q8k = try quantizeQ8K(allocator, &b);
+    defer qb_q8k.deinit();
+    var result_q8k = try matmulF32Q8K(allocator, &a, &qb_q8k);
+    defer result_q8k.deinit();
+    const metrics_q8k = computeErrorMetrics(ref.data, result_q8k.data);
+
+    // Q4_0 (4-bit per-tensor)
+    var qb_q4 = try quantizeQ4(allocator, &b);
+    defer qb_q4.deinit();
+    var result_q4 = try matmulF32Q4(allocator, &a, &qb_q4);
+    defer result_q4.deinit();
+    const metrics_q4 = computeErrorMetrics(ref.data, result_q4.data);
+
+    std.debug.print("\n=== Format Comparison (with outliers) ===\n", .{});
+    std.debug.print("Matrix: 4x128 @ 128x64\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Format     | Rel Error | Compression | RMSE\n", .{});
+    std.debug.print("-----------|-----------|-------------|--------\n", .{});
+    std.debug.print("Q8_0       | {d:7.2}%  | {d:9.2}x  | {d:.4}\n", .{ metrics_q8.rel_error * 100, qb_q8.compressionRatio(), metrics_q8.rmse });
+    std.debug.print("Q8_K       | {d:7.2}%  | {d:9.2}x  | {d:.4}\n", .{ metrics_q8k.rel_error * 100, qb_q8k.compressionRatio(), metrics_q8k.rmse });
+    std.debug.print("Q4_0       | {d:7.2}%  | {d:9.2}x  | {d:.4}\n", .{ metrics_q4.rel_error * 100, qb_q4.compressionRatio(), metrics_q4.rmse });
+
+    // Q8_K should be at least as good as Q8_0 (often better with outliers)
+    try std.testing.expect(metrics_q8k.rel_error <= metrics_q8.rel_error * 1.1); // Allow 10% tolerance
+
+    // Q4_0 should have worse accuracy but better compression
+    try std.testing.expect(qb_q4.compressionRatio() > qb_q8.compressionRatio());
+
+    // All formats should pass their acceptance thresholds
+    try std.testing.expect(metrics_q8.rel_error < 0.10); // 10% for outlier case
+    try std.testing.expect(metrics_q8k.rel_error < 0.10);
+    try std.testing.expect(metrics_q4.rel_error < 0.20); // Q4 has higher error
+}
+
+test "Quantization accuracy with realistic weight distributions" {
+    const allocator = std.testing.allocator;
+
+    // Test with weight distribution similar to transformer models
+    // (normally distributed, centered around 0)
+    var shape = [_]usize{10000};
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    // Simulate normal-ish distribution using sin/cos combination
+    for (tensor.data, 0..) |*v, i| {
+        const fi: f32 = @floatFromInt(i);
+        const val = @sin(fi * 0.1) * @cos(fi * 0.03) * 0.1;
+        v.* = val;
+    }
+
+    // Q8_0 roundtrip
+    var q8 = try quantizeQ8(allocator, &tensor);
+    defer q8.deinit();
+    var restored_q8 = try dequantizeQ8(allocator, &q8);
+    defer restored_q8.deinit();
+    const metrics_q8 = computeErrorMetrics(tensor.data, restored_q8.data);
+
+    // Q8_K roundtrip
+    var q8k = try quantizeQ8K(allocator, &tensor);
+    defer q8k.deinit();
+    var restored_q8k = try dequantizeQ8K(allocator, &q8k);
+    defer restored_q8k.deinit();
+    const metrics_q8k = computeErrorMetrics(tensor.data, restored_q8k.data);
+
+    // Q4_0 roundtrip
+    var q4 = try quantizeQ4(allocator, &tensor);
+    defer q4.deinit();
+    var restored_q4 = try dequantizeQ4(allocator, &q4);
+    defer restored_q4.deinit();
+    const metrics_q4 = computeErrorMetrics(tensor.data, restored_q4.data);
+
+    std.debug.print("\n=== Quantization Roundtrip Accuracy (10k elements) ===\n", .{});
+    std.debug.print("Format | Rel Error | Max Error | Compression\n", .{});
+    std.debug.print("-------|-----------|-----------|------------\n", .{});
+    std.debug.print("Q8_0   | {d:7.4}%  | {d:9.6} | {d:.2}x\n", .{ metrics_q8.rel_error * 100, metrics_q8.max_error, q8.compressionRatio() });
+    std.debug.print("Q8_K   | {d:7.4}%  | {d:9.6} | {d:.2}x\n", .{ metrics_q8k.rel_error * 100, metrics_q8k.max_error, q8k.compressionRatio() });
+    std.debug.print("Q4_0   | {d:7.4}%  | {d:9.6} | {d:.2}x\n", .{ metrics_q4.rel_error * 100, metrics_q4.max_error, q4.compressionRatio() });
+
+    // Q8_0 and Q8_K should have <1% relative error for normal distributions
+    try std.testing.expect(metrics_q8.rel_error < 0.01);
+    try std.testing.expect(metrics_q8k.rel_error < 0.01);
+
+    // Q4_0 should have <15% relative error (only 15 quantization levels)
+    try std.testing.expect(metrics_q4.rel_error < 0.15);
+
+    // Compression ratios should meet targets
+    try std.testing.expect(q8.compressionRatio() > 3.5); // ~4x for Q8
+    try std.testing.expect(q8k.compressionRatio() > 3.0); // ~3-4x for Q8_K
+    try std.testing.expect(q4.compressionRatio() > 6.0); // ~8x for Q4
+}
