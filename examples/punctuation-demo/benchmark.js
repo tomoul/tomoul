@@ -13,24 +13,48 @@ const koffi = require('koffi');
 const platform = process.platform;
 const arch = process.arch;
 
-let libName;
-if (platform === 'linux') {
-    libName = arch === 'x64'
-        ? 'libtomoul_fullstop-punctuation-multilang-large_linux_x86_64.so'
-        : 'libtomoul_fullstop-punctuation-multilang-large_linux_aarch64.so';
-} else if (platform === 'darwin') {
-    libName = arch === 'arm64'
-        ? 'libtomoul_fullstop-punctuation-multilang-large_mac_aarch64.dylib'
-        : 'libtomoul_fullstop-punctuation-multilang-large_mac_x86_64.dylib';
+// Model selection: 'large' or 'sonar-base'
+const MODEL = process.env.TOMOUL_MODEL || 'large';
+
+let libName, weightsFile, vocabFile;
+if (MODEL === 'sonar-base') {
+    // Sonar-Base: 12 layers, 768 hidden - 3.5x faster, 3.7x smaller
+    if (platform === 'linux') {
+        libName = arch === 'x64'
+            ? 'libtomoul_fullstop-punctuation-multilingual-sonar-base_linux_x86_64.so'
+            : 'libtomoul_fullstop-punctuation-multilingual-sonar-base_linux_aarch64.so';
+    } else if (platform === 'darwin') {
+        libName = arch === 'arm64'
+            ? 'libtomoul_fullstop-punctuation-multilingual-sonar-base_mac_aarch64.dylib'
+            : 'libtomoul_fullstop-punctuation-multilingual-sonar-base_mac_x86_64.dylib';
+    } else {
+        console.error(`Unsupported platform: ${platform}`);
+        process.exit(1);
+    }
+    weightsFile = 'fullstop_punctuation_multilingual_sonar_base_q8.tl';
+    vocabFile = 'fullstop_punctuation_multilingual_sonar_base_vocab.txt';
 } else {
-    console.error(`Unsupported platform: ${platform}`);
-    process.exit(1);
+    // Large: 24 layers, 1024 hidden - best accuracy
+    if (platform === 'linux') {
+        libName = arch === 'x64'
+            ? 'libtomoul_fullstop-punctuation-multilang-large_linux_x86_64.so'
+            : 'libtomoul_fullstop-punctuation-multilang-large_linux_aarch64.so';
+    } else if (platform === 'darwin') {
+        libName = arch === 'arm64'
+            ? 'libtomoul_fullstop-punctuation-multilang-large_mac_aarch64.dylib'
+            : 'libtomoul_fullstop-punctuation-multilang-large_mac_x86_64.dylib';
+    } else {
+        console.error(`Unsupported platform: ${platform}`);
+        process.exit(1);
+    }
+    weightsFile = 'fullstop_punctuation_multilang_large_q8.tl';
+    vocabFile = 'fullstop_punctuation_multilang_large_vocab.txt';
 }
 
 const PROJECT_ROOT = path.join(__dirname, '../..');
 const LIB_PATH = path.join(PROJECT_ROOT, 'release/lib', libName);
-const WEIGHTS_PATH = path.join(PROJECT_ROOT, 'artifacts/fullstop_punctuation_multilang_large_q8.tl');
-const VOCAB_PATH = path.join(PROJECT_ROOT, 'artifacts/fullstop_punctuation_multilang_large_vocab.txt');
+const WEIGHTS_PATH = path.join(PROJECT_ROOT, 'artifacts', weightsFile);
+const VOCAB_PATH = path.join(PROJECT_ROOT, 'artifacts', vocabFile);
 
 // Check if library exists
 if (!fs.existsSync(LIB_PATH)) {

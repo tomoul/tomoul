@@ -124,6 +124,33 @@ pub const models = [_]ModelConfig{
         .supports_bundled = false, // Weights loaded separately at runtime
         .release_mode = .fast, // Large model benefits from ReleaseFast (~15% faster)
     },
+    .{
+        .name = "fullstop-punctuation-multilingual-sonar-base",
+        .kind = .text,
+        .description = "Punctuation Restoration (XLM-RoBERTa Base - 3.5x faster, 3.7x smaller than Large)",
+        .wasm_binding = "src/models/xlm_roberta_punctuation/wasm.zig",
+        .c_binding = "src/models/xlm_roberta_punctuation/c.zig",
+        .model_module = "src/models/xlm_roberta_punctuation/model.zig",
+        .weights_path = "artifacts/fullstop_punctuation_multilingual_sonar_base.tl",
+        .hf_repo = "tomoul/fullstop-punctuation-multilingual-sonar-base",
+        .export_symbols = &.{
+            "init",
+            "get_input_buffer_ptr",
+            "get_max_input_bytes",
+            "get_output_buffer_ptr",
+            "get_output_length",
+            "process_text",
+            "reset",
+            "is_ready",
+            "get_version",
+        },
+        .weight_variants = &.{
+            .{ .suffix = "-q8", .path = "artifacts/fullstop_punctuation_multilingual_sonar_base_q8.tl", .description = "Q8 quantized - 4x smaller" },
+        },
+        .has_example = false,
+        .supports_bundled = false, // Weights loaded separately at runtime
+        .release_mode = .fast,
+    },
     // Add more models - paths are derived from name automatically:
     // .{
     //     .name = "whisper_tiny",
