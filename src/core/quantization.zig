@@ -269,6 +269,306 @@ pub fn matmulF32Q8Simd(
 }
 
 // ============================================================================
+// Q8_K: Block-wise 8-bit Symmetric Quantization (Weight-Only)
+// ============================================================================
+
+/// Block size for block-wise quantization
+/// 32 is optimal for SIMD (AVX2 = 32 bytes)
+pub const BLOCK_SIZE: usize = 32;
+
+/// Q8_K: Block-wise symmetric 8-bit quantization
+/// Storage: (n_blocks * 4) bytes for f32 scales + n bytes of int8 data
+/// Each block of 32 elements gets its own scale for better accuracy
+pub const QuantizedTensorQ8K = struct {
+    block_size: usize,
+    num_blocks: usize,
+    scales: []f32, // One scale per block (f32 for precision)
+    data: []i8,
+    shape: []usize,
+    element_count: usize,
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    /// Initialize with given shape
+    pub fn init(allocator: std.mem.Allocator, shape: []const usize) !Self {
+        var total: usize = 1;
+        for (shape) |dim| total *= dim;
+
+        const num_blocks = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        const shape_copy = try allocator.dupe(usize, shape);
+        errdefer allocator.free(shape_copy);
+
+        const scales = try allocator.alloc(f32, num_blocks);
+        errdefer allocator.free(scales);
+
+        const data = try allocator.alloc(i8, total);
+        errdefer allocator.free(data);
+
+        return .{
+            .block_size = BLOCK_SIZE,
+            .num_blocks = num_blocks,
+            .scales = scales,
+            .data = data,
+            .shape = shape_copy,
+            .element_count = total,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free memory
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.scales);
+        self.allocator.free(self.data);
+        self.allocator.free(self.shape);
+    }
+
+    /// Get total number of elements
+    pub fn numel(self: *const Self) usize {
+        return self.element_count;
+    }
+
+    /// Memory size in bytes (scales + data)
+    pub fn sizeBytes(self: *const Self) usize {
+        return self.scales.len * 4 + self.data.len;
+    }
+
+    /// Get compression ratio vs float32
+    pub fn compressionRatio(self: *const Self) f32 {
+        const f32_size: f32 = @floatFromInt(self.numel() * 4);
+        const q8k_size: f32 = @floatFromInt(self.sizeBytes());
+        return f32_size / q8k_size;
+    }
+
+    /// Get block index and offset within block for a given element index
+    pub fn getBlockInfo(self: *const Self, idx: usize) struct { block: usize, offset: usize } {
+        return .{
+            .block = idx / self.block_size,
+            .offset = idx % self.block_size,
+        };
+    }
+
+    /// Get dequantized value at index
+    pub fn getDequantized(self: *const Self, idx: usize) f32 {
+        const block_idx = idx / self.block_size;
+        const scale = self.scales[block_idx];
+        return @as(f32, @floatFromInt(self.data[idx])) * scale;
+    }
+};
+
+/// Quantize float32 tensor to Q8_K format (block-wise, per-block scale)
+pub fn quantizeQ8K(allocator: std.mem.Allocator, tensor: *const Tensor) !QuantizedTensorQ8K {
+    var result = try QuantizedTensorQ8K.init(allocator, tensor.shape);
+    errdefer result.deinit();
+
+    const total = tensor.data.len;
+    var block_idx: usize = 0;
+
+    while (block_idx * BLOCK_SIZE < total) : (block_idx += 1) {
+        const start = block_idx * BLOCK_SIZE;
+        const end = @min(start + BLOCK_SIZE, total);
+        const block = tensor.data[start..end];
+
+        // Find max absolute value in this block
+        var max_abs: f32 = 0.0;
+        for (block) |v| {
+            const abs_v = @abs(v);
+            if (abs_v > max_abs) max_abs = abs_v;
+        }
+
+        // Calculate scale for this block
+        if (max_abs == 0.0) {
+            result.scales[block_idx] = 1.0;
+            for (start..end) |i| {
+                result.data[i] = 0;
+            }
+        } else {
+            result.scales[block_idx] = max_abs / 127.0;
+            const inv_scale = 127.0 / max_abs;
+
+            // Quantize block elements
+            for (block, start..) |v, i| {
+                const scaled = v * inv_scale;
+                const rounded = @round(scaled);
+                const clamped = std.math.clamp(rounded, -127.0, 127.0);
+                result.data[i] = @intFromFloat(clamped);
+            }
+        }
+    }
+
+    return result;
+}
+
+/// Dequantize Q8_K tensor back to float32
+pub fn dequantizeQ8K(allocator: std.mem.Allocator, qtensor: *const QuantizedTensorQ8K) !Tensor {
+    var result = try Tensor.init(allocator, qtensor.shape);
+    errdefer result.deinit();
+
+    const total = qtensor.element_count;
+    var block_idx: usize = 0;
+
+    while (block_idx * qtensor.block_size < total) : (block_idx += 1) {
+        const start = block_idx * qtensor.block_size;
+        const end = @min(start + qtensor.block_size, total);
+        const scale = qtensor.scales[block_idx];
+
+        for (start..end) |i| {
+            result.data[i] = @as(f32, @floatFromInt(qtensor.data[i])) * scale;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Q8_K Weight-Only Quantized Matrix Multiplication
+// ============================================================================
+
+/// Weight-Only Quantized Matrix Multiplication for Q8_K (block-wise)
+/// a: [M, K] float32 input (activations)
+/// b: [K, N] quantized weights (block-wise Q8)
+/// Returns: [M, N] float32 result
+pub fn matmulF32Q8K(
+    allocator: std.mem.Allocator,
+    a: *const Tensor,
+    b: *const QuantizedTensorQ8K,
+) !Tensor {
+    // Validate shapes
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return QuantError.InvalidShape;
+    }
+
+    const m = a.shape[0];
+    const k_a = a.shape[1];
+    const k_b = b.shape[0];
+    const n = b.shape[1];
+
+    if (k_a != k_b) {
+        return QuantError.ShapeMismatch;
+    }
+
+    const k = k_a;
+
+    var result_shape = [_]usize{ m, n };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    // Initialize result to zero
+    @memset(result.data, 0.0);
+
+    // i, k, j loop order
+    for (0..m) |i| {
+        for (0..k) |kk| {
+            const a_val = a.data[i * k + kk];
+
+            for (0..n) |j| {
+                // Get block-wise scale for this weight
+                const w_idx = kk * n + j;
+                const block_idx = w_idx / b.block_size;
+                const scale = b.scales[block_idx];
+
+                // Dequantize weight on-the-fly
+                const w_int = b.data[w_idx];
+                const w_f32 = @as(f32, @floatFromInt(w_int)) * scale;
+                result.data[i * n + j] += a_val * w_f32;
+            }
+        }
+    }
+
+    return result;
+}
+
+/// SIMD-optimized Weight-Only Matmul for Q8_K
+pub fn matmulF32Q8KSimd(
+    allocator: std.mem.Allocator,
+    a: *const Tensor,
+    b: *const QuantizedTensorQ8K,
+) !Tensor {
+    // Validate shapes
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return QuantError.InvalidShape;
+    }
+
+    const m = a.shape[0];
+    const k_a = a.shape[1];
+    const k_b = b.shape[0];
+    const n = b.shape[1];
+
+    if (k_a != k_b) {
+        return QuantError.ShapeMismatch;
+    }
+
+    const k = k_a;
+
+    var result_shape = [_]usize{ m, n };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    // Initialize result to zero
+    @memset(result.data, 0.0);
+
+    // SIMD vector width
+    const VEC_WIDTH = 8;
+    const Vec8i8 = @Vector(VEC_WIDTH, i8);
+    const Vec8i32 = @Vector(VEC_WIDTH, i32);
+    const Vec8f32 = @Vector(VEC_WIDTH, f32);
+
+    for (0..m) |i| {
+        for (0..k) |kk| {
+            const a_val = a.data[i * k + kk];
+            const a_vec: Vec8f32 = @splat(a_val);
+
+            var j: usize = 0;
+
+            // SIMD loop
+            while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
+                // Load 8 int8 weights
+                const w_ptr = b.data[kk * n + j ..];
+                const w_i8: Vec8i8 = w_ptr[0..VEC_WIDTH].*;
+
+                // Get scales for each weight (may span multiple blocks)
+                var scale_vec: Vec8f32 = undefined;
+                inline for (0..VEC_WIDTH) |vi| {
+                    const w_idx = kk * n + j + vi;
+                    const block_idx = w_idx / b.block_size;
+                    scale_vec[vi] = b.scales[block_idx];
+                }
+
+                // Convert to i32 then float32
+                const w_i32: Vec8i32 = w_i8;
+                const w_f32: Vec8f32 = @floatFromInt(w_i32);
+
+                // Scale to dequantize
+                const w_scaled = w_f32 * scale_vec;
+
+                // Load current result
+                const result_ptr = result.data[i * n + j ..];
+                var result_vec: Vec8f32 = result_ptr[0..VEC_WIDTH].*;
+
+                // Multiply and accumulate
+                result_vec += a_vec * w_scaled;
+
+                // Store back
+                result_ptr[0..VEC_WIDTH].* = result_vec;
+            }
+
+            // Handle remainder
+            while (j < n) : (j += 1) {
+                const w_idx = kk * n + j;
+                const block_idx = w_idx / b.block_size;
+                const scale = b.scales[block_idx];
+                const w_int = b.data[w_idx];
+                const w_f32 = @as(f32, @floatFromInt(w_int)) * scale;
+                result.data[i * n + j] += a_val * w_f32;
+            }
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
 // Q4_0: Simple 4-bit Symmetric Quantization (Weight-Only)
 // ============================================================================
 
@@ -962,4 +1262,169 @@ test "Q4_0 extreme values" {
 
     // Check scale
     try std.testing.expectApproxEqAbs(@as(f32, 100.0 / 7.0), qtensor.scale, 0.0001);
+}
+
+// ============================================================================
+// Q8_K Block-wise Tests
+// ============================================================================
+
+test "Q8_K block-wise quantization roundtrip" {
+    const allocator = std.testing.allocator;
+
+    // Create test tensor with 100 elements (spans multiple blocks)
+    var shape = [_]usize{100};
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    // Fill with values that have varying ranges across blocks
+    for (tensor.data, 0..) |*v, i| {
+        // Block 0 (0-31): small values
+        // Block 1 (32-63): medium values
+        // Block 2 (64-95): large values
+        // Block 3 (96-99): mixed
+        const block = i / 32;
+        const scale_factor: f32 = @as(f32, @floatFromInt(block + 1)) * 10.0;
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.1) * scale_factor;
+    }
+
+    // Quantize with block-wise
+    var qtensor = try quantizeQ8K(allocator, &tensor);
+    defer qtensor.deinit();
+
+    // Check we have multiple blocks
+    try std.testing.expect(qtensor.num_blocks > 1);
+
+    // Check compression (slightly less than Q8_0 due to per-block scales)
+    const ratio = qtensor.compressionRatio();
+    try std.testing.expect(ratio > 2.5);
+
+    // Dequantize
+    var restored = try dequantizeQ8K(allocator, &qtensor);
+    defer restored.deinit();
+
+    // Check accuracy - should be better than per-tensor Q8_0 for varying ranges
+    for (tensor.data, 0..) |original, i| {
+        const tolerance = @abs(original) * 0.02 + 0.1; // 2% tolerance
+        try std.testing.expectApproxEqAbs(original, restored.data[i], tolerance);
+    }
+}
+
+test "Q8_K accuracy vs Q8_0 with outliers" {
+    const allocator = std.testing.allocator;
+
+    // Create tensor with an outlier that hurts per-tensor quantization
+    var shape = [_]usize{64};
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+
+    // First 32 elements: small values around 0.1
+    for (0..32) |i| {
+        tensor.data[i] = 0.1 + @sin(@as(f32, @floatFromInt(i)) * 0.1) * 0.05;
+    }
+    // Element 32 is an outlier
+    tensor.data[32] = 100.0;
+    // Rest are medium values
+    for (33..64) |i| {
+        tensor.data[i] = 1.0 + @cos(@as(f32, @floatFromInt(i)) * 0.1) * 0.5;
+    }
+
+    // Quantize with per-tensor Q8_0
+    var q8_tensor = try quantizeQ8(allocator, &tensor);
+    defer q8_tensor.deinit();
+
+    // Quantize with block-wise Q8_K
+    var q8k_tensor = try quantizeQ8K(allocator, &tensor);
+    defer q8k_tensor.deinit();
+
+    // Dequantize both
+    var restored_q8 = try dequantizeQ8(allocator, &q8_tensor);
+    defer restored_q8.deinit();
+
+    var restored_q8k = try dequantizeQ8K(allocator, &q8k_tensor);
+    defer restored_q8k.deinit();
+
+    // Calculate error for small values (first 32 elements)
+    var q8_error: f32 = 0.0;
+    var q8k_error: f32 = 0.0;
+
+    for (0..32) |i| {
+        q8_error += @abs(tensor.data[i] - restored_q8.data[i]);
+        q8k_error += @abs(tensor.data[i] - restored_q8k.data[i]);
+    }
+
+    // Q8_K should have lower error for small values when outliers exist
+    // Because it uses separate scale for block 0 vs block 1 (with outlier)
+    try std.testing.expect(q8k_error <= q8_error);
+}
+
+test "Q8_K weight-only matmul accuracy" {
+    const allocator = std.testing.allocator;
+
+    // Float32 input
+    var a_shape = [_]usize{ 2, 64 };
+    var a = try Tensor.init(allocator, &a_shape);
+    defer a.deinit();
+    for (a.data, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    }
+
+    // Float32 weights (will be quantized)
+    var b_shape = [_]usize{ 64, 32 };
+    var b = try Tensor.init(allocator, &b_shape);
+    defer b.deinit();
+    for (b.data, 0..) |*v, i| {
+        v.* = @cos(@as(f32, @floatFromInt(i)) * 0.1);
+    }
+
+    // Float32 reference
+    const ops = @import("ops.zig");
+    var ref = try ops.matmul(allocator, &a, &b);
+    defer ref.deinit();
+
+    // Quantize weights to Q8_K
+    var qb = try quantizeQ8K(allocator, &b);
+    defer qb.deinit();
+
+    // Q8_K weight-only matmul
+    var qresult = try matmulF32Q8K(allocator, &a, &qb);
+    defer qresult.deinit();
+
+    // Compare (allow 5% error)
+    for (ref.data, 0..) |expected, i| {
+        const tolerance = @abs(expected) * 0.05 + 0.1;
+        try std.testing.expectApproxEqAbs(expected, qresult.data[i], tolerance);
+    }
+}
+
+test "Q8_K weight-only matmul SIMD" {
+    const allocator = std.testing.allocator;
+
+    // Test SIMD path
+    var a_shape = [_]usize{ 4, 64 };
+    var a = try Tensor.init(allocator, &a_shape);
+    defer a.deinit();
+    for (a.data, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    }
+
+    var b_shape = [_]usize{ 64, 32 };
+    var b = try Tensor.init(allocator, &b_shape);
+    defer b.deinit();
+    for (b.data, 0..) |*v, i| {
+        v.* = @cos(@as(f32, @floatFromInt(i)) * 0.1);
+    }
+
+    var qb = try quantizeQ8K(allocator, &b);
+    defer qb.deinit();
+
+    var scalar_result = try matmulF32Q8K(allocator, &a, &qb);
+    defer scalar_result.deinit();
+
+    var simd_result = try matmulF32Q8KSimd(allocator, &a, &qb);
+    defer simd_result.deinit();
+
+    // Both should produce the same result
+    for (scalar_result.data, 0..) |expected, i| {
+        try std.testing.expectApproxEqAbs(expected, simd_result.data[i], 0.0001);
+    }
 }

@@ -20,8 +20,13 @@ VERSION = 1
 class QuantFormat:
     """Quantization format identifiers (matches Zig loader)."""
     F32 = 0   # Float32 (no quantization)
-    Q8_0 = 1  # Q8_0: symmetric 8-bit
-    Q4_0 = 2  # Q4_0: symmetric 4-bit (future)
+    Q8_0 = 1  # Q8_0: symmetric 8-bit (per-tensor scale)
+    Q4_0 = 2  # Q4_0: symmetric 4-bit (per-tensor scale)
+    Q8_K = 3  # Q8_K: block-wise 8-bit (per-block scale, better accuracy)
+
+
+# Block size for block-wise quantization (matches Zig BLOCK_SIZE)
+BLOCK_SIZE = 32
 
 
 def quantize_q8_0(tensor: np.ndarray) -> Tuple[float, np.ndarray]:
@@ -57,6 +62,81 @@ def quantize_q8_0(tensor: np.ndarray) -> Tuple[float, np.ndarray]:
 def dequantize_q8_0(scale: float, quantized: np.ndarray) -> np.ndarray:
     """Dequantize Q8_0 data back to float32 for verification."""
     return quantized.astype(np.float32) * scale
+
+
+def quantize_q8_k(tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Quantize tensor to Q8_K format (block-wise 8-bit).
+
+    Args:
+        tensor: Float32 numpy array
+
+    Returns:
+        (scales, quantized_data) where:
+        - scales: float32 numpy array (one per block)
+        - quantized_data: int8 numpy array
+    """
+    data = tensor.flatten().astype(np.float32)
+    n = len(data)
+    num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    scales = np.zeros(num_blocks, dtype=np.float32)
+    quantized = np.zeros(n, dtype=np.int8)
+
+    for block_idx in range(num_blocks):
+        start = block_idx * BLOCK_SIZE
+        end = min(start + BLOCK_SIZE, n)
+        block = data[start:end]
+
+        # Find max absolute value in this block
+        max_abs = np.max(np.abs(block))
+
+        if max_abs == 0:
+            scales[block_idx] = 1.0
+            continue
+
+        # Calculate scale for this block
+        scales[block_idx] = float(max_abs / 127.0)
+        inv_scale = 127.0 / max_abs
+
+        # Quantize block elements
+        q = np.round(block * inv_scale).astype(np.int32)
+        q = np.clip(q, -127, 127).astype(np.int8)
+        quantized[start:end] = q
+
+    return scales, quantized
+
+
+def dequantize_q8_k(scales: np.ndarray, quantized: np.ndarray) -> np.ndarray:
+    """Dequantize Q8_K data back to float32 for verification."""
+    n = len(quantized)
+    result = np.zeros(n, dtype=np.float32)
+
+    for block_idx in range(len(scales)):
+        start = block_idx * BLOCK_SIZE
+        end = min(start + BLOCK_SIZE, n)
+        scale = scales[block_idx]
+        result[start:end] = quantized[start:end].astype(np.float32) * scale
+
+    return result
+
+
+def verify_quantization_q8_k(original: np.ndarray, scales: np.ndarray, quantized: np.ndarray) -> Dict:
+    """Verify Q8_K quantization accuracy."""
+    restored = dequantize_q8_k(scales, quantized)
+    original_flat = original.flatten()
+
+    mse = np.mean((original_flat - restored) ** 2)
+    max_error = np.max(np.abs(original_flat - restored))
+    max_val = np.max(np.abs(original_flat))
+    rel_error = max_error / max_val if max_val > 0 else 0
+
+    return {
+        'mse': float(mse),
+        'max_error': float(max_error),
+        'rel_error': float(rel_error),
+        'max_val': float(max_val),
+    }
 
 
 def quantize_q4_0(tensor: np.ndarray) -> Tuple[float, np.ndarray]:
@@ -257,6 +337,21 @@ def export_tensors(
                 f.write(packed.tobytes())
                 data_size = 4 + len(packed)
 
+            elif quant_format == QuantFormat.Q8_K:
+                scales, quantized = quantize_q8_k(tensor)
+
+                # Verify if requested
+                if verify:
+                    stats = verify_quantization_q8_k(tensor, scales, quantized)
+                    max_rel_error = max(max_rel_error, stats['rel_error'])
+
+                # Write: num_blocks (u32) + scales (f32 * num_blocks) + int8 data
+                num_blocks = len(scales)
+                f.write(struct.pack('<I', num_blocks))
+                f.write(scales.tobytes())
+                f.write(quantized.tobytes())
+                data_size = 4 + num_blocks * 4 + len(quantized)
+
             else:
                 raise ValueError(f"Unsupported quantization format: {quant_format}")
 
@@ -279,7 +374,7 @@ def export_tensors(
         print(f"Compression: {overall_compression:.2f}x "
               f"({total_original / 1024 / 1024:.1f}MB -> {total_quantized / 1024 / 1024:.1f}MB)")
 
-    if verify and quant_format in (QuantFormat.Q8_0, QuantFormat.Q4_0):
+    if verify and quant_format in (QuantFormat.Q8_0, QuantFormat.Q4_0, QuantFormat.Q8_K):
         print(f"Max relative error: {max_rel_error:.4%}")
         # Q4_0 has higher expected error due to fewer quantization levels
         if quant_format == QuantFormat.Q4_0:
@@ -289,7 +384,7 @@ def export_tensors(
                 print("Quantization accuracy: GOOD (<15%)")
             else:
                 print("Quantization accuracy: WARNING (>15%)")
-        else:  # Q8_0
+        else:  # Q8_0 and Q8_K
             if max_rel_error < 0.01:
                 print("Quantization accuracy: EXCELLENT (<1%)")
             elif max_rel_error < 0.05:
@@ -357,6 +452,15 @@ def load_tl_file(path: str) -> Tuple[Dict[str, np.ndarray], int]:
                     element_count *= dim
                 # Dequantize for return
                 tensors[name] = dequantize_q4_0(scale, packed, element_count).reshape(shape)
+            elif quant_format == QuantFormat.Q8_K:
+                # Read num_blocks first
+                num_blocks = struct.unpack('<I', f.read(4))[0]
+                # Read scales
+                scales = np.frombuffer(f.read(num_blocks * 4), dtype=np.float32)
+                # Read quantized data
+                quantized = np.frombuffer(f.read(size - 4 - num_blocks * 4), dtype=np.int8)
+                # Dequantize for return
+                tensors[name] = dequantize_q8_k(scales, quantized).reshape(shape)
             else:
                 raise ValueError(f"Unsupported quant format: {quant_format}")
 
@@ -367,9 +471,9 @@ def add_quantize_args(parser):
     """Add standard quantization arguments to an argparse parser."""
     parser.add_argument(
         '--quantize', '-q',
-        choices=['f32', 'q8_0', 'q4_0'],
+        choices=['f32', 'q8_0', 'q4_0', 'q8_k'],
         default='f32',
-        help='Output format: f32 (default), q8_0 (8-bit, ~4x), or q4_0 (4-bit, ~8x)'
+        help='Output format: f32 (default), q8_0 (8-bit, ~4x), q4_0 (4-bit, ~8x), q8_k (block-wise 8-bit, best accuracy)'
     )
     parser.add_argument(
         '--no-verify',
@@ -384,5 +488,6 @@ def get_quant_format(format_str: str) -> int:
         'f32': QuantFormat.F32,
         'q8_0': QuantFormat.Q8_0,
         'q4_0': QuantFormat.Q4_0,
+        'q8_k': QuantFormat.Q8_K,
     }
     return formats.get(format_str, QuantFormat.F32)

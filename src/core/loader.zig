@@ -4,6 +4,7 @@ const Tensor = tensor_import.Tensor;
 const quantization = @import("quantization.zig");
 const QuantizedTensorQ8 = quantization.QuantizedTensorQ8;
 const QuantizedTensorQ4 = quantization.QuantizedTensorQ4;
+const QuantizedTensorQ8K = quantization.QuantizedTensorQ8K;
 
 /// Error types for model loading operations
 pub const LoadError = error{
@@ -20,8 +21,9 @@ pub const LoadError = error{
 /// Quantization format codes
 pub const QuantFormat = enum(u8) {
     f32 = 0, // Float32 (no quantization) - version 1
-    q8_0 = 1, // Q8_0: symmetric 8-bit - version 1
-    q4_0 = 2, // Q4_0: symmetric 4-bit (future)
+    q8_0 = 1, // Q8_0: symmetric 8-bit per-tensor
+    q4_0 = 2, // Q4_0: symmetric 4-bit per-tensor
+    q8_k = 3, // Q8_K: symmetric 8-bit per-block (block_size=32)
 };
 
 /// Information about a tensor stored in the file
@@ -339,6 +341,60 @@ pub const ModelLoader = struct {
         const data_start = offset + 4;
         for (qtensor.data, 0..) |*out, i| {
             out.* = self.file_data[data_start + i];
+        }
+
+        return qtensor;
+    }
+
+    /// Get a quantized tensor by name (for Q8_K format files)
+    /// Returns the tensor in quantized form for weight-only inference
+    /// Q8_K uses per-block scales for better accuracy on tensors with varying ranges
+    pub fn getQuantizedTensorQ8K(self: *Self, name: []const u8) !QuantizedTensorQ8K {
+        if (self.quant_format != .q8_k) {
+            return LoadError.UnsupportedQuantFormat;
+        }
+
+        const info = self.tensors.get(name) orelse return LoadError.TensorNotFound;
+
+        // Validate data bounds
+        const end_offset = info.data_offset + info.data_size;
+        if (end_offset > self.file_data.len) {
+            return LoadError.CorruptedFile;
+        }
+
+        // Create quantized tensor with the stored shape
+        var qtensor = try QuantizedTensorQ8K.init(self.allocator, info.shape);
+        errdefer qtensor.deinit();
+
+        // Q8_K format: 4-byte num_blocks + (num_blocks * 4) bytes scales + N bytes int8 data
+        const expected_size = 4 + qtensor.num_blocks * 4 + qtensor.element_count;
+        if (info.data_size != expected_size) {
+            return LoadError.CorruptedFile;
+        }
+
+        // Read num_blocks (first 4 bytes) - verify it matches
+        const offset: usize = @intCast(info.data_offset);
+        const stored_num_blocks = std.mem.readInt(u32, self.file_data[offset..][0..4], .little);
+        if (stored_num_blocks != qtensor.num_blocks) {
+            return LoadError.CorruptedFile;
+        }
+
+        // Read scales (num_blocks * 4 bytes of f32)
+        const scales_start = offset + 4;
+        for (qtensor.scales, 0..) |*scale, i| {
+            const byte_offset = scales_start + i * 4;
+            scale.* = @bitCast([4]u8{
+                self.file_data[byte_offset],
+                self.file_data[byte_offset + 1],
+                self.file_data[byte_offset + 2],
+                self.file_data[byte_offset + 3],
+            });
+        }
+
+        // Read int8 data (remaining bytes)
+        const data_start = scales_start + qtensor.num_blocks * 4;
+        for (qtensor.data, 0..) |*out, i| {
+            out.* = @bitCast(self.file_data[data_start + i]);
         }
 
         return qtensor;
