@@ -16,6 +16,11 @@ pub fn build(b: *std.Build) void {
     // Usage: zig build lib -Dbundled=true
     const bundled = b.option(bool, "bundled", "Embed model weights in native libraries") orelse false;
 
+    // BLAS: Link OpenBLAS for accelerated matrix operations
+    // Usage: zig build -Dmodel=whisper-tiny -Dblas=true
+    // Requires OpenBLAS to be installed (apt install libopenblas-dev)
+    const use_blas = b.option(bool, "blas", "Link OpenBLAS for accelerated matrix operations") orelse false;
+
     // ==========================================================================
     // Main executable (model-specific or generic demo)
     // ==========================================================================
@@ -68,12 +73,29 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Create build options for BLAS support in ops module
+    const ops_options = b.addOptions();
+    ops_options.addOption(bool, "use_blas", use_blas);
+
     const ops_module = b.createModule(.{
         .root_source_file = b.path("src/core/ops.zig"),
         .target = target,
         .optimize = optimize,
     });
     ops_module.addImport("tensor.zig", tensor_module);
+    ops_module.addOptions("build_options", ops_options);
+
+    // Create BLAS module and link OpenBLAS if enabled
+    if (use_blas) {
+        const blas_module = b.createModule(.{
+            .root_source_file = b.path("src/core/blas.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        blas_module.linkSystemLibrary("openblas", .{});
+        blas_module.link_libc = true;
+        ops_module.addImport("blas.zig", blas_module);
+    }
 
     const quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
@@ -113,6 +135,22 @@ pub fn build(b: *std.Build) void {
     transformer_module.addImport("quantization.zig", quantization_module);
     transformer_module.addImport("attention.zig", attention_module);
 
+    // Cache module (KV cache for autoregressive decoding)
+    const cache_module = b.createModule(.{
+        .root_source_file = b.path("src/core/cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cache_module.addImport("tensor.zig", tensor_module);
+
+    // Audio module (mel spectrogram, FFT, audio loading - pure Zig)
+    const audio_module = b.createModule(.{
+        .root_source_file = b.path("src/core/audio.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audio_module.addImport("tensor.zig", tensor_module);
+
     // Create build options for bundled mode
     const exe_options = b.addOptions();
     exe_options.addOption(bool, "bundled", bundled);
@@ -150,6 +188,7 @@ pub fn build(b: *std.Build) void {
     exe_module.addImport("quantization.zig", quantization_module);
     exe_module.addImport("attention.zig", attention_module);
     exe_module.addImport("transformer.zig", transformer_module);
+    exe_module.addImport("audio.zig", audio_module);
     exe_module.addOptions("build_options", exe_options);
 
     // Add model-specific imports if building for a specific model
@@ -166,6 +205,8 @@ pub fn build(b: *std.Build) void {
         model_module.addImport("quantization.zig", quantization_module);
         model_module.addImport("attention.zig", attention_module);
         model_module.addImport("transformer.zig", transformer_module);
+        model_module.addImport("cache.zig", cache_module);
+        model_module.addImport("audio.zig", audio_module);
         exe_module.addImport("model.zig", model_module);
     }
 

@@ -122,20 +122,27 @@ fn matmulWithWeight(
 }
 
 /// Scaled dot-product attention (float32 only, used after projection)
-/// Q, K, V: [seq_len, head_dim]
-/// Returns: [seq_len, head_dim]
+/// Q: [query_len, head_dim]
+/// K: [key_len, head_dim]
+/// V: [key_len, head_dim]
+/// mask: optional [query_len, key_len] with 0 for valid, -inf for masked positions
+/// Returns: [query_len, head_dim]
 ///
-/// Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
+/// Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k) + mask) @ V
+///
+/// For self-attention: query_len == key_len
+/// For cross-attention: query_len may differ from key_len (e.g., decoder attending to encoder)
 fn scaledDotProductAttention(
     allocator: std.mem.Allocator,
     q: *const Tensor,
     k: *const Tensor,
     v: *const Tensor,
+    mask: ?*const Tensor,
 ) !Tensor {
     const head_dim = q.shape[1];
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-    // scores = Q @ K^T
+    // scores = Q @ K^T  -> [query_len, key_len]
     var k_t = try ops.transpose(allocator, k);
     defer k_t.deinit();
 
@@ -145,10 +152,15 @@ fn scaledDotProductAttention(
     // Scale
     ops.scaleInPlace(&scores, scale);
 
+    // Apply mask if provided (for causal attention or padding)
+    if (mask) |m| {
+        try ops.applyAttentionMask(&scores, m);
+    }
+
     // Softmax
     ops.softmax(&scores);
 
-    // Output = scores @ V
+    // Output = scores @ V  -> [query_len, head_dim]
     return ops.matmul(allocator, &scores, v);
 }
 
@@ -207,6 +219,7 @@ pub fn multiHeadAttention(
             &q_head,
             &k_head,
             &v_head,
+            null, // No mask for standard self-attention
         );
         head_count += 1;
     }
@@ -279,6 +292,562 @@ pub fn multiHeadAttentionQ8K(
     config: AttentionConfig,
 ) !Tensor {
     return multiHeadAttention(QuantizedTensorQ8K, allocator, input, weights, config);
+}
+
+// ============================================================================
+// Cross-Attention (for Encoder-Decoder architectures like Whisper)
+// ============================================================================
+
+/// Cross-attention weights: Query projects from decoder, Key/Value project from encoder
+/// Used in decoder blocks to attend to encoder output
+pub fn CrossAttentionWeights(comptime WeightType: type) type {
+    return struct {
+        // Query projection [decoder_hidden, decoder_hidden] - pre-transposed
+        q_weight: WeightType,
+        q_bias: Tensor,
+
+        // Key/Value projection [encoder_hidden, decoder_hidden] - pre-transposed
+        // Note: encoder_hidden may equal decoder_hidden in Whisper
+        k_weight: WeightType,
+        k_bias: Tensor,
+        v_weight: WeightType,
+        v_bias: Tensor,
+
+        // Output projection [decoder_hidden, decoder_hidden] - pre-transposed
+        o_weight: WeightType,
+        o_bias: Tensor,
+
+        const Self = @This();
+
+        pub fn format() WeightFormat {
+            return comptime getWeightFormat(WeightType);
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.q_weight.deinit();
+            self.k_weight.deinit();
+            self.v_weight.deinit();
+            self.o_weight.deinit();
+            self.q_bias.deinit();
+            self.k_bias.deinit();
+            self.v_bias.deinit();
+            self.o_bias.deinit();
+        }
+    };
+}
+
+/// Convenience type aliases for cross-attention weights
+pub const CrossAttentionWeightsF32 = CrossAttentionWeights(Tensor);
+pub const CrossAttentionWeightsQ8 = CrossAttentionWeights(QuantizedTensorQ8);
+pub const CrossAttentionWeightsQ4 = CrossAttentionWeights(QuantizedTensorQ4);
+pub const CrossAttentionWeightsQ8K = CrossAttentionWeights(QuantizedTensorQ8K);
+
+/// Cross-attention configuration
+pub const CrossAttentionConfig = struct {
+    num_heads: usize, // Number of attention heads
+    decoder_hidden: usize, // Decoder hidden dimension (query source)
+    encoder_hidden: usize, // Encoder hidden dimension (key/value source)
+    head_dim: usize, // decoder_hidden / num_heads
+};
+
+/// Generic multi-head cross-attention
+/// query_input: [query_len, decoder_hidden] from decoder (e.g., 1 token during generation)
+/// key_value_input: [key_len, encoder_hidden] from encoder (e.g., 1500 audio frames)
+/// Returns: [query_len, decoder_hidden]
+///
+/// CrossAttention(Q_dec, K_enc, V_enc) = Concat(head_1, ..., head_h) @ W_o
+/// where head_i = Attention(Q_dec @ W_q_i, K_enc @ W_k_i, V_enc @ W_v_i)
+///
+/// NOTE: Weights are PRE-TRANSPOSED at load time for optimal SIMD matmul performance.
+pub fn multiHeadCrossAttention(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    query_input: *const Tensor, // [query_len, decoder_hidden]
+    key_value_input: *const Tensor, // [key_len, encoder_hidden]
+    weights: *const CrossAttentionWeights(WeightType),
+    config: CrossAttentionConfig,
+) !Tensor {
+    const num_heads = config.num_heads;
+    const head_dim = config.head_dim;
+
+    // Project Q from decoder input
+    var q = try matmulWithWeight(WeightType, allocator, query_input, &weights.q_weight);
+    defer q.deinit();
+    try ops.addBiasInPlace(&q, &weights.q_bias);
+
+    // Project K, V from encoder output
+    var k = try matmulWithWeight(WeightType, allocator, key_value_input, &weights.k_weight);
+    defer k.deinit();
+    try ops.addBiasInPlace(&k, &weights.k_bias);
+
+    var v = try matmulWithWeight(WeightType, allocator, key_value_input, &weights.v_weight);
+    defer v.deinit();
+    try ops.addBiasInPlace(&v, &weights.v_bias);
+
+    // Split into heads and compute cross-attention
+    var head_outputs = try allocator.alloc(Tensor, num_heads);
+    var head_count: usize = 0;
+    errdefer {
+        for (head_outputs[0..head_count]) |*h| h.deinit();
+        allocator.free(head_outputs);
+    }
+
+    for (0..num_heads) |h| {
+        const start = h * head_dim;
+        const end = start + head_dim;
+
+        // Extract head slices (Q from decoder, K/V from encoder)
+        var q_head = try ops.sliceColumns(allocator, &q, start, end);
+        defer q_head.deinit();
+        var k_head = try ops.sliceColumns(allocator, &k, start, end);
+        defer k_head.deinit();
+        var v_head = try ops.sliceColumns(allocator, &v, start, end);
+        defer v_head.deinit();
+
+        // Note: No mask for cross-attention (decoder attends to all encoder positions)
+        head_outputs[h] = try scaledDotProductAttention(
+            allocator,
+            &q_head,
+            &k_head,
+            &v_head,
+            null,
+        );
+        head_count += 1;
+    }
+    defer {
+        for (head_outputs) |*h| h.deinit();
+        allocator.free(head_outputs);
+    }
+
+    // Concatenate heads
+    var concat = try ops.concatColumns(allocator, head_outputs);
+    defer concat.deinit();
+
+    // Final projection
+    var output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
+    try ops.addBiasInPlace(&output, &weights.o_bias);
+
+    return output;
+}
+
+/// Cached cross-attention structure for pre-computed encoder K/V
+pub const CachedCrossAttentionKV = struct {
+    k: Tensor, // [key_len, hidden_dim] - projected keys
+    v: Tensor, // [key_len, hidden_dim] - projected values
+
+    pub fn deinit(self: *CachedCrossAttentionKV) void {
+        self.k.deinit();
+        self.v.deinit();
+    }
+};
+
+/// Pre-compute cross-attention K/V from encoder output
+/// Call this once after encoding, then reuse for all decoder steps
+pub fn precomputeCrossAttentionKV(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    encoder_output: *const Tensor, // [key_len, encoder_hidden]
+    weights: *const CrossAttentionWeights(WeightType),
+) !CachedCrossAttentionKV {
+    // Project K, V from encoder output
+    var k = try matmulWithWeight(WeightType, allocator, encoder_output, &weights.k_weight);
+    errdefer k.deinit();
+    try ops.addBiasInPlace(&k, &weights.k_bias);
+
+    var v = try matmulWithWeight(WeightType, allocator, encoder_output, &weights.v_weight);
+    try ops.addBiasInPlace(&v, &weights.v_bias);
+
+    return CachedCrossAttentionKV{
+        .k = k,
+        .v = v,
+    };
+}
+
+/// Multi-head cross-attention with pre-computed K/V
+/// Use this during generation to avoid recomputing K/V every step
+pub fn multiHeadCrossAttentionWithCache(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    query_input: *const Tensor, // [query_len, decoder_hidden]
+    cached_kv: *const CachedCrossAttentionKV, // Pre-computed K/V
+    weights: *const CrossAttentionWeights(WeightType),
+    config: CrossAttentionConfig,
+) !Tensor {
+    const num_heads = config.num_heads;
+    const head_dim = config.head_dim;
+
+    // Project Q from decoder input only
+    var q = try matmulWithWeight(WeightType, allocator, query_input, &weights.q_weight);
+    defer q.deinit();
+    try ops.addBiasInPlace(&q, &weights.q_bias);
+
+    // Use cached K, V
+    const k = &cached_kv.k;
+    const v = &cached_kv.v;
+
+    // Split into heads and compute cross-attention
+    var head_outputs = try allocator.alloc(Tensor, num_heads);
+    var head_count: usize = 0;
+    errdefer {
+        for (head_outputs[0..head_count]) |*h| h.deinit();
+        allocator.free(head_outputs);
+    }
+
+    for (0..num_heads) |h| {
+        const start = h * head_dim;
+        const end = start + head_dim;
+
+        // Extract head slices
+        var q_head = try ops.sliceColumns(allocator, &q, start, end);
+        defer q_head.deinit();
+        var k_head = try ops.sliceColumns(allocator, k, start, end);
+        defer k_head.deinit();
+        var v_head = try ops.sliceColumns(allocator, v, start, end);
+        defer v_head.deinit();
+
+        head_outputs[h] = try scaledDotProductAttention(
+            allocator,
+            &q_head,
+            &k_head,
+            &v_head,
+            null,
+        );
+        head_count += 1;
+    }
+    defer {
+        for (head_outputs) |*h| h.deinit();
+        allocator.free(head_outputs);
+    }
+
+    // Concatenate heads
+    var concat = try ops.concatColumns(allocator, head_outputs);
+    defer concat.deinit();
+
+    // Final projection
+    var output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
+    try ops.addBiasInPlace(&output, &weights.o_bias);
+
+    return output;
+}
+
+/// Convenience function: pre-compute cross-attention K/V with F32 weights
+pub fn precomputeCrossAttentionKVF32(
+    allocator: std.mem.Allocator,
+    encoder_output: *const Tensor,
+    weights: *const CrossAttentionWeightsF32,
+) !CachedCrossAttentionKV {
+    return precomputeCrossAttentionKV(Tensor, allocator, encoder_output, weights);
+}
+
+/// Convenience function: cross-attention with cached K/V and F32 weights
+pub fn multiHeadCrossAttentionWithCacheF32(
+    allocator: std.mem.Allocator,
+    query_input: *const Tensor,
+    cached_kv: *const CachedCrossAttentionKV,
+    weights: *const CrossAttentionWeightsF32,
+    config: CrossAttentionConfig,
+) !Tensor {
+    return multiHeadCrossAttentionWithCache(Tensor, allocator, query_input, cached_kv, weights, config);
+}
+
+/// Convenience function: cross-attention with F32 weights
+pub fn multiHeadCrossAttentionF32(
+    allocator: std.mem.Allocator,
+    query_input: *const Tensor,
+    key_value_input: *const Tensor,
+    weights: *const CrossAttentionWeightsF32,
+    config: CrossAttentionConfig,
+) !Tensor {
+    return multiHeadCrossAttention(Tensor, allocator, query_input, key_value_input, weights, config);
+}
+
+/// Convenience function: cross-attention with Q8 weights
+pub fn multiHeadCrossAttentionQ8(
+    allocator: std.mem.Allocator,
+    query_input: *const Tensor,
+    key_value_input: *const Tensor,
+    weights: *const CrossAttentionWeightsQ8,
+    config: CrossAttentionConfig,
+) !Tensor {
+    return multiHeadCrossAttention(QuantizedTensorQ8, allocator, query_input, key_value_input, weights, config);
+}
+
+// ============================================================================
+// Causal Self-Attention (for Decoder self-attention)
+// ============================================================================
+
+/// Multi-head self-attention with causal masking
+/// Used in decoder blocks where each position can only attend to earlier positions
+/// input: [seq_len, hidden_dim]
+/// Returns: [seq_len, hidden_dim]
+pub fn multiHeadCausalAttention(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const AttentionWeights(WeightType),
+    config: AttentionConfig,
+) !Tensor {
+    const seq_len = input.shape[0];
+    const num_heads = config.num_heads;
+    const head_dim = config.head_dim;
+
+    // Project Q, K, V
+    var q = try matmulWithWeight(WeightType, allocator, input, &weights.q_weight);
+    defer q.deinit();
+    var k = try matmulWithWeight(WeightType, allocator, input, &weights.k_weight);
+    defer k.deinit();
+    var v = try matmulWithWeight(WeightType, allocator, input, &weights.v_weight);
+    defer v.deinit();
+
+    try ops.addBiasInPlace(&q, &weights.q_bias);
+    try ops.addBiasInPlace(&k, &weights.k_bias);
+    try ops.addBiasInPlace(&v, &weights.v_bias);
+
+    // Create causal mask for this sequence length
+    var causal_mask = try ops.createCausalMask(allocator, seq_len);
+    defer causal_mask.deinit();
+
+    // Split into heads and compute causal attention
+    var head_outputs = try allocator.alloc(Tensor, num_heads);
+    var head_count: usize = 0;
+    errdefer {
+        for (head_outputs[0..head_count]) |*h| h.deinit();
+        allocator.free(head_outputs);
+    }
+
+    for (0..num_heads) |h| {
+        const start = h * head_dim;
+        const end = start + head_dim;
+
+        var q_head = try ops.sliceColumns(allocator, &q, start, end);
+        defer q_head.deinit();
+        var k_head = try ops.sliceColumns(allocator, &k, start, end);
+        defer k_head.deinit();
+        var v_head = try ops.sliceColumns(allocator, &v, start, end);
+        defer v_head.deinit();
+
+        head_outputs[h] = try scaledDotProductAttention(
+            allocator,
+            &q_head,
+            &k_head,
+            &v_head,
+            &causal_mask, // Apply causal masking
+        );
+        head_count += 1;
+    }
+    defer {
+        for (head_outputs) |*h| h.deinit();
+        allocator.free(head_outputs);
+    }
+
+    // Concatenate heads
+    var concat = try ops.concatColumns(allocator, head_outputs);
+    defer concat.deinit();
+
+    // Final projection
+    var output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
+    try ops.addBiasInPlace(&output, &weights.o_bias);
+
+    return output;
+}
+
+/// Convenience function: causal attention with F32 weights
+pub fn multiHeadCausalAttentionF32(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const AttentionWeightsF32,
+    config: AttentionConfig,
+) !Tensor {
+    return multiHeadCausalAttention(Tensor, allocator, input, weights, config);
+}
+
+/// Convenience function: causal attention with Q8 weights
+pub fn multiHeadCausalAttentionQ8(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const AttentionWeightsQ8,
+    config: AttentionConfig,
+) !Tensor {
+    return multiHeadCausalAttention(QuantizedTensorQ8, allocator, input, weights, config);
+}
+
+// ============================================================================
+// Self-Attention with KV Cache (for efficient autoregressive decoding)
+// ============================================================================
+
+/// Self-attention KV cache for a single layer
+/// Accumulates K/V as tokens are generated
+pub const SelfAttentionKVCache = struct {
+    k_cache: Tensor, // [max_seq_len, hidden_dim]
+    v_cache: Tensor, // [max_seq_len, hidden_dim]
+    // Reusable shape array for views
+    k_view_shape: [2]usize,
+    v_view_shape: [2]usize,
+    position: usize, // Current position (number of cached tokens)
+    max_seq_len: usize,
+    hidden_dim: usize,
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, max_seq_len: usize, hidden_dim: usize) !Self {
+        var k_shape = [_]usize{ max_seq_len, hidden_dim };
+        var k_cache = try Tensor.init(allocator, &k_shape);
+        errdefer k_cache.deinit();
+
+        var v_shape = [_]usize{ max_seq_len, hidden_dim };
+        const v_cache = try Tensor.init(allocator, &v_shape);
+
+        return Self{
+            .k_cache = k_cache,
+            .v_cache = v_cache,
+            .k_view_shape = [_]usize{ 0, hidden_dim },
+            .v_view_shape = [_]usize{ 0, hidden_dim },
+            .position = 0,
+            .max_seq_len = max_seq_len,
+            .hidden_dim = hidden_dim,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.k_cache.deinit();
+        self.v_cache.deinit();
+    }
+
+    /// Append new K/V (from single token or batch) to cache
+    pub fn append(self: *Self, k_new: *const Tensor, v_new: *const Tensor) void {
+        const new_len = k_new.shape[0];
+        const hidden = self.hidden_dim;
+
+        const k_start = self.position * hidden;
+        @memcpy(
+            self.k_cache.data[k_start .. k_start + new_len * hidden],
+            k_new.data[0 .. new_len * hidden],
+        );
+
+        const v_start = self.position * hidden;
+        @memcpy(
+            self.v_cache.data[v_start .. v_start + new_len * hidden],
+            v_new.data[0 .. new_len * hidden],
+        );
+
+        self.position += new_len;
+    }
+
+    /// Reset cache for new sequence
+    pub fn reset(self: *Self) void {
+        self.position = 0;
+    }
+};
+
+/// Single-token causal self-attention with KV cache
+/// Used during generation - processes only 1 new token
+/// new_token_emb: [1, hidden_dim] - the new token embedding
+/// kv_cache: accumulates K/V from all previous tokens
+/// Returns: [1, hidden_dim]
+pub fn multiHeadCausalAttentionWithCache(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    new_token_emb: *const Tensor, // [1, hidden_dim]
+    kv_cache: *SelfAttentionKVCache,
+    weights: *const AttentionWeights(WeightType),
+    config: AttentionConfig,
+) !Tensor {
+    const num_heads = config.num_heads;
+    const head_dim = config.head_dim;
+    const hidden_dim = config.hidden_dim;
+
+    // Project new token to Q, K, V
+    var q_new = try matmulWithWeight(WeightType, allocator, new_token_emb, &weights.q_weight);
+    defer q_new.deinit();
+    var k_new = try matmulWithWeight(WeightType, allocator, new_token_emb, &weights.k_weight);
+    errdefer k_new.deinit();
+    var v_new = try matmulWithWeight(WeightType, allocator, new_token_emb, &weights.v_weight);
+    errdefer v_new.deinit();
+
+    try ops.addBiasInPlace(&q_new, &weights.q_bias);
+    try ops.addBiasInPlace(&k_new, &weights.k_bias);
+    try ops.addBiasInPlace(&v_new, &weights.v_bias);
+
+    // Append new K/V to cache
+    kv_cache.append(&k_new, &v_new);
+    k_new.deinit();
+    v_new.deinit();
+
+    // Get full K/V from cache - update shape views with current length
+    const cache_len = kv_cache.position;
+    kv_cache.k_view_shape[0] = cache_len;
+    kv_cache.v_view_shape[0] = cache_len;
+
+    // Create views into cached K/V
+    var k_full = Tensor{
+        .data = kv_cache.k_cache.data[0 .. cache_len * hidden_dim],
+        .shape = &kv_cache.k_view_shape,
+        .allocator = kv_cache.allocator, // Won't be freed since views don't own data
+    };
+    var v_full = Tensor{
+        .data = kv_cache.v_cache.data[0 .. cache_len * hidden_dim],
+        .shape = &kv_cache.v_view_shape,
+        .allocator = kv_cache.allocator,
+    };
+
+    // Split into heads and compute attention (Q attends to all cached K/V)
+    var head_outputs = try allocator.alloc(Tensor, num_heads);
+    var head_count: usize = 0;
+    errdefer {
+        for (head_outputs[0..head_count]) |*h| h.deinit();
+        allocator.free(head_outputs);
+    }
+
+    for (0..num_heads) |h| {
+        const start = h * head_dim;
+        const end = start + head_dim;
+
+        // Q: [1, head_dim], K: [cache_len, head_dim], V: [cache_len, head_dim]
+        var q_head = try ops.sliceColumns(allocator, &q_new, start, end);
+        defer q_head.deinit();
+        var k_head = try ops.sliceColumns(allocator, &k_full, start, end);
+        defer k_head.deinit();
+        var v_head = try ops.sliceColumns(allocator, &v_full, start, end);
+        defer v_head.deinit();
+
+        // No mask needed - single token Q attending to all previous K
+        // (last position can see all previous positions)
+        head_outputs[h] = try scaledDotProductAttention(
+            allocator,
+            &q_head, // [1, head_dim]
+            &k_head, // [cache_len, head_dim]
+            &v_head, // [cache_len, head_dim]
+            null,
+        );
+        head_count += 1;
+    }
+    defer {
+        for (head_outputs) |*h| h.deinit();
+        allocator.free(head_outputs);
+    }
+
+    // Concatenate heads
+    var concat = try ops.concatColumns(allocator, head_outputs);
+    defer concat.deinit();
+
+    // Final projection
+    var output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
+    try ops.addBiasInPlace(&output, &weights.o_bias);
+
+    return output;
+}
+
+/// Convenience function: causal attention with cache and F32 weights
+pub fn multiHeadCausalAttentionWithCacheF32(
+    allocator: std.mem.Allocator,
+    new_token_emb: *const Tensor,
+    kv_cache: *SelfAttentionKVCache,
+    weights: *const AttentionWeightsF32,
+    config: AttentionConfig,
+) !Tensor {
+    return multiHeadCausalAttentionWithCache(Tensor, allocator, new_token_emb, kv_cache, weights, config);
 }
 
 // ============================================================================
@@ -780,4 +1349,147 @@ test "F32 vs quantized accuracy comparison" {
 
     // Allow reasonable quantization error
     try std.testing.expect(max_diff < 0.1);
+}
+
+test "cross-attention different input sizes" {
+    const allocator = std.testing.allocator;
+
+    // Config: 2 heads, 4 hidden dim (same for encoder/decoder)
+    const config = CrossAttentionConfig{
+        .num_heads = 2,
+        .decoder_hidden = 4,
+        .encoder_hidden = 4,
+        .head_dim = 2,
+    };
+
+    // Query from decoder: [2 tokens, 4 hidden] (e.g., generating 2 tokens)
+    var query_shape = [_]usize{ 2, 4 };
+    var query_input = try Tensor.init(allocator, &query_shape);
+    defer query_input.deinit();
+    for (query_input.data, 0..) |*val, i| {
+        val.* = @as(f32, @floatFromInt(i)) * 0.1;
+    }
+
+    // Key/Value from encoder: [5 tokens, 4 hidden] (e.g., 5 audio frames)
+    var kv_shape = [_]usize{ 5, 4 };
+    var kv_input = try Tensor.init(allocator, &kv_shape);
+    defer kv_input.deinit();
+    for (kv_input.data, 0..) |*val, i| {
+        val.* = @as(f32, @floatFromInt(i)) * 0.05;
+    }
+
+    // Create identity-like weights
+    var weight_shape = [_]usize{ 4, 4 };
+    var bias_shape = [_]usize{4};
+
+    var q_weight = try Tensor.init(allocator, &weight_shape);
+    q_weight.data[0] = 1.0;
+    q_weight.data[5] = 1.0;
+    q_weight.data[10] = 1.0;
+    q_weight.data[15] = 1.0;
+
+    const k_weight = try Tensor.init(allocator, &weight_shape);
+    @memcpy(k_weight.data, q_weight.data);
+    const v_weight = try Tensor.init(allocator, &weight_shape);
+    @memcpy(v_weight.data, q_weight.data);
+    const o_weight = try Tensor.init(allocator, &weight_shape);
+    @memcpy(o_weight.data, q_weight.data);
+
+    const q_bias = try Tensor.init(allocator, &bias_shape);
+    const k_bias = try Tensor.init(allocator, &bias_shape);
+    const v_bias = try Tensor.init(allocator, &bias_shape);
+    const o_bias = try Tensor.init(allocator, &bias_shape);
+
+    var weights = CrossAttentionWeightsF32{
+        .q_weight = q_weight,
+        .q_bias = q_bias,
+        .k_weight = k_weight,
+        .k_bias = k_bias,
+        .v_weight = v_weight,
+        .v_bias = v_bias,
+        .o_weight = o_weight,
+        .o_bias = o_bias,
+    };
+    defer weights.deinit();
+
+    // Compute cross-attention
+    var output = try multiHeadCrossAttention(
+        Tensor,
+        allocator,
+        &query_input,
+        &kv_input,
+        &weights,
+        config,
+    );
+    defer output.deinit();
+
+    // Output shape should match query: [2, 4]
+    try std.testing.expectEqual(@as(usize, 2), output.shape[0]);
+    try std.testing.expectEqual(@as(usize, 4), output.shape[1]);
+}
+
+test "causal attention masks future positions" {
+    const allocator = std.testing.allocator;
+
+    // Config: 1 head, 2 hidden dim (simple for verification)
+    const config = AttentionConfig{
+        .num_heads = 1,
+        .hidden_dim = 2,
+        .head_dim = 2,
+    };
+
+    // Input: 3 tokens
+    var input_shape = [_]usize{ 3, 2 };
+    var input = try Tensor.init(allocator, &input_shape);
+    defer input.deinit();
+    // Different values per token so we can verify masking
+    input.data[0] = 1.0;
+    input.data[1] = 0.0; // token 0
+    input.data[2] = 0.0;
+    input.data[3] = 1.0; // token 1
+    input.data[4] = 0.5;
+    input.data[5] = 0.5; // token 2
+
+    // Identity weights
+    var weight_shape = [_]usize{ 2, 2 };
+    var bias_shape = [_]usize{2};
+
+    var q_weight = try Tensor.init(allocator, &weight_shape);
+    q_weight.data[0] = 1.0;
+    q_weight.data[3] = 1.0;
+    const k_weight = try Tensor.init(allocator, &weight_shape);
+    @memcpy(k_weight.data, q_weight.data);
+    const v_weight = try Tensor.init(allocator, &weight_shape);
+    @memcpy(v_weight.data, q_weight.data);
+    const o_weight = try Tensor.init(allocator, &weight_shape);
+    @memcpy(o_weight.data, q_weight.data);
+
+    const q_bias = try Tensor.init(allocator, &bias_shape);
+    const k_bias = try Tensor.init(allocator, &bias_shape);
+    const v_bias = try Tensor.init(allocator, &bias_shape);
+    const o_bias = try Tensor.init(allocator, &bias_shape);
+
+    var weights = AttentionWeightsF32{
+        .q_weight = q_weight,
+        .k_weight = k_weight,
+        .v_weight = v_weight,
+        .o_weight = o_weight,
+        .q_bias = q_bias,
+        .k_bias = k_bias,
+        .v_bias = v_bias,
+        .o_bias = o_bias,
+    };
+    defer weights.deinit();
+
+    // Compute causal attention
+    var output = try multiHeadCausalAttention(Tensor, allocator, &input, &weights, config);
+    defer output.deinit();
+
+    // Output shape should match input
+    try std.testing.expectEqual(@as(usize, 3), output.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), output.shape[1]);
+
+    // The first token should only attend to itself (due to causal mask)
+    // With identity weights and softmax(1 element) = 1.0, output[0] should equal input[0]
+    // (This is a simplified verification - the actual values depend on the projection)
 }

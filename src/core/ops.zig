@@ -1,9 +1,17 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Support both module imports (Wasm build) and relative imports (native build)
 const tensor_import = @import("tensor.zig");
 const Tensor = tensor_import.Tensor;
 const TensorError = tensor_import.TensorError;
+
+// Build options for BLAS support
+const build_options = @import("build_options");
+const use_blas: bool = if (@hasDecl(build_options, "use_blas")) build_options.use_blas else false;
+
+// BLAS module (only used when BLAS is enabled)
+const blas = if (use_blas) @import("blas.zig") else undefined;
 
 /// Operations error types
 pub const OpsError = error{
@@ -192,7 +200,7 @@ pub fn negateInPlace(a: *Tensor) void {
 
 /// Matrix multiplication: C = A @ B
 /// For A with shape [M, K] and B with shape [K, N], result has shape [M, N].
-/// Uses SIMD-optimized implementation with cache-friendly loop ordering.
+/// Uses BLAS when available (-Dblas=true), otherwise SIMD-optimized Zig.
 pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) !Tensor {
     // Validate: both must be 2D matrices
     if (a.shape.len != 2 or b.shape.len != 2) {
@@ -216,46 +224,150 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
     var result = try Tensor.init(allocator, &result_shape);
     errdefer result.deinit();
 
+    // Use BLAS if available, otherwise fall back to pure Zig SIMD
+    if (use_blas) {
+        // BLAS path: cblas_sgemm(C = alpha*A*B + beta*C)
+        blas.sgemm(m, n, k, a.data, b.data, result.data, 1.0, 0.0);
+        return result;
+    }
+
+    // Pure Zig path: SIMD-optimized implementation
     // Initialize result to zero
     @memset(result.data, 0.0);
 
-    // SIMD vector width (process 8 floats at once)
+    // SIMD vector width (8 floats for AVX/AVX2)
     const VEC_WIDTH = 8;
     const Vec = @Vector(VEC_WIDTH, f32);
 
-    // Optimized loop order: i, k, j
-    // This improves cache locality by accessing B's row consecutively
-    for (0..m) |i| {
-        for (0..k) |kk| {
-            // Broadcast A[i, kk] to all lanes of a vector
-            const a_val = a.data[i * k + kk];
-            const a_vec: Vec = @splat(a_val);
+    // Register blocking: process MR rows of A at once
+    // This keeps MR accumulators in registers, reducing memory traffic
+    const MR = 4; // Number of rows to process together
+    const NR = 24; // Number of columns per micro-kernel (3 vectors)
 
-            // Process B's row in chunks of VEC_WIDTH
-            var j: usize = 0;
+    // Main loop with register blocking
+    var i: usize = 0;
+    while (i + MR <= m) : (i += MR) {
+        var j: usize = 0;
 
-            // SIMD vectorized loop
-            while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
-                // Load 8 elements from B[kk, j..j+8]
-                const b_ptr = b.data[kk * n + j ..];
-                const b_vec: Vec = b_ptr[0..VEC_WIDTH].*;
+        // Vectorized columns (process NR columns at a time)
+        while (j + NR <= n) : (j += NR) {
+            // Accumulators for MR x NR block (kept in registers)
+            var c00: Vec = @splat(0.0);
+            var c01: Vec = @splat(0.0);
+            var c02: Vec = @splat(0.0);
+            var c10: Vec = @splat(0.0);
+            var c11: Vec = @splat(0.0);
+            var c12: Vec = @splat(0.0);
+            var c20: Vec = @splat(0.0);
+            var c21: Vec = @splat(0.0);
+            var c22: Vec = @splat(0.0);
+            var c30: Vec = @splat(0.0);
+            var c31: Vec = @splat(0.0);
+            var c32: Vec = @splat(0.0);
 
-                // Load 8 elements from result[i, j..j+8]
-                const result_ptr = result.data[i * n + j ..];
-                var result_vec: Vec = result_ptr[0..VEC_WIDTH].*;
+            // Reduction over K dimension
+            for (0..k) |kk| {
+                // Load 4 elements from column kk of A (broadcast each)
+                const a0: Vec = @splat(a.data[(i + 0) * k + kk]);
+                const a1: Vec = @splat(a.data[(i + 1) * k + kk]);
+                const a2: Vec = @splat(a.data[(i + 2) * k + kk]);
+                const a3: Vec = @splat(a.data[(i + 3) * k + kk]);
 
-                // Multiply and accumulate: result += a_val * b_vec
-                result_vec += a_vec * b_vec;
+                // Load 3 vectors (24 elements) from row kk of B
+                const b_base = kk * n + j;
+                const b0: Vec = b.data[b_base ..][0..VEC_WIDTH].*;
+                const b1: Vec = b.data[b_base + VEC_WIDTH ..][0..VEC_WIDTH].*;
+                const b2: Vec = b.data[b_base + 2 * VEC_WIDTH ..][0..VEC_WIDTH].*;
 
-                // Store back
-                result_ptr[0..VEC_WIDTH].* = result_vec;
+                // Accumulate: C[i, j] += A[i, k] * B[k, j]
+                c00 += a0 * b0;
+                c01 += a0 * b1;
+                c02 += a0 * b2;
+                c10 += a1 * b0;
+                c11 += a1 * b1;
+                c12 += a1 * b2;
+                c20 += a2 * b0;
+                c21 += a2 * b1;
+                c22 += a2 * b2;
+                c30 += a3 * b0;
+                c31 += a3 * b1;
+                c32 += a3 * b2;
             }
 
-            // Handle remaining elements (tail loop)
-            while (j < n) : (j += 1) {
+            // Store results
+            result.data[(i + 0) * n + j ..][0..VEC_WIDTH].* = c00;
+            result.data[(i + 0) * n + j + VEC_WIDTH ..][0..VEC_WIDTH].* = c01;
+            result.data[(i + 0) * n + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = c02;
+            result.data[(i + 1) * n + j ..][0..VEC_WIDTH].* = c10;
+            result.data[(i + 1) * n + j + VEC_WIDTH ..][0..VEC_WIDTH].* = c11;
+            result.data[(i + 1) * n + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = c12;
+            result.data[(i + 2) * n + j ..][0..VEC_WIDTH].* = c20;
+            result.data[(i + 2) * n + j + VEC_WIDTH ..][0..VEC_WIDTH].* = c21;
+            result.data[(i + 2) * n + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = c22;
+            result.data[(i + 3) * n + j ..][0..VEC_WIDTH].* = c30;
+            result.data[(i + 3) * n + j + VEC_WIDTH ..][0..VEC_WIDTH].* = c31;
+            result.data[(i + 3) * n + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = c32;
+        }
+
+        // Handle remaining columns with smaller vectors
+        while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
+            var c0: Vec = @splat(0.0);
+            var c1: Vec = @splat(0.0);
+            var c2: Vec = @splat(0.0);
+            var c3: Vec = @splat(0.0);
+
+            for (0..k) |kk| {
+                const b_vec: Vec = b.data[kk * n + j ..][0..VEC_WIDTH].*;
+                c0 += @as(Vec, @splat(a.data[(i + 0) * k + kk])) * b_vec;
+                c1 += @as(Vec, @splat(a.data[(i + 1) * k + kk])) * b_vec;
+                c2 += @as(Vec, @splat(a.data[(i + 2) * k + kk])) * b_vec;
+                c3 += @as(Vec, @splat(a.data[(i + 3) * k + kk])) * b_vec;
+            }
+
+            result.data[(i + 0) * n + j ..][0..VEC_WIDTH].* = c0;
+            result.data[(i + 1) * n + j ..][0..VEC_WIDTH].* = c1;
+            result.data[(i + 2) * n + j ..][0..VEC_WIDTH].* = c2;
+            result.data[(i + 3) * n + j ..][0..VEC_WIDTH].* = c3;
+        }
+
+        // Scalar tail for remaining columns
+        while (j < n) : (j += 1) {
+            var c0: f32 = 0.0;
+            var c1: f32 = 0.0;
+            var c2: f32 = 0.0;
+            var c3: f32 = 0.0;
+            for (0..k) |kk| {
                 const b_val = b.data[kk * n + j];
-                result.data[i * n + j] += a_val * b_val;
+                c0 += a.data[(i + 0) * k + kk] * b_val;
+                c1 += a.data[(i + 1) * k + kk] * b_val;
+                c2 += a.data[(i + 2) * k + kk] * b_val;
+                c3 += a.data[(i + 3) * k + kk] * b_val;
             }
+            result.data[(i + 0) * n + j] = c0;
+            result.data[(i + 1) * n + j] = c1;
+            result.data[(i + 2) * n + j] = c2;
+            result.data[(i + 3) * n + j] = c3;
+        }
+    }
+
+    // Handle remaining rows (when M is not divisible by MR)
+    while (i < m) : (i += 1) {
+        var j: usize = 0;
+        while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
+            var c: Vec = @splat(0.0);
+            for (0..k) |kk| {
+                const a_vec: Vec = @splat(a.data[i * k + kk]);
+                const b_vec: Vec = b.data[kk * n + j ..][0..VEC_WIDTH].*;
+                c += a_vec * b_vec;
+            }
+            result.data[i * n + j ..][0..VEC_WIDTH].* = c;
+        }
+        while (j < n) : (j += 1) {
+            var c: f32 = 0.0;
+            for (0..k) |kk| {
+                c += a.data[i * k + kk] * b.data[kk * n + j];
+            }
+            result.data[i * n + j] = c;
         }
     }
 
@@ -1340,6 +1452,7 @@ pub fn embedding(
 /// Layer Normalization
 /// Normalizes across the last dimension (features)
 /// y = (x - mean) / sqrt(var + eps) * gamma + beta
+/// SIMD-optimized for AVX (8-wide vectors)
 pub fn layerNorm(
     allocator: std.mem.Allocator,
     input: *const Tensor,
@@ -1347,52 +1460,17 @@ pub fn layerNorm(
     beta: *const Tensor,
     epsilon: f32,
 ) !Tensor {
-    if (input.shape.len != 2) {
-        return OpsError.InvalidShape;
-    }
-
-    const seq_len = input.shape[0];
-    const hidden_dim = input.shape[1];
-
-    if (gamma.shape.len != 1 or gamma.shape[0] != hidden_dim) {
-        return OpsError.ShapeMismatch;
-    }
-    if (beta.shape.len != 1 or beta.shape[0] != hidden_dim) {
-        return OpsError.ShapeMismatch;
-    }
-
     var result = try input.clone(allocator);
     errdefer result.deinit();
 
-    for (0..seq_len) |row| {
-        const row_start = row * hidden_dim;
-        const row_data = result.data[row_start..][0..hidden_dim];
-
-        // Calculate mean
-        var mean_val: f32 = 0.0;
-        for (row_data) |v| mean_val += v;
-        mean_val /= @floatFromInt(hidden_dim);
-
-        // Calculate variance
-        var variance: f32 = 0.0;
-        for (row_data) |v| {
-            const diff = v - mean_val;
-            variance += diff * diff;
-        }
-        variance /= @floatFromInt(hidden_dim);
-
-        // Normalize, scale, and shift
-        const std_dev = @sqrt(variance + epsilon);
-        for (row_data, 0..) |*v, i| {
-            const normalized = (v.* - mean_val) / std_dev;
-            v.* = normalized * gamma.data[i] + beta.data[i];
-        }
-    }
+    // Use the optimized in-place version (which does all validation)
+    try layerNormInPlace(&result, gamma, beta, epsilon);
 
     return result;
 }
 
 /// In-place layer normalization
+/// SIMD-optimized for AVX (8-wide vectors)
 pub fn layerNormInPlace(
     input: *Tensor,
     gamma: *const Tensor,
@@ -1413,52 +1491,204 @@ pub fn layerNormInPlace(
         return OpsError.ShapeMismatch;
     }
 
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+    const hidden_dim_f: f32 = @floatFromInt(hidden_dim);
+
     for (0..seq_len) |row| {
         const row_start = row * hidden_dim;
         const row_data = input.data[row_start..][0..hidden_dim];
 
+        // Calculate mean using SIMD
         var mean_val: f32 = 0.0;
-        for (row_data) |v| mean_val += v;
-        mean_val /= @floatFromInt(hidden_dim);
-
-        var variance: f32 = 0.0;
-        for (row_data) |v| {
-            const diff = v - mean_val;
-            variance += diff * diff;
+        if (hidden_dim >= VEC_WIDTH) {
+            var sum_vec: Vec = @splat(0.0);
+            var i: usize = 0;
+            while (i + VEC_WIDTH <= hidden_dim) : (i += VEC_WIDTH) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH].*;
+                sum_vec += v;
+            }
+            mean_val = @reduce(.Add, sum_vec);
+            // Handle remainder
+            while (i < hidden_dim) : (i += 1) {
+                mean_val += row_data[i];
+            }
+        } else {
+            for (row_data) |v| mean_val += v;
         }
-        variance /= @floatFromInt(hidden_dim);
+        mean_val /= hidden_dim_f;
 
-        const std_dev = @sqrt(variance + epsilon);
-        for (row_data, 0..) |*v, i| {
-            const normalized = (v.* - mean_val) / std_dev;
-            v.* = normalized * gamma.data[i] + beta.data[i];
+        // Calculate variance using SIMD
+        var variance: f32 = 0.0;
+        const mean_vec: Vec = @splat(mean_val);
+        if (hidden_dim >= VEC_WIDTH) {
+            var var_vec: Vec = @splat(0.0);
+            var i: usize = 0;
+            while (i + VEC_WIDTH <= hidden_dim) : (i += VEC_WIDTH) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH].*;
+                const diff = v - mean_vec;
+                var_vec += diff * diff;
+            }
+            variance = @reduce(.Add, var_vec);
+            // Handle remainder
+            while (i < hidden_dim) : (i += 1) {
+                const diff = row_data[i] - mean_val;
+                variance += diff * diff;
+            }
+        } else {
+            for (row_data) |v| {
+                const diff = v - mean_val;
+                variance += diff * diff;
+            }
+        }
+        variance /= hidden_dim_f;
+
+        // Normalize, scale, and shift using SIMD
+        const inv_std: f32 = 1.0 / @sqrt(variance + epsilon);
+        const inv_std_vec: Vec = @splat(inv_std);
+
+        if (hidden_dim >= VEC_WIDTH) {
+            var i: usize = 0;
+            while (i + VEC_WIDTH <= hidden_dim) : (i += VEC_WIDTH) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH].*;
+                const gamma_v: Vec = gamma.data[i..][0..VEC_WIDTH].*;
+                const beta_v: Vec = beta.data[i..][0..VEC_WIDTH].*;
+                const normalized = (v - mean_vec) * inv_std_vec;
+                row_data[i..][0..VEC_WIDTH].* = normalized * gamma_v + beta_v;
+            }
+            // Handle remainder
+            while (i < hidden_dim) : (i += 1) {
+                const normalized = (row_data[i] - mean_val) * inv_std;
+                row_data[i] = normalized * gamma.data[i] + beta.data[i];
+            }
+        } else {
+            for (row_data, 0..) |*v, i| {
+                const normalized = (v.* - mean_val) * inv_std;
+                v.* = normalized * gamma.data[i] + beta.data[i];
+            }
         }
     }
 }
 
-/// GELU activation (Gaussian Error Linear Unit)
-/// Used by BERT/DistilBERT instead of ReLU
+/// GELU activation (Gaussian Error Linear Unit) - Tanh Approximation
+/// Used by GPT-2, BERT/DistilBERT
 /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+/// SIMD-optimized for AVX (8-wide vectors)
 pub fn gelu(tensor: *Tensor) void {
     const sqrt_2_over_pi: f32 = 0.7978845608; // sqrt(2/pi)
     const coeff: f32 = 0.044715;
 
-    for (tensor.data) |*x| {
-        const x3 = x.* * x.* * x.*;
-        const inner = sqrt_2_over_pi * (x.* + coeff * x3);
-        x.* = 0.5 * x.* * (1.0 + std.math.tanh(inner));
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+    const len = tensor.data.len;
+
+    const sqrt_vec: Vec = @splat(sqrt_2_over_pi);
+    const coeff_vec: Vec = @splat(coeff);
+    const half_vec: Vec = @splat(0.5);
+    const one_vec: Vec = @splat(1.0);
+
+    var i: usize = 0;
+    while (i + VEC_WIDTH <= len) : (i += VEC_WIDTH) {
+        const x: Vec = tensor.data[i..][0..VEC_WIDTH].*;
+        const x2 = x * x;
+        const x3 = x2 * x;
+        const inner = sqrt_vec * (x + coeff_vec * x3);
+        // Vectorized tanh
+        const tanh_v = Vec{
+            std.math.tanh(inner[0]), std.math.tanh(inner[1]),
+            std.math.tanh(inner[2]), std.math.tanh(inner[3]),
+            std.math.tanh(inner[4]), std.math.tanh(inner[5]),
+            std.math.tanh(inner[6]), std.math.tanh(inner[7]),
+        };
+        tensor.data[i..][0..VEC_WIDTH].* = half_vec * x * (one_vec + tanh_v);
+    }
+    // Handle remainder
+    while (i < len) : (i += 1) {
+        const x = tensor.data[i];
+        const x3 = x * x * x;
+        const inner = sqrt_2_over_pi * (x + coeff * x3);
+        tensor.data[i] = 0.5 * x * (1.0 + std.math.tanh(inner));
     }
 }
 
-/// Allocating version of GELU
+/// Approximate error function (erf) using Abramowitz and Stegun approximation
+/// Maximum error: 1.5e-7
+fn erf(x: f32) f32 {
+    // Constants for the approximation
+    const a1: f32 = 0.254829592;
+    const a2: f32 = -0.284496736;
+    const a3: f32 = 1.421413741;
+    const a4: f32 = -1.453152027;
+    const a5: f32 = 1.061405429;
+    const p: f32 = 0.3275911;
+
+    // Save the sign of x
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const abs_x = @abs(x);
+
+    // A&S formula 7.1.26
+    const t = 1.0 / (1.0 + p * abs_x);
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const t4 = t3 * t;
+    const t5 = t4 * t;
+
+    const y = 1.0 - (a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5) * @exp(-abs_x * abs_x);
+
+    return sign * y;
+}
+
+/// Exact GELU activation using error function
+/// Used by Whisper and other models that use approximate='none'
+/// Formula: x * 0.5 * (1 + erf(x / sqrt(2)))
+/// SIMD-optimized for AVX (8-wide vectors)
+pub fn geluExact(tensor: *Tensor) void {
+    const inv_sqrt_2: f32 = 0.7071067811865476; // 1/sqrt(2)
+
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+    const len = tensor.data.len;
+
+    const inv_sqrt_2_vec: Vec = @splat(inv_sqrt_2);
+    const half_vec: Vec = @splat(0.5);
+    const one_vec: Vec = @splat(1.0);
+
+    var i: usize = 0;
+    while (i + VEC_WIDTH <= len) : (i += VEC_WIDTH) {
+        const x: Vec = tensor.data[i..][0..VEC_WIDTH].*;
+        const scaled = x * inv_sqrt_2_vec;
+        // Vectorized erf
+        const erf_v = Vec{
+            erf(scaled[0]), erf(scaled[1]), erf(scaled[2]), erf(scaled[3]),
+            erf(scaled[4]), erf(scaled[5]), erf(scaled[6]), erf(scaled[7]),
+        };
+        tensor.data[i..][0..VEC_WIDTH].* = x * half_vec * (one_vec + erf_v);
+    }
+    // Handle remainder
+    while (i < len) : (i += 1) {
+        const x = tensor.data[i];
+        const erf_val = erf(x * inv_sqrt_2);
+        tensor.data[i] = x * 0.5 * (1.0 + erf_val);
+    }
+}
+
+/// Allocating version of GELU (tanh approximation)
 pub fn geluAlloc(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
     var result = try tensor.clone(allocator);
     gelu(&result);
     return result;
 }
 
+/// Allocating version of exact GELU
+pub fn geluExactAlloc(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
+    var result = try tensor.clone(allocator);
+    geluExact(&result);
+    return result;
+}
+
 /// Softmax along last dimension (rows)
 /// Uses stable softmax: subtract max before exp to prevent overflow
+/// SIMD-optimized for AVX (8-wide vectors)
 pub fn softmax(tensor: *Tensor) void {
     if (tensor.shape.len != 2) {
         return; // Only support 2D tensors for now
@@ -1467,26 +1697,82 @@ pub fn softmax(tensor: *Tensor) void {
     const rows = tensor.shape[0];
     const cols = tensor.shape[1];
 
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+
     for (0..rows) |row| {
         const row_start = row * cols;
         const row_data = tensor.data[row_start..][0..cols];
 
-        // Find max for numerical stability
+        // Find max for numerical stability using SIMD
         var max_val: f32 = row_data[0];
-        for (row_data[1..]) |v| {
-            if (v > max_val) max_val = v;
+
+        if (cols >= VEC_WIDTH) {
+            var max_vec: Vec = @splat(-std.math.inf(f32));
+            var i: usize = 0;
+            while (i + VEC_WIDTH <= cols) : (i += VEC_WIDTH) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH].*;
+                max_vec = @max(max_vec, v);
+            }
+            // Reduce vector to scalar
+            max_val = @reduce(.Max, max_vec);
+            // Handle remainder
+            while (i < cols) : (i += 1) {
+                if (row_data[i] > max_val) max_val = row_data[i];
+            }
+        } else {
+            for (row_data[1..]) |v| {
+                if (v > max_val) max_val = v;
+            }
         }
 
-        // Compute exp(x - max) and sum
+        // Compute exp(x - max) and sum using SIMD
         var sum_val: f32 = 0.0;
-        for (row_data) |*v| {
-            v.* = @exp(v.* - max_val);
-            sum_val += v.*;
+        const max_vec: Vec = @splat(max_val);
+
+        if (cols >= VEC_WIDTH) {
+            var sum_vec: Vec = @splat(0.0);
+            var i: usize = 0;
+            while (i + VEC_WIDTH <= cols) : (i += VEC_WIDTH) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH].*;
+                const shifted = v - max_vec;
+                // Vectorized exp
+                const exp_v = Vec{
+                    @exp(shifted[0]), @exp(shifted[1]), @exp(shifted[2]), @exp(shifted[3]),
+                    @exp(shifted[4]), @exp(shifted[5]), @exp(shifted[6]), @exp(shifted[7]),
+                };
+                row_data[i..][0..VEC_WIDTH].* = exp_v;
+                sum_vec += exp_v;
+            }
+            sum_val = @reduce(.Add, sum_vec);
+            // Handle remainder
+            while (i < cols) : (i += 1) {
+                row_data[i] = @exp(row_data[i] - max_val);
+                sum_val += row_data[i];
+            }
+        } else {
+            for (row_data) |*v| {
+                v.* = @exp(v.* - max_val);
+                sum_val += v.*;
+            }
         }
 
-        // Normalize
-        for (row_data) |*v| {
-            v.* /= sum_val;
+        // Normalize using SIMD
+        const inv_sum: Vec = @splat(1.0 / sum_val);
+        if (cols >= VEC_WIDTH) {
+            var i: usize = 0;
+            while (i + VEC_WIDTH <= cols) : (i += VEC_WIDTH) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH].*;
+                row_data[i..][0..VEC_WIDTH].* = v * inv_sum;
+            }
+            const inv_sum_scalar = 1.0 / sum_val;
+            while (i < cols) : (i += 1) {
+                row_data[i] *= inv_sum_scalar;
+            }
+        } else {
+            for (row_data) |*v| {
+                v.* /= sum_val;
+            }
         }
     }
 }
@@ -1629,6 +1915,67 @@ pub fn argmax(allocator: std.mem.Allocator, tensor: *const Tensor) ![]usize {
     }
 
     return indices;
+}
+
+// ============================================================================
+// Causal Masking (for Decoder Self-Attention)
+// ============================================================================
+
+/// Apply causal mask to attention scores in-place.
+/// Masks positions where column > row with -inf (future positions cannot be attended to).
+/// scores: [seq_len, seq_len] attention scores tensor
+pub fn applyCausalMask(scores: *Tensor) void {
+    std.debug.assert(scores.shape.len == 2);
+    std.debug.assert(scores.shape[0] == scores.shape[1]);
+
+    const seq_len = scores.shape[0];
+    const neg_inf = -std.math.inf(f32);
+
+    for (0..seq_len) |row| {
+        // Mask all columns after the current row (future positions)
+        for ((row + 1)..seq_len) |col| {
+            scores.data[row * seq_len + col] = neg_inf;
+        }
+    }
+}
+
+/// Create a causal attention mask tensor.
+/// Returns: [seq_len, seq_len] with 0.0 for valid positions, -inf for masked positions.
+/// Can be added to attention scores before softmax.
+pub fn createCausalMask(allocator: std.mem.Allocator, seq_len: usize) !Tensor {
+    var out_shape = [_]usize{ seq_len, seq_len };
+    var mask = try Tensor.init(allocator, &out_shape);
+    errdefer mask.deinit();
+
+    const neg_inf = -std.math.inf(f32);
+
+    for (0..seq_len) |row| {
+        for (0..seq_len) |col| {
+            if (col <= row) {
+                // Current and past positions are valid (0 added to scores)
+                mask.data[row * seq_len + col] = 0.0;
+            } else {
+                // Future positions are masked (-inf added to scores -> 0 after softmax)
+                mask.data[row * seq_len + col] = neg_inf;
+            }
+        }
+    }
+
+    return mask;
+}
+
+/// Apply an additive attention mask to scores in-place.
+/// mask: [query_len, key_len] with 0 for valid, -inf for masked positions
+/// scores: [query_len, key_len] attention scores
+/// Used for both causal masking and padding masks.
+pub fn applyAttentionMask(scores: *Tensor, mask: *const Tensor) OpsError!void {
+    if (!shapesMatch(scores.shape, mask.shape)) {
+        return OpsError.ShapeMismatch;
+    }
+
+    for (scores.data, mask.data) |*s, m| {
+        s.* += m;
+    }
 }
 
 // ============================================================================
@@ -1911,4 +2258,102 @@ test "add bias in place" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.1), input.data[3], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.2), input.data[4], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.3), input.data[5], 0.001);
+}
+
+// ============================================================================
+// Tests: Causal Masking
+// ============================================================================
+
+test "create causal mask 4x4" {
+    const allocator = std.testing.allocator;
+
+    var mask = try createCausalMask(allocator, 4);
+    defer mask.deinit();
+
+    // Expected mask (0 = valid, -inf = masked):
+    // [  0,  -∞,  -∞,  -∞ ]  row 0: can only see position 0
+    // [  0,   0,  -∞,  -∞ ]  row 1: can see positions 0, 1
+    // [  0,   0,   0,  -∞ ]  row 2: can see positions 0, 1, 2
+    // [  0,   0,   0,   0 ]  row 3: can see all positions
+
+    try std.testing.expectEqual(@as(usize, 2), mask.shape.len);
+    try std.testing.expectEqual(@as(usize, 4), mask.shape[0]);
+    try std.testing.expectEqual(@as(usize, 4), mask.shape[1]);
+
+    // Row 0: can only see position 0
+    try std.testing.expectEqual(@as(f32, 0.0), mask.data[0]); // [0,0]
+    try std.testing.expect(std.math.isNegativeInf(mask.data[1])); // [0,1]
+    try std.testing.expect(std.math.isNegativeInf(mask.data[2])); // [0,2]
+    try std.testing.expect(std.math.isNegativeInf(mask.data[3])); // [0,3]
+
+    // Row 2: can see positions 0, 1, 2
+    try std.testing.expectEqual(@as(f32, 0.0), mask.data[8]); // [2,0]
+    try std.testing.expectEqual(@as(f32, 0.0), mask.data[9]); // [2,1]
+    try std.testing.expectEqual(@as(f32, 0.0), mask.data[10]); // [2,2]
+    try std.testing.expect(std.math.isNegativeInf(mask.data[11])); // [2,3]
+
+    // Row 3 (last row): can see all positions
+    try std.testing.expectEqual(@as(f32, 0.0), mask.data[12]); // [3,0]
+    try std.testing.expectEqual(@as(f32, 0.0), mask.data[13]); // [3,1]
+    try std.testing.expectEqual(@as(f32, 0.0), mask.data[14]); // [3,2]
+    try std.testing.expectEqual(@as(f32, 0.0), mask.data[15]); // [3,3]
+}
+
+test "apply causal mask in place" {
+    const allocator = std.testing.allocator;
+
+    // Create 3x3 attention scores (all ones)
+    var scores_shape = [_]usize{ 3, 3 };
+    var scores = try Tensor.init(allocator, &scores_shape);
+    defer scores.deinit();
+    scores.fill(1.0);
+
+    applyCausalMask(&scores);
+
+    // Expected after masking:
+    // [ 1,  -∞,  -∞ ]
+    // [ 1,   1,  -∞ ]
+    // [ 1,   1,   1 ]
+
+    // Row 0
+    try std.testing.expectEqual(@as(f32, 1.0), scores.data[0]);
+    try std.testing.expect(std.math.isNegativeInf(scores.data[1]));
+    try std.testing.expect(std.math.isNegativeInf(scores.data[2]));
+
+    // Row 1
+    try std.testing.expectEqual(@as(f32, 1.0), scores.data[3]);
+    try std.testing.expectEqual(@as(f32, 1.0), scores.data[4]);
+    try std.testing.expect(std.math.isNegativeInf(scores.data[5]));
+
+    // Row 2 (no masking)
+    try std.testing.expectEqual(@as(f32, 1.0), scores.data[6]);
+    try std.testing.expectEqual(@as(f32, 1.0), scores.data[7]);
+    try std.testing.expectEqual(@as(f32, 1.0), scores.data[8]);
+}
+
+test "apply attention mask additive" {
+    const allocator = std.testing.allocator;
+
+    // Scores: all 2.0
+    var shape = [_]usize{ 2, 3 };
+    var scores = try Tensor.init(allocator, &shape);
+    defer scores.deinit();
+    scores.fill(2.0);
+
+    // Mask: 0 for valid, -inf for position [0,2] and [1,2]
+    var mask = try Tensor.init(allocator, &shape);
+    defer mask.deinit();
+    mask.fill(0.0);
+    mask.data[2] = -std.math.inf(f32); // [0,2]
+    mask.data[5] = -std.math.inf(f32); // [1,2]
+
+    try applyAttentionMask(&scores, &mask);
+
+    // Expected: [2, 2, -inf], [2, 2, -inf]
+    try std.testing.expectEqual(@as(f32, 2.0), scores.data[0]);
+    try std.testing.expectEqual(@as(f32, 2.0), scores.data[1]);
+    try std.testing.expect(std.math.isNegativeInf(scores.data[2]));
+    try std.testing.expectEqual(@as(f32, 2.0), scores.data[3]);
+    try std.testing.expectEqual(@as(f32, 2.0), scores.data[4]);
+    try std.testing.expect(std.math.isNegativeInf(scores.data[5]));
 }

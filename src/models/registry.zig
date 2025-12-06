@@ -151,11 +151,59 @@ pub const models = [_]ModelConfig{
         .supports_bundled = false, // Weights loaded separately at runtime
         .release_mode = .fast,
     },
-    // Add more models - paths are derived from name automatically:
-    // .{
-    //     .name = "whisper_tiny",
-    //     .kind = .audio,
-    //     .description = "Speech Recognition",
-    //     .export_symbols = &.{ "init", "transcribe", ... },
-    // },
+    // Whisper Speech-to-Text models (Phase 10)
+    .{
+        .name = "whisper-tiny",
+        .kind = .audio,
+        .description = "Speech Recognition (Whisper Tiny - 39M params)",
+        .wasm_binding = "src/models/whisper/wasm.zig",
+        .c_binding = "src/models/whisper/c.zig",
+        .model_module = "src/models/whisper/model.zig",
+        .weights_path = "artifacts/whisper_tiny.tl",
+        .hf_repo = "tomoul/whisper-tiny",
+        .export_symbols = &.{
+            "init",
+            "get_mel_buffer_ptr",
+            "get_max_mel_frames",
+            "get_output_buffer_ptr",
+            "get_output_length",
+            "transcribe",
+            "reset",
+            "is_ready",
+            "get_version",
+        },
+        .weight_variants = &.{
+            .{ .suffix = "-q8", .path = "artifacts/whisper_tiny_q8.tl", .description = "Q8 quantized - 4x smaller" },
+        },
+        .has_example = false,
+        .supports_bundled = false, // Weights loaded separately at runtime
+        .release_mode = .fast,
+    },
+    .{
+        .name = "whisper-base",
+        .kind = .audio,
+        .description = "Speech Recognition (Whisper Base - 74M params)",
+        .wasm_binding = "src/models/whisper/wasm.zig",
+        .c_binding = "src/models/whisper/c.zig",
+        .model_module = "src/models/whisper/model.zig",
+        .weights_path = "artifacts/whisper_base.tl",
+        .hf_repo = "tomoul/whisper-base",
+        .export_symbols = &.{
+            "init",
+            "get_mel_buffer_ptr",
+            "get_max_mel_frames",
+            "get_output_buffer_ptr",
+            "get_output_length",
+            "transcribe",
+            "reset",
+            "is_ready",
+            "get_version",
+        },
+        .weight_variants = &.{
+            .{ .suffix = "-q8", .path = "artifacts/whisper_base_q8.tl", .description = "Q8 quantized - 4x smaller" },
+        },
+        .has_example = false,
+        .supports_bundled = false, // Weights loaded separately at runtime
+        .release_mode = .fast,
+    },
 };
