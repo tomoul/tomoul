@@ -16,11 +16,12 @@
 
 const std = @import("std");
 const Tensor = @import("tensor.zig").Tensor;
-const ops = @import("ops.zig");
 
 pub const config = @import("config.zig");
 pub const encoder = @import("encoder.zig");
 pub const decoder = @import("decoder.zig");
+pub const ops = @import("ops.zig");
+pub const audio = @import("audio.zig");
 
 const WhisperConfig = config.WhisperConfig;
 const WhisperTokens = config.WhisperTokens;
@@ -97,16 +98,16 @@ pub const Whisper = struct {
         var audio_features = try self.enc.encode(mel);
         defer audio_features.deinit();
 
-        // 2. Initialize prompt tokens
-        var tokens = std.ArrayList(u32).init(allocator);
-        errdefer tokens.deinit();
+        // 2. Initialize prompt tokens (Zig 0.15 style - unmanaged)
+        var tokens: std.ArrayListUnmanaged(u32) = .{};
+        errdefer tokens.deinit(allocator);
 
         // Add start tokens: <|startoftranscript|><|lang|><|task|><|notimestamps|>
-        try tokens.append(WhisperTokens.SOT);
-        try tokens.append(opts.language);
-        try tokens.append(opts.task);
+        try tokens.append(allocator, WhisperTokens.SOT);
+        try tokens.append(allocator, opts.language);
+        try tokens.append(allocator, opts.task);
         if (!opts.timestamps) {
-            try tokens.append(WhisperTokens.NO_TIMESTAMPS);
+            try tokens.append(allocator, WhisperTokens.NO_TIMESTAMPS);
         }
 
         // 3. Process initial prompt (get logits for first predicted token)
@@ -132,7 +133,7 @@ pub const Whisper = struct {
                 break;
             }
 
-            try tokens.append(next_token);
+            try tokens.append(allocator, next_token);
 
             // Decode next step
             var next_logits = try self.dec.decodeStep(next_token, position, &audio_features);
@@ -148,7 +149,7 @@ pub const Whisper = struct {
             position += 1;
         }
 
-        return tokens.toOwnedSlice();
+        return tokens.toOwnedSlice(allocator);
     }
 
     /// Clean up resources

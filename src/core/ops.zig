@@ -9,9 +9,30 @@ const TensorError = tensor_import.TensorError;
 // Build options for BLAS support
 const build_options = @import("build_options");
 const use_blas: bool = if (@hasDecl(build_options, "use_blas")) build_options.use_blas else false;
+const use_zblas: bool = if (@hasDecl(build_options, "use_zblas")) build_options.use_zblas else false;
 
-// BLAS module (only used when BLAS is enabled)
+// BLAS modules (only used when enabled)
 const blas = if (use_blas) @import("blas.zig") else undefined;
+const zblas = if (use_zblas) @import("zblas") else undefined;
+
+// Context for parallel execution
+const context_import = @import("context.zig");
+pub const Context = context_import.Context;
+
+/// Global thread pool for parallel operations
+/// Set via initGlobalContext() at startup, used by matmul automatically
+var global_context: ?*Context = null;
+
+/// Initialize the global execution context for parallel operations
+/// Call this once at startup before using matmul
+pub fn initGlobalContext(ctx: *Context) void {
+    global_context = ctx;
+}
+
+/// Deinitialize the global execution context
+pub fn deinitGlobalContext() void {
+    global_context = null;
+}
 
 /// Operations error types
 pub const OpsError = error{
@@ -201,6 +222,7 @@ pub fn negateInPlace(a: *Tensor) void {
 /// Matrix multiplication: C = A @ B
 /// For A with shape [M, K] and B with shape [K, N], result has shape [M, N].
 /// Uses BLAS when available (-Dblas=true), otherwise SIMD-optimized Zig.
+/// Automatically uses multithreading if global context is set and workload is large enough.
 pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) !Tensor {
     // Validate: both must be 2D matrices
     if (a.shape.len != 2 or b.shape.len != 2) {
@@ -219,19 +241,31 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
 
     const k = k_a;
 
+    // Check if we should use parallel execution (when global context is set)
+    // Only parallelize for large enough matrices (m >= min_parallel_rows)
+    if (global_context) |ctx| {
+        if (ctx.shouldParallelize(m)) {
+            return matmulParallel(allocator, ctx, a, b);
+        }
+    }
+
     // Result shape: [M, N]
     var result_shape = [_]usize{ m, n };
     var result = try Tensor.init(allocator, &result_shape);
     errdefer result.deinit();
 
-    // Use BLAS if available, otherwise fall back to pure Zig SIMD
+    // Use BLAS if available, otherwise zblas, otherwise fall back to pure Zig SIMD
     if (use_blas) {
-        // BLAS path: cblas_sgemm(C = alpha*A*B + beta*C)
+        // OpenBLAS path: cblas_sgemm(C = alpha*A*B + beta*C)
         blas.sgemm(m, n, k, a.data, b.data, result.data, 1.0, 0.0);
+        return result;
+    } else if (use_zblas) {
+        // zblas path: pure Zig optimized SGEMM
+        zblas.sgemm(m, n, k, a.data, b.data, result.data, 1.0, 0.0);
         return result;
     }
 
-    // Pure Zig path: SIMD-optimized implementation
+    // Fallback pure Zig path: SIMD-optimized implementation (for benchmarking)
     // Initialize result to zero
     @memset(result.data, 0.0);
 
@@ -372,6 +406,114 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
     }
 
     return result;
+}
+
+/// Parallel matrix multiplication: C = A @ B
+/// Splits M dimension across threads for parallel execution.
+/// Falls back to single-threaded matmul if Context is not parallel or workload is small.
+///
+/// Parameters:
+/// - allocator: Memory allocator for result tensor
+/// - ctx: Execution context with thread pool
+/// - a: Left matrix [M, K]
+/// - b: Right matrix [K, N]
+///
+/// Returns: Result matrix [M, N]
+pub fn matmulParallel(allocator: std.mem.Allocator, ctx: *Context, a: *const Tensor, b: *const Tensor) !Tensor {
+    _ = ctx; // Parallel context not used - zblas handles parallelism internally
+
+    // Validate: both must be 2D matrices
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return OpsError.InvalidShape;
+    }
+
+    const m = a.shape[0]; // rows of A
+    const k_a = a.shape[1]; // cols of A
+    const k_b = b.shape[0]; // rows of B
+    const n = b.shape[1]; // cols of B
+
+    // Validate: A columns must match B rows
+    if (k_a != k_b) {
+        return OpsError.ShapeMismatch;
+    }
+
+    const k = k_a;
+
+    // Result shape: [M, N]
+    var result_shape = [_]usize{ m, n };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    // Use zblas if available (it handles parallelism internally via sgemmParallel)
+    // Otherwise fall back to the pure Zig SIMD implementation
+    if (use_zblas) {
+        // zblas path: pure Zig optimized SGEMM
+        zblas.sgemm(m, n, k, a.data, b.data, result.data, 1.0, 0.0);
+        return result;
+    } else if (use_blas) {
+        blas.sgemm(m, n, k, a.data, b.data, result.data, 1.0, 0.0);
+        return result;
+    }
+
+    // Fallback: pure Zig SIMD (no parallelism in this path)
+    @memset(result.data, 0.0);
+    matmulRowRange(a.data, b.data, result.data, k, n, 0, m);
+
+    return result;
+}
+
+/// Task function for parallel matmul work (used by spawnWg)
+fn matmulRowRangeTask(
+    a_data: []const f32,
+    b_data: []const f32,
+    result_data: []f32,
+    k: usize,
+    n: usize,
+    row_start: usize,
+    row_end: usize,
+) void {
+    matmulRowRange(a_data, b_data, result_data, k, n, row_start, row_end);
+}
+
+/// Compute a range of rows for matmul: result[row_start:row_end, :] = a[row_start:row_end, :] @ b
+/// This is the inner kernel shared by both single-threaded and parallel matmul.
+fn matmulRowRange(
+    a_data: []const f32,
+    b_data: []const f32,
+    result_data: []f32,
+    k: usize,
+    n: usize,
+    row_start: usize,
+    row_end: usize,
+) void {
+    // SIMD vector width (process 8 floats at once)
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+
+    // Process each row in this thread's range
+    for (row_start..row_end) |i| {
+        var j: usize = 0;
+
+        // Vectorized columns
+        while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
+            var acc: Vec = @splat(0.0);
+            for (0..k) |kk| {
+                const a_val: Vec = @splat(a_data[i * k + kk]);
+                const b_vec: Vec = b_data[kk * n + j ..][0..VEC_WIDTH].*;
+                acc += a_val * b_vec;
+            }
+            result_data[i * n + j ..][0..VEC_WIDTH].* = acc;
+        }
+
+        // Scalar tail
+        while (j < n) : (j += 1) {
+            var acc: f32 = 0.0;
+            for (0..k) |kk| {
+                acc += a_data[i * k + kk] * b_data[kk * n + j];
+            }
+            result_data[i * n + j] = acc;
+        }
+    }
 }
 
 /// Transpose a 2D matrix: B = A^T

@@ -7,6 +7,7 @@ Usage:
     python export_whisper.py -m base -o ./models/ -q q8_0
     python export_whisper.py -m large-v3-turbo -o ./models/ -q q8_0
     python export_whisper.py -m distil-small.en -o ./models/ -q q8_0
+    python export_whisper.py --vocab-only -o ./models/   # Export only vocabulary
 
 Supported models:
   - OpenAI Whisper: tiny, base, small, medium, large, large-v3-turbo
@@ -17,9 +18,11 @@ The exporter:
 2. Extracts encoder and decoder weights
 3. Pre-transposes weights for optimal SIMD matmul
 4. Exports to .tl format with optional quantization
+5. Optionally exports vocabulary for text decoding
 """
 
 import argparse
+import struct
 import sys
 from pathlib import Path
 from typing import Dict, Optional
@@ -29,6 +32,136 @@ import torch
 
 # Import shared tl_format utilities
 from tl_format import export_tensors, QuantFormat
+
+
+# ============================================================================
+# Vocabulary export for text decoding
+# ============================================================================
+
+# Whisper vocabulary layout:
+# Token 0-50256: GPT-2 BPE tokens
+# Token 50257: <|endoftext|> (EOT)
+# Token 50258: <|startoftranscript|> (SOT)
+# Token 50259-50357: language tokens (<|en|>, <|zh|>, etc.)
+# Token 50358: <|translate|>
+# Token 50359: <|transcribe|>
+# Token 50360: <|startoflm|>
+# Token 50361: <|startofprev|>
+# Token 50362: <|nospeech|>
+# Token 50363: <|notimestamps|>
+# Token 50364+: timestamp tokens
+
+WHISPER_LANGUAGES = [
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr",
+    "pl", "ca", "nl", "ar", "sv", "it", "id", "hi", "fi", "vi",
+    "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no",
+    "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk",
+    "te", "fa", "lv", "bn", "sr", "az", "sl", "kn", "et", "mk",
+    "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw",
+    "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc",
+    "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo",
+    "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl",
+    "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su"
+]
+
+SPECIAL_TOKENS = {
+    50257: "<|endoftext|>",
+    50258: "<|startoftranscript|>",
+    50358: "<|translate|>",
+    50359: "<|transcribe|>",
+    50360: "<|startoflm|>",
+    50361: "<|startofprev|>",
+    50362: "<|nospeech|>",
+    50363: "<|notimestamps|>",
+}
+
+
+def export_whisper_vocab(output_dir: str) -> Path:
+    """Export Whisper vocabulary for text decoding.
+
+    Returns the path to the binary vocabulary file.
+    """
+    try:
+        import whisper
+    except ImportError:
+        print("Error: OpenAI Whisper not installed.")
+        print("Install with: pip install openai-whisper")
+        sys.exit(1)
+
+    # Load tokenizer from any Whisper model
+    print("Loading Whisper tokenizer...")
+    tokenizer = whisper.tokenizer.get_tokenizer(multilingual=True)
+    encoding = tokenizer.encoding
+
+    vocab_size = 51865  # Standard Whisper vocab size
+    output_dir = Path(output_dir)
+    txt_path = output_dir / "whisper_vocab.txt"
+    bin_path = output_dir / "whisper_vocab.bin"
+
+    print(f"Exporting {vocab_size} tokens...")
+
+    # First write text file (for debugging/inspection)
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        for i in range(vocab_size):
+            token_str = _get_token_string(encoding, i)
+            f.write(token_str + '\n')
+
+    print(f"  Text vocabulary: {txt_path}")
+
+    # Write binary file (for fast loading in Zig)
+    with open(bin_path, 'wb') as f:
+        # Write vocab size as u32 little-endian
+        f.write(struct.pack('<I', vocab_size))
+
+        # Write each token as length-prefixed string
+        with open(txt_path, 'r', encoding='utf-8') as txt:
+            for line in txt:
+                token = line.rstrip('\n')
+                token_bytes = token.encode('utf-8')
+                # Write length (u16) + bytes
+                f.write(struct.pack('<H', len(token_bytes)))
+                f.write(token_bytes)
+
+    print(f"  Binary vocabulary: {bin_path}")
+    return bin_path
+
+
+def _get_token_string(encoding, token_id: int) -> str:
+    """Get the string representation of a token ID."""
+    try:
+        # Try to decode using tiktoken
+        token_bytes = encoding.decode_single_token_bytes(token_id)
+        try:
+            token_str = token_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            # For byte tokens that aren't valid UTF-8, use hex
+            token_str = token_bytes.hex()
+
+        # Escape special characters
+        token_str = (token_str
+            .replace('\\', '\\\\')
+            .replace('\n', '\\n')
+            .replace('\r', '\\r')
+            .replace('\t', '\\t'))
+        return token_str
+
+    except KeyError:
+        # Special tokens - handle manually
+        if token_id in SPECIAL_TOKENS:
+            return SPECIAL_TOKENS[token_id]
+        elif 50259 <= token_id <= 50357:
+            # Language tokens
+            lang_idx = token_id - 50259
+            if lang_idx < len(WHISPER_LANGUAGES):
+                return f"<|{WHISPER_LANGUAGES[lang_idx]}|>"
+            else:
+                return f"<|lang_{lang_idx}|>"
+        elif token_id >= 50364:
+            # Timestamp tokens
+            timestamp = (token_id - 50364) * 0.02
+            return f"<|{timestamp:.2f}|>"
+        else:
+            return f"<|special_{token_id}|>"
 
 
 # Model configurations (matches Zig config.zig)
@@ -533,13 +666,36 @@ def main():
         action="store_true",
         help="Also export a validation fixture"
     )
+    parser.add_argument(
+        "--vocab",
+        action="store_true",
+        help="Also export vocabulary for text decoding"
+    )
+    parser.add_argument(
+        "--vocab-only",
+        action="store_true",
+        help="Only export vocabulary (skip model weights)"
+    )
 
     args = parser.parse_args()
+
+    # Create output directory if needed
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.vocab_only:
+        # Only export vocabulary
+        vocab_path = export_whisper_vocab(args.output)
+        print(f"\nDone! Vocabulary exported to: {vocab_path}")
+        return
 
     output_path = export_whisper(args.model, args.output, args.quantization)
 
     if args.fixture:
         export_validation_fixture(args.model, args.output)
+
+    if args.vocab:
+        export_whisper_vocab(args.output)
 
     print(f"\nDone! Model exported to: {output_path}")
 

@@ -21,6 +21,16 @@ pub fn build(b: *std.Build) void {
     // Requires OpenBLAS to be installed (apt install libopenblas-dev)
     const use_blas = b.option(bool, "blas", "Link OpenBLAS for accelerated matrix operations") orelse false;
 
+    // zblas: Use pure Zig zblas library (default when not using OpenBLAS)
+    // Usage: zig build -Dmodel=whisper-tiny -Dzblas=true (or just omit -Dblas)
+    // No external dependencies required - works everywhere including WASM
+    // Set -Dzblas=false -Dblas=false to use pure Zig fallback in ops.zig (for benchmarking)
+    const use_zblas = b.option(bool, "zblas", "Use pure Zig zblas for matrix operations") orelse !use_blas;
+
+    // LTO: Enable Link-Time Optimization for better cross-module inlining
+    // Usage: zig build -Dmodel=whisper-tiny -Dzblas=true -Dlto=true
+    const use_lto = b.option(bool, "lto", "Enable Link-Time Optimization") orelse false;
+
     // ==========================================================================
     // Main executable (model-specific or generic demo)
     // ==========================================================================
@@ -76,6 +86,7 @@ pub fn build(b: *std.Build) void {
     // Create build options for BLAS support in ops module
     const ops_options = b.addOptions();
     ops_options.addOption(bool, "use_blas", use_blas);
+    ops_options.addOption(bool, "use_zblas", use_zblas and !use_blas);
 
     const ops_module = b.createModule(.{
         .root_source_file = b.path("src/core/ops.zig"),
@@ -84,6 +95,17 @@ pub fn build(b: *std.Build) void {
     });
     ops_module.addImport("tensor.zig", tensor_module);
     ops_module.addOptions("build_options", ops_options);
+
+    // Create zblas module (pure Zig, no external deps)
+    // Always create it but only import when use_zblas is true
+    const zblas_module = b.createModule(.{
+        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (use_zblas and !use_blas) {
+        ops_module.addImport("zblas", zblas_module);
+    }
 
     // Create BLAS module and link OpenBLAS if enabled
     if (use_blas) {
@@ -213,7 +235,13 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = exe_name,
         .root_module = exe_module,
+        .use_lld = true,
     });
+
+    // Enable LTO if requested
+    if (use_lto) {
+        exe.want_lto = true;
+    }
 
     b.installArtifact(exe);
 
@@ -226,6 +254,65 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the Tomoul inference engine");
     run_step.dependOn(&run_cmd.step);
+
+    // ==========================================================================
+    // Whisper HTTP Server
+    // ==========================================================================
+    if (filter) |model_name| {
+        if (std.mem.eql(u8, model_name, "whisper-tiny") or
+            std.mem.eql(u8, model_name, "whisper-base") or
+            std.mem.eql(u8, model_name, "whisper-small") or
+            std.mem.eql(u8, model_name, "whisper-medium") or
+            std.mem.eql(u8, model_name, "whisper-large"))
+        {
+            const server_module = b.createModule(.{
+                .root_source_file = b.path("src/models/whisper/server.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            server_module.addImport("tensor.zig", tensor_module);
+            server_module.addImport("ops.zig", ops_module);
+            server_module.addImport("loader.zig", loader_module);
+            server_module.addImport("quantization.zig", quantization_module);
+            server_module.addImport("attention.zig", attention_module);
+            server_module.addImport("transformer.zig", transformer_module);
+            server_module.addImport("audio.zig", audio_module);
+
+            // Add model module for whisper
+            if (model_module_path) |path| {
+                const whisper_model_module = b.createModule(.{
+                    .root_source_file = b.path(path),
+                    .target = target,
+                    .optimize = optimize,
+                });
+                whisper_model_module.addImport("tensor.zig", tensor_module);
+                whisper_model_module.addImport("ops.zig", ops_module);
+                whisper_model_module.addImport("loader.zig", loader_module);
+                whisper_model_module.addImport("quantization.zig", quantization_module);
+                whisper_model_module.addImport("attention.zig", attention_module);
+                whisper_model_module.addImport("transformer.zig", transformer_module);
+                whisper_model_module.addImport("cache.zig", cache_module);
+                whisper_model_module.addImport("audio.zig", audio_module);
+                server_module.addImport("model.zig", whisper_model_module);
+            }
+
+            const server_exe = b.addExecutable(.{
+                .name = "whisper-server",
+                .root_module = server_module,
+            });
+
+            b.installArtifact(server_exe);
+
+            const server_run_cmd = b.addRunArtifact(server_exe);
+            server_run_cmd.step.dependOn(b.getInstallStep());
+            if (b.args) |args| {
+                server_run_cmd.addArgs(args);
+            }
+
+            const server_step = b.step("whisper-server", "Build and run the Whisper HTTP server");
+            server_step.dependOn(&server_run_cmd.step);
+        }
+    }
 
     // ==========================================================================
     // Unit tests
@@ -291,12 +378,26 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
     });
 
+    // WASM build options - always use zblas (no OpenBLAS in WASM)
+    const wasm_ops_options = b.addOptions();
+    wasm_ops_options.addOption(bool, "use_blas", false);
+    wasm_ops_options.addOption(bool, "use_zblas", true);
+
     const wasm_ops_module = b.createModule(.{
         .root_source_file = b.path("src/core/ops.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall,
     });
     wasm_ops_module.addImport("tensor.zig", wasm_tensor_module);
+    wasm_ops_module.addOptions("build_options", wasm_ops_options);
+
+    // zblas for WASM (pure Zig - perfect for WASM)
+    const wasm_zblas_module = b.createModule(.{
+        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_ops_module.addImport("zblas", wasm_zblas_module);
 
     const wasm_quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
@@ -304,6 +405,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
     });
     wasm_quantization_module.addImport("tensor.zig", wasm_tensor_module);
+    wasm_quantization_module.addImport("ops.zig", wasm_ops_module);
 
     const wasm_loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
@@ -518,12 +620,26 @@ fn buildNativeLib(
         .optimize = optimize,
     });
 
+    // Create ops build options (use zblas for lib builds - no external deps)
+    const ops_build_options = b.addOptions();
+    ops_build_options.addOption(bool, "use_blas", false);
+    ops_build_options.addOption(bool, "use_zblas", true);
+
     const ops_module = b.createModule(.{
         .root_source_file = b.path("src/core/ops.zig"),
         .target = target,
         .optimize = optimize,
     });
     ops_module.addImport("tensor.zig", tensor_module);
+    ops_module.addOptions("build_options", ops_build_options);
+
+    // zblas for native lib builds (pure Zig - no external dependencies)
+    const zblas_module = b.createModule(.{
+        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ops_module.addImport("zblas", zblas_module);
 
     const quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
@@ -540,6 +656,7 @@ fn buildNativeLib(
     });
     loader_module.addImport("tensor.zig", tensor_module);
     loader_module.addImport("quantization.zig", quantization_module);
+    loader_module.addImport("ops.zig", ops_module);
 
     // Generic attention module (supports F32, Q8, Q4, Q8_K) - Native
     const attention_module = b.createModule(.{
@@ -562,6 +679,14 @@ fn buildNativeLib(
     transformer_module.addImport("quantization.zig", quantization_module);
     transformer_module.addImport("attention.zig", attention_module);
 
+    // Audio module (mel spectrogram, FFT, audio loading - pure Zig) - Native lib
+    const audio_module = b.createModule(.{
+        .root_source_file = b.path("src/core/audio.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audio_module.addImport("tensor.zig", tensor_module);
+
     // Create the model module
     const model_module = b.createModule(.{
         .root_source_file = b.path(model_module_path),
@@ -574,6 +699,7 @@ fn buildNativeLib(
     model_module.addImport("quantization.zig", quantization_module);
     model_module.addImport("attention.zig", attention_module);
     model_module.addImport("transformer.zig", transformer_module);
+    model_module.addImport("audio.zig", audio_module);
 
     // Create build options for bundled/lite mode
     const options = b.addOptions();

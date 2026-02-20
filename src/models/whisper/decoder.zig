@@ -851,107 +851,52 @@ pub const WhisperDecoder = struct {
         var num_tokens: usize = prompt_tokens.len;
 
         // Process prompt tokens one-by-one to fill the self-attention KV cache
-        // (or process all at once with standard forward, then warm up cache)
-        // For simplicity, we process prompt with forwardWithCache first
-        var logits = try self.forwardWithCache(prompt_tokens, cached_cross_kvs);
-        const vocab_size = self.cfg.n_vocab;
-        const last_logits = logits.data[(prompt_tokens.len - 1) * vocab_size ..][0..vocab_size];
-        var next_token = argmax(last_logits);
-        logits.deinit();
+        // This ensures the cache state matches what we use for generation
+        var final_hidden: Tensor = undefined;
+        var final_hidden_valid = false;
+        defer if (final_hidden_valid) final_hidden.deinit();
 
-        // Warm up self-attention cache with prompt tokens
         for (prompt_tokens, 0..) |tok, pos| {
             const single_tok = [_]u32{tok};
             var emb = try self.embedTokens(&single_tok, pos);
-            defer emb.deinit();
 
-            // Pass through each layer, filling the cache
+            // Pass through each layer with proper KV cache update
             var x = emb;
             var x_owned = false;
-            defer if (x_owned) x.deinit();
 
             for (w.blocks, 0..) |*block, layer_i| {
-                // Project only K, V for this token and add to cache
-                // (We don't need the output, just filling the cache)
-                const attn_config = AttentionConfig{
-                    .num_heads = self.cfg.n_text_head,
-                    .hidden_dim = self.cfg.n_text_state,
-                    .head_dim = self.cfg.headDim(),
-                };
-
-                var ln = try ops.layerNorm(allocator, &x, &block.self_attn_ln_gamma, &block.self_attn_ln_beta, 1e-5);
-                defer ln.deinit();
-
-                // Project K, V and add to cache
-                var k = try ops.matmul(allocator, &ln, &block.self_attn.k_weight);
-                defer k.deinit();
-                try ops.addBiasInPlace(&k, &block.self_attn.k_bias);
-
-                var v = try ops.matmul(allocator, &ln, &block.self_attn.v_weight);
-                defer v.deinit();
-                try ops.addBiasInPlace(&v, &block.self_attn.v_bias);
-
-                self_kv_caches[layer_i].append(&k, &v);
-
-                // Continue forward for next layer (but only if we have more layers)
-                if (layer_i < n_layers - 1) {
-                    // Simple attention for warmup - we need the embeddings to flow through
-                    var self_attn_out = try attention.multiHeadCausalAttention(
-                        Tensor,
-                        allocator,
-                        &ln,
-                        &block.self_attn,
-                        attn_config,
-                    );
-                    defer self_attn_out.deinit();
-
-                    var x1 = try ops.add(allocator, &x, &self_attn_out);
-                    defer x1.deinit();
-
-                    // Cross attention
-                    const cross_config = CrossAttentionConfig{
-                        .num_heads = self.cfg.n_text_head,
-                        .decoder_hidden = self.cfg.n_text_state,
-                        .encoder_hidden = self.cfg.n_text_state,
-                        .head_dim = self.cfg.headDim(),
-                    };
-
-                    var cross_ln = try ops.layerNorm(allocator, &x1, &block.cross_attn_ln_gamma, &block.cross_attn_ln_beta, 1e-5);
-                    defer cross_ln.deinit();
-
-                    var cross_out = try attention.multiHeadCrossAttentionWithCache(
-                        Tensor,
-                        allocator,
-                        &cross_ln,
-                        &cached_cross_kvs[layer_i],
-                        &block.cross_attn,
-                        cross_config,
-                    );
-                    defer cross_out.deinit();
-
-                    var x2 = try ops.add(allocator, &x1, &cross_out);
-                    defer x2.deinit();
-
-                    // FFN
-                    var ffn_ln = try ops.layerNorm(allocator, &x2, &block.ffn_ln_gamma, &block.ffn_ln_beta, 1e-5);
-                    defer ffn_ln.deinit();
-
-                    var fc1 = try ops.matmul(allocator, &ffn_ln, &block.ffn_fc1_weight);
-                    defer fc1.deinit();
-                    try ops.addBiasInPlace(&fc1, &block.ffn_fc1_bias);
-                    ops.geluExact(&fc1);
-
-                    var fc2 = try ops.matmul(allocator, &fc1, &block.ffn_fc2_weight);
-                    try ops.addBiasInPlace(&fc2, &block.ffn_fc2_bias);
-
-                    const x3 = try ops.add(allocator, &x2, &fc2);
-                    fc2.deinit();
-
-                    if (x_owned) x.deinit();
-                    x = x3;
-                    x_owned = true;
-                }
+                const new_x = try self.forwardBlockSingleToken(
+                    allocator,
+                    &x,
+                    &self_kv_caches[layer_i],
+                    &cached_cross_kvs[layer_i],
+                    block,
+                );
+                if (x_owned) x.deinit() else emb.deinit();
+                x = new_x;
+                x_owned = true;
             }
+
+            // Keep the final hidden state from the last prompt token
+            if (final_hidden_valid) final_hidden.deinit();
+            final_hidden = x;
+            final_hidden_valid = true;
+        }
+
+        // Compute logits for first generated token from final prompt hidden state
+        const vocab_size = self.cfg.n_vocab;
+        var next_token: u32 = undefined;
+        {
+            var prompt_norm = try ops.layerNorm(allocator, &final_hidden, &w.ln_gamma, &w.ln_beta, 1e-5);
+            defer prompt_norm.deinit();
+
+            var prompt_emb_t = try ops.transpose(allocator, &w.token_embedding);
+            defer prompt_emb_t.deinit();
+
+            var prompt_logits = try ops.matmul(allocator, &prompt_norm, &prompt_emb_t);
+            defer prompt_logits.deinit();
+
+            next_token = argmax(prompt_logits.data[0..vocab_size]);
         }
 
         // Now generate new tokens using full KV cache

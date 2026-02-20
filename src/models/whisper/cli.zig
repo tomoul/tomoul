@@ -11,6 +11,7 @@ const std = @import("std");
 
 // Use module imports from build.zig
 const Tensor = @import("tensor.zig").Tensor;
+const ops = @import("ops.zig");
 const loader_mod = @import("loader.zig");
 const ModelLoader = loader_mod.ModelLoader;
 const LoadError = loader_mod.LoadError;
@@ -59,6 +60,13 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // Initialize execution context for parallel matrix operations
+    // Uses direct thread spawning (no thread pool overhead or shutdown issues)
+    var ctx = ops.Context.initMultiThreaded(allocator, null);
+    defer ctx.deinit();
+    ops.initGlobalContext(&ctx);
+    defer ops.deinitGlobalContext();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);

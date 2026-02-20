@@ -35,7 +35,7 @@ pub const LayerKVCache = struct {
         errdefer k_cache.deinit();
 
         var v_shape = [_]usize{ max_seq_len, hidden_dim };
-        var v_cache = try Tensor.init(allocator, &v_shape);
+        const v_cache = try Tensor.init(allocator, &v_shape);
 
         return Self{
             .k_cache = k_cache,
