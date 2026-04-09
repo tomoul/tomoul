@@ -226,26 +226,27 @@ pub const SentenceTransformerModel = struct {
     }
 
     /// Run forward pass: token IDs → hidden states (before pooling)
-    pub fn forward(self: *Self, input_ids: []const u32, attention_mask: []const u32, token_type_ids: []const u32) !Tensor {
+    /// Uses a scratch arena allocator for all temporaries to minimize allocation overhead.
+    pub fn forward(self: *Self, scratch: std.mem.Allocator, input_ids: []const u32, attention_mask: []const u32, token_type_ids: []const u32) !Tensor {
         const seq_len = input_ids.len;
         const config = self.config;
         const transformer_config = config.getTransformerConfig();
 
         // 1. Embeddings: word + position + token_type
-        var word_emb = try ops.embedding(self.allocator, input_ids, &self.word_embeddings);
+        var word_emb = try ops.embedding(scratch, input_ids, &self.word_embeddings);
         defer word_emb.deinit();
 
         // BERT position IDs start at 0 (no offset, unlike RoBERTa)
-        const position_ids = try self.allocator.alloc(u32, seq_len);
-        defer self.allocator.free(position_ids);
+        const position_ids = try scratch.alloc(u32, seq_len);
+        defer scratch.free(position_ids);
         for (position_ids, 0..) |*p, i| {
             p.* = @intCast(i);
         }
 
-        var pos_emb = try ops.embedding(self.allocator, position_ids, &self.position_embeddings);
+        var pos_emb = try ops.embedding(scratch, position_ids, &self.position_embeddings);
         defer pos_emb.deinit();
 
-        var type_emb = try ops.embedding(self.allocator, token_type_ids, &self.token_type_embeddings);
+        var type_emb = try ops.embedding(scratch, token_type_ids, &self.token_type_embeddings);
         defer type_emb.deinit();
 
         // Combine embeddings
@@ -254,7 +255,7 @@ pub const SentenceTransformerModel = struct {
 
         // Embedding layer norm
         var hidden = try ops.layerNorm(
-            self.allocator,
+            scratch,
             &word_emb,
             &self.embed_ln_gamma,
             &self.embed_ln_beta,
@@ -267,7 +268,7 @@ pub const SentenceTransformerModel = struct {
         switch (self.weights) {
             .f32 => |f| {
                 output = try transformer.transformerStackF32(
-                    self.allocator,
+                    scratch,
                     &hidden,
                     f.blocks,
                     transformer_config,
@@ -275,7 +276,7 @@ pub const SentenceTransformerModel = struct {
             },
             .q8k => |q| {
                 output = try transformer.transformerStackQ8K(
-                    self.allocator,
+                    scratch,
                     &hidden,
                     q.blocks,
                     transformer_config,
@@ -290,12 +291,18 @@ pub const SentenceTransformerModel = struct {
 
     /// Compute embedding for a single text
     /// Returns a normalized 384-dim vector
+    /// Uses an arena allocator for all inference temporaries — bulk-freed after each call.
     pub fn embed(self: *Self, tokenizer: *Tokenizer, text: []const u8) ![384]f32 {
         var enc = try tokenizer.encode(text);
         defer enc.deinit(self.allocator);
 
-        var hidden = try self.forward(enc.input_ids, enc.attention_mask, enc.token_type_ids);
-        defer hidden.deinit();
+        // Use arena for forward pass scratch memory — all temporaries bulk-freed at end
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        var hidden = try self.forward(scratch, enc.input_ids, enc.attention_mask, enc.token_type_ids);
+        // No need to defer hidden.deinit() — arena handles it
 
         // Mean pooling over non-padding tokens
         var pooled = meanPool(&hidden, enc.attention_mask, self.config.hidden_dim);

@@ -161,8 +161,8 @@ pub fn transformerBlock(
     weights: *const TransformerBlockWeights(WeightType),
     config: TransformerConfig,
 ) !Tensor {
-    // 1. Multi-head attention with generic weights
-    var attn_output = try attention_generic.multiHeadAttention(
+    // 1. Multi-head attention with generic weights (fused — no per-head copies)
+    var attn_output = try attention_generic.multiHeadAttentionFused(
         WeightType,
         allocator,
         input,
@@ -197,20 +197,21 @@ pub fn transformerBlock(
 
     // Second linear: intermediate -> hidden (weight pre-transposed)
     var ff_output = try matmulWithWeight(WeightType, allocator, &ff_hidden, &weights.ff_linear2_weight);
-    defer ff_output.deinit();
+    errdefer ff_output.deinit();
     try ops.addBiasInPlace(&ff_output, &weights.ff_linear2_bias);
 
     // Residual connection
     try ops.addInPlace(&ff_output, &normed1);
 
-    // Layer norm
-    return ops.layerNorm(
-        allocator,
+    // Layer norm (in-place — ff_output IS the return value, no clone needed)
+    try ops.layerNormInPlace(
         &ff_output,
         &weights.ff_ln_gamma,
         &weights.ff_ln_beta,
         config.layer_norm_eps,
     );
+
+    return ff_output;
 }
 
 /// Generic forward pass through multiple Transformer blocks
