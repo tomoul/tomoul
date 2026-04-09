@@ -18,6 +18,7 @@ const quant = @import("quantization.zig");
 const QuantizedTensorQ8 = quant.QuantizedTensorQ8;
 const QuantizedTensorQ4 = quant.QuantizedTensorQ4;
 const QuantizedTensorQ8K = quant.QuantizedTensorQ8K;
+const F16Tensor = quant.F16Tensor;
 
 /// Weight format enumeration for runtime checks and debugging
 pub const WeightFormat = enum {
@@ -25,6 +26,7 @@ pub const WeightFormat = enum {
     q8,
     q4,
     q8_k,
+    f16,
 
     pub fn name(self: WeightFormat) []const u8 {
         return switch (self) {
@@ -32,6 +34,7 @@ pub const WeightFormat = enum {
             .q8 => "Q8_0",
             .q4 => "Q4_0",
             .q8_k => "Q8_K",
+            .f16 => "F16",
         };
     }
 
@@ -41,6 +44,7 @@ pub const WeightFormat = enum {
             .q8 => 8,
             .q4 => 4,
             .q8_k => 8,
+            .f16 => 16,
         };
     }
 };
@@ -86,6 +90,7 @@ pub const AttentionWeightsF32 = AttentionWeights(Tensor);
 pub const AttentionWeightsQ8 = AttentionWeights(QuantizedTensorQ8);
 pub const AttentionWeightsQ4 = AttentionWeights(QuantizedTensorQ4);
 pub const AttentionWeightsQ8K = AttentionWeights(QuantizedTensorQ8K);
+pub const AttentionWeightsF16 = AttentionWeights(F16Tensor);
 
 /// Configuration for attention mechanism
 pub const AttentionConfig = struct {
@@ -100,6 +105,7 @@ fn getWeightFormat(comptime T: type) WeightFormat {
     if (T == QuantizedTensorQ8) return .q8;
     if (T == QuantizedTensorQ4) return .q4;
     if (T == QuantizedTensorQ8K) return .q8_k;
+    if (T == F16Tensor) return .f16;
     @compileError("Unsupported weight type: " ++ @typeName(T));
 }
 
@@ -118,6 +124,7 @@ fn matmulWithWeight(
         .q8 => quant.matmulF32Q8Simd(allocator, input, weight),
         .q4 => quant.matmulF32Q4Simd(allocator, input, weight),
         .q8_k => quant.matmulF32Q8KSimd(allocator, input, weight),
+        .f16 => quant.matmulF32F16(allocator, input, weight),
     };
 }
 

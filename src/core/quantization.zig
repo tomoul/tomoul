@@ -1851,3 +1851,114 @@ test "Quantization accuracy with realistic weight distributions" {
     try std.testing.expect(q8k.compressionRatio() > 3.0); // ~3-4x for Q8_K
     try std.testing.expect(q4.compressionRatio() > 6.0); // ~8x for Q4
 }
+
+// ============================================================================
+// F16: Half-Precision Weight Storage (Phase 18)
+// ============================================================================
+
+/// F16 tensor: weights stored as float16, activations remain float32.
+/// 2× smaller than f32 with minimal precision loss (~3 decimal digits).
+pub const F16Tensor = struct {
+    data: []f16,
+    shape: []usize,
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, shape: []const usize) !Self {
+        var total: usize = 1;
+        for (shape) |dim| total *= dim;
+
+        const shape_copy = try allocator.dupe(usize, shape);
+        errdefer allocator.free(shape_copy);
+
+        const data = try allocator.alloc(f16, total);
+        errdefer allocator.free(data);
+
+        return .{
+            .data = data,
+            .shape = shape_copy,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.data);
+        self.allocator.free(self.shape);
+    }
+
+    pub fn numel(self: *const Self) usize {
+        var total: usize = 1;
+        for (self.shape) |dim| total *= dim;
+        return total;
+    }
+
+    /// Memory size in bytes (2 bytes per element)
+    pub fn sizeBytes(self: *const Self) usize {
+        return self.numel() * 2;
+    }
+
+    /// Compression ratio vs float32 (always ~2×)
+    pub fn compressionRatio(self: *const Self) f32 {
+        const f32_size: f32 = @floatFromInt(self.numel() * 4);
+        const f16_size: f32 = @floatFromInt(self.sizeBytes());
+        return f32_size / f16_size;
+    }
+};
+
+/// Convert float32 tensor to F16 (simple truncation)
+pub fn toF16(allocator: std.mem.Allocator, tensor: *const Tensor) !F16Tensor {
+    var result = try F16Tensor.init(allocator, tensor.shape);
+    errdefer result.deinit();
+
+    for (result.data, tensor.data) |*dst, src| {
+        dst.* = @floatCast(src);
+    }
+
+    return result;
+}
+
+/// Matrix multiply: float32 activations × float16 weights → float32 output
+/// Dispatches to zblas sgemmF16 when available, else uses SIMD fallback.
+pub fn matmulF32F16(
+    allocator: std.mem.Allocator,
+    a: *const Tensor,
+    b: *const F16Tensor,
+) !Tensor {
+    if (a.shape.len != 2 or b.shape.len != 2) {
+        return QuantError.InvalidShape;
+    }
+
+    const m = a.shape[0];
+    const k_a = a.shape[1];
+    const k_b = b.shape[0];
+    const n = b.shape[1];
+
+    if (k_a != k_b) {
+        return QuantError.ShapeMismatch;
+    }
+
+    const k = k_a;
+
+    var result_shape = [_]usize{ m, n };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    if (use_zblas) {
+        zblas.sgemmF16(m, n, k, a.data, b.data, result.data);
+        return result;
+    }
+
+    // Fallback: scalar f16→f32 matmul
+    @memset(result.data, 0.0);
+    for (0..m) |i| {
+        for (0..k) |kk| {
+            const a_val = a.data[i * k + kk];
+            for (0..n) |j| {
+                result.data[i * n + j] += a_val * @as(f32, @floatCast(b.data[kk * n + j]));
+            }
+        }
+    }
+
+    return result;
+}

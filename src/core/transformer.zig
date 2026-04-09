@@ -19,6 +19,7 @@ const attention_generic = @import("attention.zig");
 const QuantizedTensorQ8 = quant.QuantizedTensorQ8;
 const QuantizedTensorQ4 = quant.QuantizedTensorQ4;
 const QuantizedTensorQ8K = quant.QuantizedTensorQ8K;
+const F16Tensor = quant.F16Tensor;
 
 // Re-export from attention_generic for convenience
 pub const WeightFormat = attention_generic.WeightFormat;
@@ -71,6 +72,7 @@ pub const TransformerBlockWeightsF32 = TransformerBlockWeights(Tensor);
 pub const TransformerBlockWeightsQ8 = TransformerBlockWeights(QuantizedTensorQ8);
 pub const TransformerBlockWeightsQ4 = TransformerBlockWeights(QuantizedTensorQ4);
 pub const TransformerBlockWeightsQ8K = TransformerBlockWeights(QuantizedTensorQ8K);
+pub const TransformerBlockWeightsF16 = TransformerBlockWeights(F16Tensor);
 
 /// Configuration for Transformer
 pub const TransformerConfig = struct {
@@ -118,6 +120,7 @@ fn getWeightFormat(comptime T: type) WeightFormat {
     if (T == QuantizedTensorQ8) return .q8;
     if (T == QuantizedTensorQ4) return .q4;
     if (T == QuantizedTensorQ8K) return .q8_k;
+    if (T == F16Tensor) return .f16;
     @compileError("Unsupported weight type: " ++ @typeName(T));
 }
 
@@ -136,6 +139,7 @@ fn matmulWithWeight(
         .q8 => quant.matmulF32Q8Simd(allocator, input, weight),
         .q4 => quant.matmulF32Q4Simd(allocator, input, weight),
         .q8_k => quant.matmulF32Q8KSimd(allocator, input, weight),
+        .f16 => quant.matmulF32F16(allocator, input, weight),
     };
 }
 
@@ -341,6 +345,26 @@ pub fn transformerStackQ8K(
     config: TransformerConfig,
 ) !Tensor {
     return transformerStack(QuantizedTensorQ8K, allocator, input, blocks, config);
+}
+
+/// Transformer block with F16 weights
+pub fn transformerBlockF16(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const TransformerBlockWeightsF16,
+    config: TransformerConfig,
+) !Tensor {
+    return transformerBlock(F16Tensor, allocator, input, weights, config);
+}
+
+/// Transformer stack with F16 weights
+pub fn transformerStackF16(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    blocks: []const TransformerBlockWeightsF16,
+    config: TransformerConfig,
+) !Tensor {
+    return transformerStack(F16Tensor, allocator, input, blocks, config);
 }
 
 // ============================================================================

@@ -5,6 +5,7 @@ const quantization = @import("quantization.zig");
 const QuantizedTensorQ8 = quantization.QuantizedTensorQ8;
 const QuantizedTensorQ4 = quantization.QuantizedTensorQ4;
 const QuantizedTensorQ8K = quantization.QuantizedTensorQ8K;
+const F16Tensor = quantization.F16Tensor;
 
 /// Error types for model loading operations
 pub const LoadError = error{
@@ -24,6 +25,7 @@ pub const QuantFormat = enum(u8) {
     q8_0 = 1, // Q8_0: symmetric 8-bit per-tensor
     q4_0 = 2, // Q4_0: symmetric 4-bit per-tensor
     q8_k = 3, // Q8_K: symmetric 8-bit per-block (block_size=32)
+    f16 = 4, // F16: half-precision float16
 };
 
 /// Information about a tensor stored in the file
@@ -400,6 +402,40 @@ pub const ModelLoader = struct {
         return qtensor;
     }
 
+    /// Load tensor as F16 (half-precision)
+    pub fn getF16Tensor(self: *Self, name: []const u8) !F16Tensor {
+        if (self.quant_format != .f16) {
+            return LoadError.UnsupportedQuantFormat;
+        }
+
+        const info = self.tensors.get(name) orelse return LoadError.TensorNotFound;
+
+        const end_offset = info.data_offset + info.data_size;
+        if (end_offset > self.file_data.len) {
+            return LoadError.CorruptedFile;
+        }
+
+        var ftensor = try F16Tensor.init(self.allocator, info.shape);
+        errdefer ftensor.deinit();
+
+        // F16 format: N * 2 bytes of f16 data (no scale needed)
+        const expected_size = ftensor.numel() * 2;
+        if (info.data_size != expected_size) {
+            return LoadError.CorruptedFile;
+        }
+
+        const offset: usize = @intCast(info.data_offset);
+        for (ftensor.data, 0..) |*out, i| {
+            const byte_offset = offset + i * 2;
+            out.* = @bitCast([2]u8{
+                self.file_data[byte_offset],
+                self.file_data[byte_offset + 1],
+            });
+        }
+
+        return ftensor;
+    }
+
     /// Get tensor by name with automatic dequantization
     /// For quantized files, dequantizes to float32. For float32 files, same as getTensor.
     /// Useful for embeddings and layer norm weights that should remain float32.
@@ -510,6 +546,21 @@ pub const ModelLoader = struct {
                     });
                     const q: i8 = @bitCast(self.file_data[data_start + i]);
                     out.* = @as(f32, @floatFromInt(q)) * scale;
+                }
+            },
+            .f16 => {
+                // F16: N * 2 bytes of f16 data
+                const expected_size = tensor.size() * 2;
+                if (info.data_size != expected_size) {
+                    return LoadError.CorruptedFile;
+                }
+                for (tensor.data, 0..) |*out, i| {
+                    const byte_offset = offset + i * 2;
+                    const f16_val: f16 = @bitCast([2]u8{
+                        self.file_data[byte_offset],
+                        self.file_data[byte_offset + 1],
+                    });
+                    out.* = @floatCast(f16_val);
                 }
             },
         }
