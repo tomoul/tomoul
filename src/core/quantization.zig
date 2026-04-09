@@ -2,6 +2,11 @@ const std = @import("std");
 const tensor_import = @import("tensor.zig");
 const Tensor = tensor_import.Tensor;
 
+// zblas support: check if zblas module is available in the build
+const ops_module = @import("ops.zig");
+const use_zblas: bool = @hasDecl(ops_module, "use_zblas") and ops_module.use_zblas;
+const zblas = if (use_zblas) @import("zblas") else undefined;
+
 /// Quantization error types
 pub const QuantError = error{
     InvalidShape,
@@ -211,6 +216,12 @@ pub fn matmulF32Q8Simd(
     errdefer result.deinit();
 
     const scale = b.scale;
+
+    // Use zblas Q8 SGEMM when available (cache-blocked, skinny-M optimized)
+    if (use_zblas) {
+        zblas.sgemmQ8(m, n, k, a.data, b.data, scale, result.data);
+        return result;
+    }
 
     // Initialize result to zero
     @memset(result.data, 0.0);
@@ -524,6 +535,12 @@ pub fn matmulF32Q8KSimd(
     var result_shape = [_]usize{ m, n };
     var result = try Tensor.init(allocator, &result_shape);
     errdefer result.deinit();
+
+    // Use zblas Q8_K SGEMM when available (cache-blocked, skinny-M optimized)
+    if (use_zblas) {
+        zblas.sgemmQ8K(m, n, k, a.data, b.data, b.scales, b.block_size, result.data);
+        return result;
+    }
 
     // Initialize result to zero
     @memset(result.data, 0.0);

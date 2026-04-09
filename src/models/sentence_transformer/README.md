@@ -32,26 +32,29 @@ In Q8_K mode, only transformer block linear weights are quantized. Embeddings an
 
 Measured on AMD CPU + RTX 4090, 50 iterations, warm start:
 
-| Engine | Single (ms) | 5-sent seq (ms/sent) | 10-sent (ms/sent) | Notes |
-|---|---|---|---|---|
-| **Tomoul** (Zig, ReleaseFast) | 8.7 | 6.0 | 6.2 | Node.js FFI via koffi |
-| PyTorch CPU (MKL) | 3.6 | 3.6 | 1.0 (batched) | `transformers` pipeline |
-| PyTorch CUDA (RTX 4090) | 2.6 | — | 0.55 (batched) | GPU baseline |
+| Engine | Weights | Single (ms) | 5-sent (ms/sent) | 10-sent (ms/sent) | Notes |
+|---|---|---|---|---|---|
+| **Tomoul** (Zig, ReleaseFast) | **Q8_K** | **3.5** | **3.0** | **2.7** | Node.js FFI via koffi |
+| **Tomoul** (Zig, ReleaseFast) | F32 | 8.7 | 6.0 | 5.8 | Node.js FFI via koffi |
+| PyTorch CPU (MKL) | F32 | 3.6 | 3.6 | 1.0 (batched) | `transformers` pipeline |
+| PyTorch CUDA (RTX 4090) | F32 | 2.6 | — | 0.55 (batched) | GPU baseline |
 
-**Optimizations applied:** arena allocator for inference scratch, fused strided multi-head attention (no per-head copies), vectorized GELU (Padé tanh approximation), SIMD bias addition, in-place layerNorm, zblas skinny-M SGEMM kernel. See [zblas](https://github.com/tomoul/zblas) for BLAS-level optimization details.
+Q8_K is the recommended variant: **3.6× smaller** model (24 MB vs 87 MB), **2.5× faster** than F32, and matches or beats PyTorch CPU — with negligible accuracy loss (cosine similarity ≥ 0.9997 vs F32).
 
-**Accuracy:** All 5 reference sentences achieve cosine similarity ≥ 0.99 against HuggingFace `sentence-transformers` output.
+**Optimizations applied:** arena allocator for inference scratch, fused strided multi-head attention (no per-head copies), vectorized GELU (Padé tanh approximation), SIMD bias addition, in-place layerNorm, zblas skinny-M SGEMM kernel, zblas Q8_K weight-only quantized SGEMM. See [zblas](https://github.com/tomoul/zblas) for BLAS-level optimization details.
+
+**Accuracy:** All 5 reference sentences achieve cosine similarity ≥ 0.99 against HuggingFace `sentence-transformers` output (both F32 and Q8_K variants).
 
 ## Quick Start
 
 ### Generate Weights
 
 ```bash
-# F32 (full precision)
+# F32 (full precision, ~87 MB)
 python tools/export_sentence_transformer.py -o artifacts/
 
-# Q8_K (3.6× smaller, negligible accuracy loss)
-python tools/export_sentence_transformer.py -o artifacts/ -q q8_0
+# Q8_K (recommended: ~24 MB, 2.5× faster inference)
+python tools/export_sentence_transformer.py -o artifacts/ -q q8_k
 ```
 
 Requires: `pip install torch transformers sentence-transformers`

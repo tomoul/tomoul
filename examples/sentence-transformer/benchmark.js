@@ -27,8 +27,16 @@ if (platform === 'linux') {
 }
 
 const PROJECT_ROOT = path.join(__dirname, '../..');
+
+// Weight variant: 'f32' (default) or 'q8k'
+const VARIANT = process.env.TOMOUL_VARIANT || 'f32';
+const weightFiles = {
+    'f32': 'all_minilm_l6_v2.tl',
+    'q8k': 'all_minilm_l6_v2_q8k.tl',
+};
+
 const LIB_PATH = path.join(PROJECT_ROOT, 'zig-out/lib', `libtomoul_sentence_transformer${libSuffix}`);
-const WEIGHTS_PATH = path.join(PROJECT_ROOT, 'artifacts/all_minilm_l6_v2.tl');
+const WEIGHTS_PATH = path.join(PROJECT_ROOT, 'artifacts', weightFiles[VARIANT] || weightFiles['f32']);
 const VOCAB_PATH = path.join(PROJECT_ROOT, 'artifacts/all_minilm_l6_v2_vocab.txt');
 
 // Also check release/lib/ if zig-out doesn't have it

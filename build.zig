@@ -126,6 +126,9 @@ pub fn build(b: *std.Build) void {
     });
     quantization_module.addImport("tensor.zig", tensor_module);
     quantization_module.addImport("ops.zig", ops_module);
+    if (use_zblas and !use_blas) {
+        quantization_module.addImport("zblas", zblas_module);
+    }
 
     const loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
@@ -447,6 +450,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm_quantization_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_quantization_module.addImport("ops.zig", wasm_ops_module);
+    wasm_quantization_module.addImport("zblas", wasm_zblas_dep.module("zblas"));
 
     const wasm_loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
@@ -695,6 +699,7 @@ fn buildNativeLib(
     });
     quantization_module.addImport("tensor.zig", tensor_module);
     quantization_module.addImport("ops.zig", ops_module);
+    quantization_module.addImport("zblas", lib_zblas_dep.module("zblas"));
 
     const loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
