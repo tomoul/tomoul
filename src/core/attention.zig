@@ -121,6 +121,26 @@ fn matmulWithWeight(
     };
 }
 
+/// Fused matrix multiplication + bias: C = input @ weight + bias
+fn matmulWithWeightBias(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weight: *const WeightType,
+    bias: *const Tensor,
+) !Tensor {
+    const format = comptime getWeightFormat(WeightType);
+
+    if (format == .f32) {
+        return ops.matmulBias(allocator, input, weight, bias);
+    }
+
+    var result = try matmulWithWeight(WeightType, allocator, input, weight);
+    errdefer result.deinit();
+    try ops.addBiasInPlace(&result, bias);
+    return result;
+}
+
 /// Scaled dot-product attention (float32 only, used after projection)
 /// Q: [query_len, head_dim]
 /// K: [key_len, head_dim]
@@ -256,16 +276,12 @@ pub fn multiHeadAttentionFused(
     const head_dim = config.head_dim;
 
     // Project Q, K, V — these are the only large allocations
-    var q = try matmulWithWeight(WeightType, allocator, input, &weights.q_weight);
+    var q = try matmulWithWeightBias(WeightType, allocator, input, &weights.q_weight, &weights.q_bias);
     defer q.deinit();
-    var k = try matmulWithWeight(WeightType, allocator, input, &weights.k_weight);
+    var k = try matmulWithWeightBias(WeightType, allocator, input, &weights.k_weight, &weights.k_bias);
     defer k.deinit();
-    var v = try matmulWithWeight(WeightType, allocator, input, &weights.v_weight);
+    var v = try matmulWithWeightBias(WeightType, allocator, input, &weights.v_weight, &weights.v_bias);
     defer v.deinit();
-
-    try ops.addBiasInPlace(&q, &weights.q_bias);
-    try ops.addBiasInPlace(&k, &weights.k_bias);
-    try ops.addBiasInPlace(&v, &weights.v_bias);
 
     // Allocate output [seq_len, hidden_dim] and one shared scores buffer [seq_len, seq_len]
     var out_shape = [_]usize{ seq_len, hidden_dim };
@@ -291,9 +307,8 @@ pub fn multiHeadAttentionFused(
     }
 
     // Final output projection
-    var output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
+    const output = try matmulWithWeightBias(WeightType, allocator, &concat, &weights.o_weight, &weights.o_bias);
     concat.deinit();
-    try ops.addBiasInPlace(&output, &weights.o_bias);
 
     return output;
 }
@@ -317,16 +332,12 @@ pub fn multiHeadAttention(
     const head_dim = config.head_dim;
 
     // Project Q, K, V using appropriate matmul for weight type
-    var q = try matmulWithWeight(WeightType, allocator, input, &weights.q_weight);
+    var q = try matmulWithWeightBias(WeightType, allocator, input, &weights.q_weight, &weights.q_bias);
     defer q.deinit();
-    var k = try matmulWithWeight(WeightType, allocator, input, &weights.k_weight);
+    var k = try matmulWithWeightBias(WeightType, allocator, input, &weights.k_weight, &weights.k_bias);
     defer k.deinit();
-    var v = try matmulWithWeight(WeightType, allocator, input, &weights.v_weight);
+    var v = try matmulWithWeightBias(WeightType, allocator, input, &weights.v_weight, &weights.v_bias);
     defer v.deinit();
-
-    try ops.addBiasInPlace(&q, &weights.q_bias);
-    try ops.addBiasInPlace(&k, &weights.k_bias);
-    try ops.addBiasInPlace(&v, &weights.v_bias);
 
     // Split into heads and compute attention
     var head_outputs = try allocator.alloc(Tensor, num_heads);
@@ -367,8 +378,7 @@ pub fn multiHeadAttention(
     defer concat.deinit();
 
     // Final projection using appropriate matmul for weight type
-    var output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
-    try ops.addBiasInPlace(&output, &weights.o_bias);
+    const output = try matmulWithWeightBias(WeightType, allocator, &concat, &weights.o_weight, &weights.o_bias);
 
     return output;
 }

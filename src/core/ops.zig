@@ -408,6 +408,60 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
     return result;
 }
 
+/// Fused matrix multiplication + bias: C = A @ B + broadcast(bias)
+/// A: [M, K], B: [K, N], bias: [N] → result: [M, N]
+/// Eliminates the separate addBiasInPlace pass.
+pub fn matmulBias(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor, bias: *const Tensor) !Tensor {
+    if (a.shape.len != 2 or b.shape.len != 2 or bias.shape.len != 1) {
+        return OpsError.InvalidShape;
+    }
+
+    const m = a.shape[0];
+    const k_a = a.shape[1];
+    const k_b = b.shape[0];
+    const n = b.shape[1];
+
+    if (k_a != k_b) return OpsError.ShapeMismatch;
+    if (bias.shape[0] != n) return OpsError.ShapeMismatch;
+
+    const k = k_a;
+
+    var result_shape = [_]usize{ m, n };
+    var result = try Tensor.init(allocator, &result_shape);
+    errdefer result.deinit();
+
+    if (use_zblas) {
+        zblas.sgemmBias(m, n, k, a.data, b.data, bias.data.ptr, result.data);
+        return result;
+    }
+
+    // Fallback: sgemm + separate bias
+    if (use_blas) {
+        blas.sgemm(m, n, k, a.data, b.data, result.data, 1.0, 0.0);
+    } else {
+        @memset(result.data, 0.0);
+        matmulRowRange(a.data, b.data, result.data, k, n, 0, m);
+    }
+
+    // Add bias to each row
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+    for (0..m) |row| {
+        const row_start = row * n;
+        var col: usize = 0;
+        while (col + VEC_WIDTH <= n) : (col += VEC_WIDTH) {
+            const c_ptr = result.data[row_start + col ..][0..VEC_WIDTH];
+            const b_vec: Vec = bias.data[col..][0..VEC_WIDTH].*;
+            c_ptr.* = @as(Vec, c_ptr.*) + b_vec;
+        }
+        while (col < n) : (col += 1) {
+            result.data[row_start + col] += bias.data[col];
+        }
+    }
+
+    return result;
+}
+
 /// Parallel matrix multiplication: C = A @ B
 /// Splits M dimension across threads for parallel execution.
 /// Falls back to single-threaded matmul if Context is not parallel or workload is small.

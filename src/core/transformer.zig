@@ -139,6 +139,28 @@ fn matmulWithWeight(
     };
 }
 
+/// Fused matrix multiplication + bias: C = input @ weight + bias
+/// Uses fused sgemmBias for f32, separate matmul+bias for quantized.
+fn matmulWithWeightBias(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weight: *const WeightType,
+    bias: *const Tensor,
+) !Tensor {
+    const format = comptime getWeightFormat(WeightType);
+
+    if (format == .f32) {
+        return ops.matmulBias(allocator, input, weight, bias);
+    }
+
+    // Quantized: separate matmul then bias
+    var result = try matmulWithWeight(WeightType, allocator, input, weight);
+    errdefer result.deinit();
+    try ops.addBiasInPlace(&result, bias);
+    return result;
+}
+
 /// Generic forward pass through a single Transformer block
 /// Architecture (post-LN style):
 ///   Input
@@ -188,17 +210,15 @@ pub fn transformerBlock(
     // FFN(x) = Linear(GELU(Linear(x)))
 
     // First linear: hidden -> intermediate (weight pre-transposed)
-    var ff_hidden = try matmulWithWeight(WeightType, allocator, &normed1, &weights.ff_linear1_weight);
+    var ff_hidden = try matmulWithWeightBias(WeightType, allocator, &normed1, &weights.ff_linear1_weight, &weights.ff_linear1_bias);
     defer ff_hidden.deinit();
-    try ops.addBiasInPlace(&ff_hidden, &weights.ff_linear1_bias);
 
     // GELU activation
     ops.gelu(&ff_hidden);
 
     // Second linear: intermediate -> hidden (weight pre-transposed)
-    var ff_output = try matmulWithWeight(WeightType, allocator, &ff_hidden, &weights.ff_linear2_weight);
+    var ff_output = try matmulWithWeightBias(WeightType, allocator, &ff_hidden, &weights.ff_linear2_weight, &weights.ff_linear2_bias);
     errdefer ff_output.deinit();
-    try ops.addBiasInPlace(&ff_output, &weights.ff_linear2_bias);
 
     // Residual connection
     try ops.addInPlace(&ff_output, &normed1);
