@@ -1281,8 +1281,54 @@ pub fn conv1d(
     var output = try Tensor.init(allocator, &out_shape);
     errdefer output.deinit();
 
-    // Naive convolution implementation
-    for (0..out_channels) |oc| {
+    if (use_zblas) {
+        // Repack weights from [C_out, C_in, K] to [C_in, K, C_out] for SIMD
+        const repack_len = out_channels * in_channels * kernel_size;
+        const repacked = try allocator.alloc(f32, repack_len);
+        defer allocator.free(repacked);
+        zblas.conv1dRepackWeight(
+            out_channels,
+            in_channels,
+            kernel_size,
+            weight.data.ptr,
+            repacked.ptr,
+        );
+
+        const bias_ptr: ?[*]const f32 = if (bias) |b| b.data.ptr else null;
+
+        if (padding == 0) {
+            zblas.conv1dNoPad(
+                out_channels,
+                in_channels,
+                out_width,
+                in_width,
+                kernel_size,
+                stride,
+                input.data.ptr,
+                repacked.ptr,
+                bias_ptr,
+                output.data.ptr,
+                .none,
+            );
+        } else {
+            zblas.conv1dFull(
+                out_channels,
+                in_channels,
+                out_width,
+                in_width,
+                kernel_size,
+                stride,
+                padding,
+                input.data.ptr,
+                repacked.ptr,
+                bias_ptr,
+                output.data.ptr,
+                .none,
+            );
+        }
+    } else {
+        // Naive convolution implementation
+        for (0..out_channels) |oc| {
         for (0..out_width) |ow| {
             var sum_val: f32 = 0.0;
 
@@ -1309,6 +1355,122 @@ pub fn conv1d(
 
             // output[oc, ow]
             output.data[oc * out_width + ow] = sum_val;
+        }
+    }
+    }
+
+    return output;
+}
+
+/// Repack conv1d weight from [C_out, C_in, K] to zblas SIMD-friendly [C_in, K, C_out].
+/// Call once at model init; pass the result to conv1dRepacked.
+pub fn repackConv1dWeight(allocator: std.mem.Allocator, weight: *const Tensor) !Tensor {
+    if (weight.shape.len != 3) return OpsError.InvalidShape;
+    const out_channels = weight.shape[0];
+    const in_channels = weight.shape[1];
+    const kernel_size = weight.shape[2];
+    // Repacked tensor has shape [C_in, K, C_out] but same total size
+    var shape = [_]usize{ in_channels, kernel_size, out_channels };
+    var repacked = try Tensor.init(allocator, &shape);
+    errdefer repacked.deinit();
+    if (use_zblas) {
+        zblas.conv1dRepackWeight(out_channels, in_channels, kernel_size, weight.data.ptr, repacked.data.ptr);
+    } else {
+        // Scalar fallback: just copy in repacked order
+        for (0..in_channels) |ic| {
+            for (0..kernel_size) |k| {
+                const dst_base = (ic * kernel_size + k) * out_channels;
+                for (0..out_channels) |oc| {
+                    repacked.data[dst_base + oc] = weight.data[oc * (in_channels * kernel_size) + ic * kernel_size + k];
+                }
+            }
+        }
+    }
+    return repacked;
+}
+
+/// Conv1d using pre-repacked weights (layout [C_in, K, C_out]).
+/// Avoids per-call weight repacking overhead. Use with repackConv1dWeight.
+pub fn conv1dRepacked(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    repacked_weight: *const Tensor,
+    out_channels: usize,
+    in_channels: usize,
+    kernel_size: usize,
+    bias: ?*const Tensor,
+    stride: usize,
+    padding: usize,
+) !Tensor {
+    if (input.shape.len != 2 or repacked_weight.shape.len != 3) {
+        return OpsError.InvalidShape;
+    }
+
+    const in_width = input.shape[1];
+    const padded_width = in_width + 2 * padding;
+    if (padded_width < kernel_size) {
+        return OpsError.InvalidShape;
+    }
+    const out_width = (padded_width - kernel_size) / stride + 1;
+
+    var out_shape = [_]usize{ out_channels, out_width };
+    var output = try Tensor.init(allocator, &out_shape);
+    errdefer output.deinit();
+
+    if (use_zblas) {
+        const bias_ptr: ?[*]const f32 = if (bias) |b| b.data.ptr else null;
+
+        if (padding == 0) {
+            zblas.conv1dNoPad(
+                out_channels,
+                in_channels,
+                out_width,
+                in_width,
+                kernel_size,
+                stride,
+                input.data.ptr,
+                repacked_weight.data.ptr,
+                bias_ptr,
+                output.data.ptr,
+                .none,
+            );
+        } else {
+            zblas.conv1dFull(
+                out_channels,
+                in_channels,
+                out_width,
+                in_width,
+                kernel_size,
+                stride,
+                padding,
+                input.data.ptr,
+                repacked_weight.data.ptr,
+                bias_ptr,
+                output.data.ptr,
+                .none,
+            );
+        }
+    } else {
+        // Scalar fallback: read from repacked [C_in, K, C_out] layout
+        for (0..out_channels) |oc| {
+            for (0..out_width) |ow| {
+                var sum_val: f32 = 0.0;
+                for (0..in_channels) |ic| {
+                    for (0..kernel_size) |k| {
+                        const in_pos_signed: i64 = @as(i64, @intCast(ow * stride + k)) - @as(i64, @intCast(padding));
+                        if (in_pos_signed >= 0 and in_pos_signed < @as(i64, @intCast(in_width))) {
+                            const in_pos: usize = @intCast(in_pos_signed);
+                            const in_val = input.data[ic * in_width + in_pos];
+                            const w_val = repacked_weight.data[(ic * kernel_size + k) * out_channels + oc];
+                            sum_val += in_val * w_val;
+                        }
+                    }
+                }
+                if (bias) |b| {
+                    sum_val += b.data[oc];
+                }
+                output.data[oc * out_width + ow] = sum_val;
+            }
         }
     }
 

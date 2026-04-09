@@ -31,6 +31,13 @@ pub const SileroVAD = struct {
     enc3_weight: Tensor, // [128, 64, 3]
     enc3_bias: Tensor, // [128]
 
+    // Pre-repacked weights for SIMD conv1d (layout: [C_in, K, C_out])
+    stft_basis_repacked: Tensor,
+    enc0_weight_repacked: Tensor,
+    enc1_weight_repacked: Tensor,
+    enc2_weight_repacked: Tensor,
+    enc3_weight_repacked: Tensor,
+
     // LSTM weights (hidden_size=128, 4 gates packed)
     lstm_weights: ops.LSTMWeights,
 
@@ -119,6 +126,18 @@ pub const SileroVAD = struct {
         errdefer context_buffer.deinit();
         // Zero-initialized by Tensor.init
 
+        // Pre-repack weights for SIMD conv1d
+        var stft_basis_repacked = try ops.repackConv1dWeight(allocator, &stft_basis);
+        errdefer stft_basis_repacked.deinit();
+        var enc0_weight_repacked = try ops.repackConv1dWeight(allocator, &enc0_weight);
+        errdefer enc0_weight_repacked.deinit();
+        var enc1_weight_repacked = try ops.repackConv1dWeight(allocator, &enc1_weight);
+        errdefer enc1_weight_repacked.deinit();
+        var enc2_weight_repacked = try ops.repackConv1dWeight(allocator, &enc2_weight);
+        errdefer enc2_weight_repacked.deinit();
+        var enc3_weight_repacked = try ops.repackConv1dWeight(allocator, &enc3_weight);
+        errdefer enc3_weight_repacked.deinit();
+
         return Self{
             .allocator = allocator,
             .stft_basis = stft_basis,
@@ -130,6 +149,11 @@ pub const SileroVAD = struct {
             .enc2_bias = enc2_bias,
             .enc3_weight = enc3_weight,
             .enc3_bias = enc3_bias,
+            .stft_basis_repacked = stft_basis_repacked,
+            .enc0_weight_repacked = enc0_weight_repacked,
+            .enc1_weight_repacked = enc1_weight_repacked,
+            .enc2_weight_repacked = enc2_weight_repacked,
+            .enc3_weight_repacked = enc3_weight_repacked,
             .lstm_weights = ops.LSTMWeights{
                 .weight_ih = lstm_weight_ih,
                 .weight_hh = lstm_weight_hh,
@@ -154,6 +178,11 @@ pub const SileroVAD = struct {
         self.enc2_bias.deinit();
         self.enc3_weight.deinit();
         self.enc3_bias.deinit();
+        self.stft_basis_repacked.deinit();
+        self.enc0_weight_repacked.deinit();
+        self.enc1_weight_repacked.deinit();
+        self.enc2_weight_repacked.deinit();
+        self.enc3_weight_repacked.deinit();
         self.lstm_weights.weight_ih.deinit();
         self.lstm_weights.weight_hh.deinit();
         self.lstm_weights.bias_ih.deinit();
@@ -261,7 +290,7 @@ pub const SileroVAD = struct {
         }
 
         // Perform 1D convolution with stride=128 (hop size)
-        var stft_complex = try ops.conv1d(self.allocator, &audio_padded, &self.stft_basis, null, HOP_SIZE, 0);
+        var stft_complex = try ops.conv1dRepacked(self.allocator, &audio_padded, &self.stft_basis_repacked, 258, 1, 256, null, HOP_SIZE, 0);
         audio_padded.deinit();
         errdefer stft_complex.deinit();
 
@@ -302,23 +331,23 @@ pub const SileroVAD = struct {
         var enc_input = try features.clone(self.allocator);
         defer enc_input.deinit();
 
-        // Conv layer 0: stride=1, padding=1
-        var x0 = try ops.conv1d(self.allocator, &enc_input, &self.enc0_weight, &self.enc0_bias, 1, 1);
+        // Conv layer 0: stride=1, padding=1 [129,4]->[128,4]
+        var x0 = try ops.conv1dRepacked(self.allocator, &enc_input, &self.enc0_weight_repacked, 128, 129, 3, &self.enc0_bias, 1, 1);
         defer x0.deinit();
         ops.reluInPlace(&x0);
 
-        // Conv layer 1: stride=2, padding=1
-        var x1 = try ops.conv1d(self.allocator, &x0, &self.enc1_weight, &self.enc1_bias, 2, 1);
+        // Conv layer 1: stride=2, padding=1 [128,4]->[64,2]
+        var x1 = try ops.conv1dRepacked(self.allocator, &x0, &self.enc1_weight_repacked, 64, 128, 3, &self.enc1_bias, 2, 1);
         defer x1.deinit();
         ops.reluInPlace(&x1);
 
-        // Conv layer 2: stride=2, padding=1
-        var x2 = try ops.conv1d(self.allocator, &x1, &self.enc2_weight, &self.enc2_bias, 2, 1);
+        // Conv layer 2: stride=2, padding=1 [64,2]->[64,1]
+        var x2 = try ops.conv1dRepacked(self.allocator, &x1, &self.enc2_weight_repacked, 64, 64, 3, &self.enc2_bias, 2, 1);
         defer x2.deinit();
         ops.reluInPlace(&x2);
 
-        // Conv layer 3: stride=1, padding=1
-        var x3 = try ops.conv1d(self.allocator, &x2, &self.enc3_weight, &self.enc3_bias, 1, 1);
+        // Conv layer 3: stride=1, padding=1 [64,1]->[128,1]
+        var x3 = try ops.conv1dRepacked(self.allocator, &x2, &self.enc3_weight_repacked, 128, 64, 3, &self.enc3_bias, 1, 1);
         ops.reluInPlace(&x3);
 
         return x3;
