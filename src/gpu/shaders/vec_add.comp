@@ -1,0 +1,21 @@
+#version 450
+
+// Simple vector add: C[i] = A[i] + B[i]
+// Used as smoke test for Vulkan compute dispatch.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufferA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufferB { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer BufferC { float C[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < count) {
+        C[idx] = A[idx] + B[idx];
+    }
+}

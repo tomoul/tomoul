@@ -409,6 +409,34 @@ pub fn build(b: *std.Build) void {
     st_test_step.dependOn(&run_st_tests.step);
 
     // ==========================================================================
+    // Vulkan GPU compute tests
+    // ==========================================================================
+    {
+        const vulkan_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vulkan.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        vulkan_module.link_libc = true;
+        vulkan_module.linkSystemLibrary("vulkan", .{});
+
+        const gpu_test_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_vulkan_compute.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_test_module.addImport("vulkan", vulkan_module);
+
+        const gpu_tests = b.addTest(.{
+            .root_module = gpu_test_module,
+        });
+
+        const run_gpu_tests = b.addRunArtifact(gpu_tests);
+        const gpu_test_step = b.step("test-gpu", "Run Vulkan GPU compute tests");
+        gpu_test_step.dependOn(&run_gpu_tests.step);
+    }
+
+    // ==========================================================================
     // WebAssembly targets (data-driven from model_registry.zig)
     // ==========================================================================
     const wasm_target = b.resolveTargetQuery(.{
