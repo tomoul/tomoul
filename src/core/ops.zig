@@ -564,12 +564,17 @@ pub fn matvec(allocator: std.mem.Allocator, a: *const Tensor, x: *const Tensor) 
     var result = try Tensor.init(allocator, &result_shape);
     errdefer result.deinit();
 
-    for (0..m) |i| {
-        var dot: f32 = 0.0;
-        for (0..n) |j| {
-            dot += a.data[i * n + j] * x.data[j];
+    if (use_zblas) {
+        // zblas SIMD-optimized sgemv: y = 1.0 * A * x + 0.0 * y
+        zblas.sgemv(m, n, a.data, x.data, result.data, 1.0, 0.0);
+    } else {
+        for (0..m) |i| {
+            var dot: f32 = 0.0;
+            for (0..n) |j| {
+                dot += a.data[i * n + j] * x.data[j];
+            }
+            result.data[i] = dot;
         }
-        result.data[i] = dot;
     }
 
     return result;
