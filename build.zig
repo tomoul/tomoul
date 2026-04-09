@@ -235,7 +235,6 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = exe_name,
         .root_module = exe_module,
-        .use_lld = true,
     });
 
     // Enable LTO if requested
@@ -362,6 +361,46 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("test-integration", "Run integration tests with fixtures");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    // ==========================================================================
+    // Sentence Transformer validation tests
+    // ==========================================================================
+    const st_tokenizer_module = b.createModule(.{
+        .root_source_file = b.path("src/models/sentence_transformer/tokenizer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const st_model_module = b.createModule(.{
+        .root_source_file = b.path("src/models/sentence_transformer/model.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    st_model_module.addImport("tensor.zig", tensor_module);
+    st_model_module.addImport("ops.zig", ops_module);
+    st_model_module.addImport("loader.zig", loader_module);
+    st_model_module.addImport("quantization.zig", quantization_module);
+    st_model_module.addImport("attention.zig", attention_module);
+    st_model_module.addImport("transformer.zig", transformer_module);
+    st_model_module.addImport("cache.zig", cache_module);
+    st_model_module.addImport("audio.zig", audio_module);
+    st_model_module.addImport("tokenizer.zig", st_tokenizer_module);
+
+    const st_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/test_sentence_transformer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    st_test_module.addImport("model", st_model_module);
+    st_test_module.addImport("tokenizer", st_tokenizer_module);
+
+    const st_tests = b.addTest(.{
+        .root_module = st_test_module,
+    });
+
+    const run_st_tests = b.addRunArtifact(st_tests);
+    const st_test_step = b.step("test-sentence-transformer", "Run sentence transformer validation tests");
+    st_test_step.dependOn(&run_st_tests.step);
 
     // ==========================================================================
     // WebAssembly targets (data-driven from model_registry.zig)
@@ -727,7 +766,7 @@ fn buildNativeLib(
             });
             c_mod.addImport("tensor", tensor_mod);
             c_mod.addImport("model", model_mod);
-            c_mod.addImport("loader", loader_mod);  // For QuantFormat access
+            c_mod.addImport("loader", loader_mod); // For QuantFormat access
             c_mod.addOptions("build_options", opts);
 
             // Embed model weights if bundled mode

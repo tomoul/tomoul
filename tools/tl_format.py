@@ -11,7 +11,7 @@ Supports:
 import struct
 import numpy as np
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 
 MAGIC = b'TOUL'
 VERSION = 1

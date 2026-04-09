@@ -151,6 +151,28 @@ pub const models = [_]ModelConfig{
         .supports_bundled = false, // Weights loaded separately at runtime
         .release_mode = .fast,
     },
+    // Sentence Transformer (all-MiniLM-L6-v2) — embedding model
+    .{
+        .name = "sentence_transformer",
+        .kind = .text,
+        .description = "Sentence Embeddings (all-MiniLM-L6-v2, 384-dim)",
+        .model_module = "src/models/sentence_transformer/model.zig",
+        .cli_module = "src/models/sentence_transformer/cli.zig",
+        .weights_path = "artifacts/all_minilm_l6_v2.tl",
+        .export_symbols = &.{
+            "init",
+            "embed",
+            "is_ready",
+            "get_version",
+        },
+        .weight_variants = &.{
+            .{ .suffix = "-q8", .path = "artifacts/all_minilm_l6_v2_q8.tl", .description = "Q8 quantized - 4x smaller" },
+        },
+        .has_example = false,
+        .has_cli = true,
+        .supports_bundled = false,
+        .release_mode = .fast,
+    },
     // Whisper Speech-to-Text models (Phase 10)
     .{
         .name = "whisper-tiny",
