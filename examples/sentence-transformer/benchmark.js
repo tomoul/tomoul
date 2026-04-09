@@ -28,11 +28,12 @@ if (platform === 'linux') {
 
 const PROJECT_ROOT = path.join(__dirname, '../..');
 
-// Weight variant: 'f32' (default) or 'q8k'
+// Weight variant: 'f32' (default), 'q8k', or 'f16'
 const VARIANT = process.env.TOMOUL_VARIANT || 'f32';
 const weightFiles = {
     'f32': 'all_minilm_l6_v2.tl',
     'q8k': 'all_minilm_l6_v2_q8k.tl',
+    'f16': 'all_minilm_l6_v2_f16.tl',
 };
 
 const LIB_PATH = path.join(PROJECT_ROOT, 'zig-out/lib', `libtomoul_sentence_transformer${libSuffix}`);
@@ -99,6 +100,7 @@ const lib = koffi.load(libPath);
 // Define FFI bindings matching c.zig exports
 const tomoul_sentence_transformer_init = lib.func('int tomoul_sentence_transformer_init(string, string)');
 const tomoul_sentence_transformer_embed = lib.func('int tomoul_sentence_transformer_embed(_In_ uint8_t*, size_t, _Out_ float*)');
+const tomoul_sentence_transformer_embed_batch = lib.func('int tomoul_sentence_transformer_embed_batch(_In_ const uint8_t**, _In_ const size_t*, size_t, _Out_ float*)');
 const tomoul_sentence_transformer_destroy = lib.func('void tomoul_sentence_transformer_destroy()');
 const tomoul_sentence_transformer_is_ready = lib.func('int tomoul_sentence_transformer_is_ready()');
 
@@ -132,6 +134,29 @@ function embedText(text) {
         embedding[i] = outputBuffer.readFloatLE(i * 4);
     }
     return embedding;
+}
+
+// Batch embed function
+function embedBatchTexts(texts) {
+    const batchSize = texts.length;
+    const textBuffers = texts.map(t => Buffer.from(t, 'utf8'));
+    const textLengths = textBuffers.map(b => b.length);
+    const outputBuffer = Buffer.alloc(batchSize * EMBEDDING_DIM * 4);
+
+    const result = tomoul_sentence_transformer_embed_batch(textBuffers, textLengths, batchSize, outputBuffer);
+    if (result !== 0) {
+        throw new Error(`Batch embedding failed with error code: ${result}`);
+    }
+
+    const embeddings = [];
+    for (let i = 0; i < batchSize; i++) {
+        const emb = new Float32Array(EMBEDDING_DIM);
+        for (let j = 0; j < EMBEDDING_DIM; j++) {
+            emb[j] = outputBuffer.readFloatLE((i * EMBEDDING_DIM + j) * 4);
+        }
+        embeddings.push(emb);
+    }
+    return embeddings;
 }
 
 function cosineSimilarity(a, b) {
@@ -230,6 +255,53 @@ console.log(`    Min:     ${min.toFixed(2)}ms  (${(min / 10).toFixed(2)}ms per s
 
 const batch10Avg = avg;
 
+// --- 5 sentences BATCHED ---
+console.log(`\n--- 5 Sentences (batched) ---`);
+times = [];
+const batch5Texts = BATCH_SENTENCES.slice(0, 5);
+for (let i = 0; i < NUM_ITERATIONS; i++) {
+    const start = performance.now();
+    embedBatchTexts(batch5Texts);
+    const end = performance.now();
+    times.push(end - start);
+}
+
+avg = times.reduce((a, b) => a + b, 0) / times.length;
+sorted = [...times].sort((a, b) => a - b);
+p50 = sorted[Math.floor(sorted.length / 2)];
+min = sorted[0];
+
+console.log(`  5 sentences batched (${NUM_ITERATIONS} runs):`);
+console.log(`    Average: ${avg.toFixed(2)}ms  (${(avg / 5).toFixed(2)}ms per sentence)`);
+console.log(`    Median:  ${p50.toFixed(2)}ms  (${(p50 / 5).toFixed(2)}ms per sentence)`);
+console.log(`    Min:     ${min.toFixed(2)}ms  (${(min / 5).toFixed(2)}ms per sentence)`);
+console.log(`    Speedup vs sequential: ${(seq5Avg / avg).toFixed(2)}x`);
+
+const batched5Avg = avg;
+
+// --- 10 sentences BATCHED ---
+console.log(`\n--- 10 Sentences (batched) ---`);
+times = [];
+for (let i = 0; i < NUM_ITERATIONS; i++) {
+    const start = performance.now();
+    embedBatchTexts(BATCH_SENTENCES);
+    const end = performance.now();
+    times.push(end - start);
+}
+
+avg = times.reduce((a, b) => a + b, 0) / times.length;
+sorted = [...times].sort((a, b) => a - b);
+p50 = sorted[Math.floor(sorted.length / 2)];
+min = sorted[0];
+
+console.log(`  10 sentences batched (${NUM_ITERATIONS} runs):`);
+console.log(`    Average: ${avg.toFixed(2)}ms  (${(avg / 10).toFixed(2)}ms per sentence)`);
+console.log(`    Median:  ${p50.toFixed(2)}ms  (${(p50 / 10).toFixed(2)}ms per sentence)`);
+console.log(`    Min:     ${min.toFixed(2)}ms  (${(min / 10).toFixed(2)}ms per sentence)`);
+console.log(`    Speedup vs sequential: ${(batch10Avg / avg).toFixed(2)}x`);
+
+const batched10Avg = avg;
+
 // --- Correctness: cosine similarities between sentence pairs ---
 console.log('\n--- Correctness Check ---');
 const embeddings = SENTENCES.map(s => embedText(s));
@@ -240,6 +312,22 @@ for (let i = 0; i < SENTENCES.length; i++) {
     }
 }
 
+// --- Batch vs Sequential correctness ---
+console.log('\n--- Batch vs Sequential Correctness ---');
+const batchEmbs = embedBatchTexts(SENTENCES);
+let maxDiff = 0;
+for (let i = 0; i < SENTENCES.length; i++) {
+    const sim = cosineSimilarity(embeddings[i], batchEmbs[i]);
+    let diff = 0;
+    for (let j = 0; j < EMBEDDING_DIM; j++) {
+        diff = Math.max(diff, Math.abs(embeddings[i][j] - batchEmbs[i][j]));
+    }
+    maxDiff = Math.max(maxDiff, diff);
+    console.log(`  Sentence ${i}: cosine=${sim.toFixed(6)}, max_abs_diff=${diff.toExponential(3)}`);
+}
+console.log(`  Overall max abs diff: ${maxDiff.toExponential(3)}`);
+console.log(`  Match: ${maxDiff < 1e-4 ? 'PASS' : 'FAIL (divergence > 1e-4)'}`);
+
 // Cleanup
 tomoul_sentence_transformer_destroy();
 
@@ -247,7 +335,10 @@ tomoul_sentence_transformer_destroy();
 console.log('\n============================================================');
 console.log('Summary (Tomoul / Node.js FFI)');
 console.log('============================================================');
+console.log(`  Variant:            ${VARIANT.toUpperCase()}`);
 console.log(`  Single sentence:    ${singleAvg.toFixed(2)}ms avg, ${singleP50.toFixed(2)}ms p50`);
 console.log(`  5 sent sequential:  ${seq5Avg.toFixed(2)}ms avg (${(seq5Avg / 5).toFixed(2)}ms/sent)`);
 console.log(`  10 sent sequential: ${batch10Avg.toFixed(2)}ms avg (${(batch10Avg / 10).toFixed(2)}ms/sent)`);
+console.log(`  5 sent batched:     ${batched5Avg.toFixed(2)}ms avg (${(batched5Avg / 5).toFixed(2)}ms/sent) [${(seq5Avg / batched5Avg).toFixed(2)}x speedup]`);
+console.log(`  10 sent batched:    ${batched10Avg.toFixed(2)}ms avg (${(batched10Avg / 10).toFixed(2)}ms/sent) [${(batch10Avg / batched10Avg).toFixed(2)}x speedup]`);
 console.log('============================================================');

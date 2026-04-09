@@ -24,9 +24,10 @@
 | Variant | File | Size | Accuracy vs F32 |
 |---|---|---|---|
 | **F32** (default) | `all_minilm_l6_v2.tl` | ~87 MB | baseline |
+| **F16** (half-precision) | `all_minilm_l6_v2_f16.tl` | ~43 MB | effectively lossless |
 | **Q8_K** (8-bit quantized) | `all_minilm_l6_v2_q8k.tl` | ~24 MB | cosine sim ≥ 0.9997 |
 
-In Q8_K mode, only transformer block linear weights are quantized. Embeddings and LayerNorm parameters remain float32.
+In Q8_K mode, only transformer block linear weights are quantized. Embeddings and LayerNorm parameters remain float32. F16 stores all weights as IEEE 754 half-precision (10-bit mantissa). Q8_K is recommended for best size/speed tradeoff.
 
 ## Benchmarks
 
@@ -34,8 +35,9 @@ Measured on AMD CPU + RTX 4090, 50 iterations, warm start:
 
 | Engine | Weights | Single (ms) | 5-sent (ms/sent) | 10-sent (ms/sent) | Notes |
 |---|---|---|---|---|---|
-| **Tomoul** (Zig, ReleaseFast) | **Q8_K** | **3.5** | **3.0** | **2.7** | Node.js FFI via koffi |
-| **Tomoul** (Zig, ReleaseFast) | F32 | 8.7 | 6.0 | 5.8 | Node.js FFI via koffi |
+| **Tomoul** (Zig, ReleaseFast) | **Q8_K** | **3.6** | **3.2** | **2.8** | Node.js FFI via koffi |
+| **Tomoul** (Zig, ReleaseFast) | F16 | 5.0 | 7.2 | 4.0 | 1.8× faster than F32, 2× smaller |
+| **Tomoul** (Zig, ReleaseFast) | F32 | 9.2 | 6.8 | 6.8 | Node.js FFI via koffi |
 | PyTorch CPU (MKL) | F32 | 3.6 | 3.6 | 1.0 (batched) | `transformers` pipeline |
 | PyTorch CUDA (RTX 4090) | F32 | 2.6 | — | 0.55 (batched) | GPU baseline |
 
@@ -52,6 +54,9 @@ Q8_K is the recommended variant: **3.6× smaller** model (24 MB vs 87 MB), **2.5
 ```bash
 # F32 (full precision, ~87 MB)
 python tools/export_sentence_transformer.py -o artifacts/
+
+# F16 (half-precision, ~43 MB, 1.8× faster than F32)
+python tools/export_sentence_transformer.py -o artifacts/ -q f16
 
 # Q8_K (recommended: ~24 MB, 2.5× faster inference)
 python tools/export_sentence_transformer.py -o artifacts/ -q q8_k

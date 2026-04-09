@@ -4,7 +4,7 @@
 // Architecture: BERT encoder (6 layers, 384 hidden, 12 heads)
 //   WordPiece tokenizer → BERT embeddings → 6 transformer blocks → mean pooling → L2 normalize → 384-dim vector
 //
-// Supports float32 and Q8_K quantized weights (auto-detected from .tl file).
+// Supports float32, Q8_K quantized, and f16 half-precision weights (auto-detected from .tl file).
 
 const std = @import("std");
 const tensor_mod = @import("tensor.zig");
@@ -18,12 +18,15 @@ const transformer = @import("transformer.zig");
 const attention = @import("attention.zig");
 const TransformerBlockWeights = transformer.TransformerBlockWeightsF32;
 const TransformerBlockWeightsQ8K = transformer.TransformerBlockWeightsQ8K;
+const TransformerBlockWeightsF16 = transformer.TransformerBlockWeightsF16;
 const TransformerConfig = transformer.TransformerConfig;
 const AttentionWeights = attention.AttentionWeightsF32;
 const AttentionWeightsQ8K = attention.AttentionWeightsQ8K;
+const AttentionWeightsF16 = attention.AttentionWeightsF16;
 
 const quant = @import("quantization.zig");
 const QuantizedTensorQ8K = quant.QuantizedTensorQ8K;
+const F16Tensor = quant.F16Tensor;
 
 const tokenizer_mod = @import("tokenizer.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -65,6 +68,9 @@ pub const WeightStorage = union(enum) {
     q8k: struct {
         blocks: []TransformerBlockWeightsQ8K,
     },
+    f16: struct {
+        blocks: []TransformerBlockWeightsF16,
+    },
 
     pub fn deinit(self: *WeightStorage, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -75,6 +81,10 @@ pub const WeightStorage = union(enum) {
             .q8k => |*q| {
                 for (q.blocks) |*block| block.deinit();
                 allocator.free(q.blocks);
+            },
+            .f16 => |*h| {
+                for (h.blocks) |*block| block.deinit();
+                allocator.free(h.blocks);
             },
         }
     }
@@ -118,7 +128,7 @@ pub const SentenceTransformerModel = struct {
     fn initFromLoader(allocator: std.mem.Allocator, loader: *ModelLoader) !Self {
         const config = try detectConfig(loader);
         const quant_format = loader.quant_format;
-        const is_quantized = quant_format == .q8_k;
+        const is_quantized = quant_format == .q8_k or quant_format == .f16;
 
         // Load embeddings (always float32)
         var word_embeddings = if (is_quantized)
@@ -165,6 +175,18 @@ pub const SentenceTransformerModel = struct {
                 loaded += 1;
             }
             weights = .{ .q8k = .{ .blocks = blocks } };
+        } else if (quant_format == .f16) {
+            var blocks = try allocator.alloc(TransformerBlockWeightsF16, config.num_layers);
+            var loaded: usize = 0;
+            errdefer {
+                for (blocks[0..loaded]) |*b| b.deinit();
+                allocator.free(blocks);
+            }
+            for (0..config.num_layers) |i| {
+                blocks[i] = try loadTransformerBlockF16(allocator, loader, i);
+                loaded += 1;
+            }
+            weights = .{ .f16 = .{ .blocks = blocks } };
         } else {
             var blocks = try allocator.alloc(TransformerBlockWeights, config.num_layers);
             var loaded: usize = 0;
@@ -194,7 +216,7 @@ pub const SentenceTransformerModel = struct {
 
     /// Auto-detect config from model weights
     fn detectConfig(loader: *ModelLoader) !SentenceTransformerConfig {
-        const is_quantized = loader.quant_format == .q8_k;
+        const is_quantized = loader.quant_format == .q8_k or loader.quant_format == .f16;
         var word_emb = if (is_quantized)
             try loader.getTensorDequantized("embeddings.word_embeddings.weight")
         else
@@ -282,6 +304,14 @@ pub const SentenceTransformerModel = struct {
                     transformer_config,
                 );
             },
+            .f16 => |h| {
+                output = try transformer.transformerStackF16(
+                    scratch,
+                    &hidden,
+                    h.blocks,
+                    transformer_config,
+                );
+            },
         }
 
         // output is now [seq_len, hidden_dim] — caller owns it
@@ -311,6 +341,145 @@ pub const SentenceTransformerModel = struct {
         l2Normalize(&pooled);
 
         return pooled;
+    }
+
+    /// Embed a batch of texts in a single forward pass.
+    /// All sentences are padded to the same length and processed as one batched GEMM.
+    /// Returns batch_size normalized 384-dim vectors.
+    pub fn embedBatch(self: *Self, tokenizer: *Tokenizer, texts: []const []const u8, output: [][384]f32) !void {
+        const batch_size = texts.len;
+        if (batch_size == 0) return;
+
+        // 1. Tokenize all sentences
+        var encodings = try self.allocator.alloc(TokenizerOutput, batch_size);
+        defer self.allocator.free(encodings);
+        var encoded_count: usize = 0;
+        defer {
+            for (encodings[0..encoded_count]) |*enc| enc.deinit(self.allocator);
+        }
+
+        var max_seq_len: usize = 0;
+        for (texts) |text| {
+            encodings[encoded_count] = try tokenizer.encode(text);
+            const sl = encodings[encoded_count].input_ids.len;
+            if (sl > max_seq_len) max_seq_len = sl;
+            encoded_count += 1;
+        }
+
+        // 2. Build padded batched inputs
+        const total_tokens = batch_size * max_seq_len;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        const batched_input_ids = try scratch.alloc(u32, total_tokens);
+        const batched_attention_mask = try scratch.alloc(u32, total_tokens);
+        const batched_token_type_ids = try scratch.alloc(u32, total_tokens);
+
+        @memset(batched_input_ids, 0); // PAD = 0
+        @memset(batched_attention_mask, 0);
+        @memset(batched_token_type_ids, 0);
+
+        for (0..batch_size) |s| {
+            const enc = &encodings[s];
+            const offset = s * max_seq_len;
+            const sl = enc.input_ids.len;
+            @memcpy(batched_input_ids[offset..][0..sl], enc.input_ids);
+            @memcpy(batched_attention_mask[offset..][0..sl], enc.attention_mask);
+            @memcpy(batched_token_type_ids[offset..][0..sl], enc.token_type_ids);
+        }
+
+        // Compute actual sentence lengths for attention masking
+        const sentence_lengths = try scratch.alloc(usize, batch_size);
+        for (0..batch_size) |s| {
+            sentence_lengths[s] = encodings[s].input_ids.len;
+        }
+
+        // 3. Batched forward pass
+        var hidden = try self.forwardBatched(scratch, batched_input_ids, batched_token_type_ids, batch_size, max_seq_len, sentence_lengths);
+
+        // 4. Per-sentence mean pool + L2 normalize
+        const hidden_dim = self.config.hidden_dim;
+        for (0..batch_size) |s| {
+            const mask_slice = batched_attention_mask[s * max_seq_len ..][0..max_seq_len];
+
+            // Create a view into the hidden states for this sentence
+            const sent_shape = try scratch.alloc(usize, 2);
+            sent_shape[0] = max_seq_len;
+            sent_shape[1] = hidden_dim;
+            var sent_hidden = Tensor{
+                .data = hidden.data[s * max_seq_len * hidden_dim ..][0 .. max_seq_len * hidden_dim],
+                .shape = sent_shape,
+                .allocator = scratch,
+            };
+
+            output[s] = meanPool(&sent_hidden, mask_slice, hidden_dim);
+            l2Normalize(&output[s]);
+        }
+    }
+
+    /// Batched forward pass: processes batch_size * max_seq_len tokens at once.
+    /// All linear projections run as single large GEMMs for better FLOPS utilization.
+    fn forwardBatched(self: *Self, scratch: std.mem.Allocator, input_ids: []const u32, token_type_ids: []const u32, batch_size: usize, max_seq_len: usize, sentence_lengths: []const usize) !Tensor {
+        const total_tokens = batch_size * max_seq_len;
+        const config = self.config;
+        const transformer_config = config.getTransformerConfig();
+
+        // 1. Embeddings: word + position + token_type
+        var word_emb = try ops.embedding(scratch, input_ids, &self.word_embeddings);
+        defer word_emb.deinit();
+
+        // Position IDs repeat per sentence: [0,1,...,max_seq_len-1, 0,1,...,max_seq_len-1, ...]
+        const position_ids = try scratch.alloc(u32, total_tokens);
+        defer scratch.free(position_ids);
+        for (0..batch_size) |s| {
+            for (0..max_seq_len) |i| {
+                position_ids[s * max_seq_len + i] = @intCast(i);
+            }
+        }
+
+        var pos_emb = try ops.embedding(scratch, position_ids, &self.position_embeddings);
+        defer pos_emb.deinit();
+
+        var type_emb = try ops.embedding(scratch, token_type_ids, &self.token_type_embeddings);
+        defer type_emb.deinit();
+
+        // Combine embeddings
+        try ops.addInPlace(&word_emb, &pos_emb);
+        try ops.addInPlace(&word_emb, &type_emb);
+
+        // Embedding layer norm
+        var hidden = try ops.layerNorm(
+            scratch,
+            &word_emb,
+            &self.embed_ln_gamma,
+            &self.embed_ln_beta,
+            config.layer_norm_eps,
+        );
+        defer hidden.deinit();
+
+        // 2. Run through transformer blocks (batched)
+        var output: Tensor = undefined;
+        switch (self.weights) {
+            .f32 => |f| {
+                output = try transformer.transformerStackBatched(
+                    Tensor, scratch, &hidden, f.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
+                );
+            },
+            .q8k => |q| {
+                output = try transformer.transformerStackBatched(
+                    QuantizedTensorQ8K, scratch, &hidden, q.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
+                );
+            },
+            .f16 => |h| {
+                output = try transformer.transformerStackBatched(
+                    F16Tensor, scratch, &hidden, h.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
+                );
+            },
+        }
+
+        return output;
     }
 
     pub fn deinit(self: *Self) void {
@@ -515,6 +684,96 @@ pub const SentenceTransformerModel = struct {
             .ff_ln_beta = ff_ln_b,
         };
     }
+
+    fn loadTransformerBlockF16(allocator: std.mem.Allocator, loader: *ModelLoader, layer_idx: usize) !TransformerBlockWeightsF16 {
+        _ = allocator;
+        var buf: [128]u8 = undefined;
+
+        const q_w_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.self.query.weight", .{layer_idx}) catch unreachable;
+        var q_w = try loader.getF16Tensor(q_w_name);
+        errdefer q_w.deinit();
+
+        const k_w_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.self.key.weight", .{layer_idx}) catch unreachable;
+        var k_w = try loader.getF16Tensor(k_w_name);
+        errdefer k_w.deinit();
+
+        const v_w_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.self.value.weight", .{layer_idx}) catch unreachable;
+        var v_w = try loader.getF16Tensor(v_w_name);
+        errdefer v_w.deinit();
+
+        const o_w_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.output.dense.weight", .{layer_idx}) catch unreachable;
+        var o_w = try loader.getF16Tensor(o_w_name);
+        errdefer o_w.deinit();
+
+        const q_b_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.self.query.bias", .{layer_idx}) catch unreachable;
+        var q_b = try loader.getTensorDequantized(q_b_name);
+        errdefer q_b.deinit();
+
+        const k_b_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.self.key.bias", .{layer_idx}) catch unreachable;
+        var k_b = try loader.getTensorDequantized(k_b_name);
+        errdefer k_b.deinit();
+
+        const v_b_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.self.value.bias", .{layer_idx}) catch unreachable;
+        var v_b = try loader.getTensorDequantized(v_b_name);
+        errdefer v_b.deinit();
+
+        const o_b_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.output.dense.bias", .{layer_idx}) catch unreachable;
+        var o_b = try loader.getTensorDequantized(o_b_name);
+        errdefer o_b.deinit();
+
+        const attn_ln_g_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.output.LayerNorm.weight", .{layer_idx}) catch unreachable;
+        var attn_ln_g = try loader.getTensorDequantized(attn_ln_g_name);
+        errdefer attn_ln_g.deinit();
+
+        const attn_ln_b_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.attention.output.LayerNorm.bias", .{layer_idx}) catch unreachable;
+        var attn_ln_b = try loader.getTensorDequantized(attn_ln_b_name);
+        errdefer attn_ln_b.deinit();
+
+        const ff1_w_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.intermediate.dense.weight", .{layer_idx}) catch unreachable;
+        var ff1_w = try loader.getF16Tensor(ff1_w_name);
+        errdefer ff1_w.deinit();
+
+        const ff1_b_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.intermediate.dense.bias", .{layer_idx}) catch unreachable;
+        var ff1_b = try loader.getTensorDequantized(ff1_b_name);
+        errdefer ff1_b.deinit();
+
+        const ff2_w_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.output.dense.weight", .{layer_idx}) catch unreachable;
+        var ff2_w = try loader.getF16Tensor(ff2_w_name);
+        errdefer ff2_w.deinit();
+
+        const ff2_b_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.output.dense.bias", .{layer_idx}) catch unreachable;
+        var ff2_b = try loader.getTensorDequantized(ff2_b_name);
+        errdefer ff2_b.deinit();
+
+        const ff_ln_g_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.output.LayerNorm.weight", .{layer_idx}) catch unreachable;
+        var ff_ln_g = try loader.getTensorDequantized(ff_ln_g_name);
+        errdefer ff_ln_g.deinit();
+
+        const ff_ln_b_name = std.fmt.bufPrint(&buf, "encoder.layer.{d}.output.LayerNorm.bias", .{layer_idx}) catch unreachable;
+        var ff_ln_b = try loader.getTensorDequantized(ff_ln_b_name);
+        errdefer ff_ln_b.deinit();
+
+        return TransformerBlockWeightsF16{
+            .attention = AttentionWeightsF16{
+                .q_weight = q_w,
+                .k_weight = k_w,
+                .v_weight = v_w,
+                .o_weight = o_w,
+                .q_bias = q_b,
+                .k_bias = k_b,
+                .v_bias = v_b,
+                .o_bias = o_b,
+            },
+            .attn_ln_gamma = attn_ln_g,
+            .attn_ln_beta = attn_ln_b,
+            .ff_linear1_weight = ff1_w,
+            .ff_linear1_bias = ff1_b,
+            .ff_linear2_weight = ff2_w,
+            .ff_linear2_bias = ff2_b,
+            .ff_ln_gamma = ff_ln_g,
+            .ff_ln_beta = ff_ln_b,
+        };
+    }
 };
 
 // =============================================================================
@@ -613,14 +872,13 @@ pub const SentenceTransformer = struct {
         return self.model.embed(&self.tokenizer, text);
     }
 
-    /// Embed a batch of texts
+    /// Embed a batch of texts using a single batched forward pass.
+    /// All sentences processed together for better GEMM utilization.
     pub fn embedBatch(self: *Self, texts: []const []const u8) ![][384]f32 {
-        var results = try self.allocator.alloc([384]f32, texts.len);
+        const results = try self.allocator.alloc([384]f32, texts.len);
         errdefer self.allocator.free(results);
 
-        for (texts, 0..) |text, i| {
-            results[i] = try self.embed(text);
-        }
+        try self.model.embedBatch(&self.tokenizer, texts, results);
 
         return results;
     }

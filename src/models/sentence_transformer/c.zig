@@ -100,6 +100,48 @@ export fn tomoul_sentence_transformer_is_ready() c_int {
     return if (is_initialized) 1 else 0;
 }
 
+/// Embed a batch of texts in a single forward pass.
+/// texts: array of pointers to UTF-8 text strings
+/// text_lengths: array of byte lengths per text
+/// batch_size: number of texts
+/// output: pointer to batch_size * 384 floats
+/// Returns: 0 on success, negative error code on failure.
+export fn tomoul_sentence_transformer_embed_batch(
+    texts: [*]const [*]const u8,
+    text_lengths: [*]const usize,
+    batch_size: usize,
+    output: [*]f32,
+) c_int {
+    if (!is_initialized) {
+        return -1;
+    }
+
+    if (batch_size == 0) {
+        return -2;
+    }
+
+    const allocator = gpa.?.allocator();
+
+    // Build slice array
+    const text_slices = allocator.alloc([]const u8, batch_size) catch return -4;
+    defer allocator.free(text_slices);
+
+    for (0..batch_size) |i| {
+        if (text_lengths[i] == 0) return -2;
+        text_slices[i] = texts[i][0..text_lengths[i]];
+    }
+
+    const embeddings = model_instance.?.embedBatch(text_slices) catch return -3;
+    defer allocator.free(embeddings);
+
+    // Copy results to output buffer
+    for (0..batch_size) |i| {
+        @memcpy(output[i * 384 ..][0..384], &embeddings[i]);
+    }
+
+    return 0;
+}
+
 /// Get version string.
 export fn tomoul_sentence_transformer_version() [*:0]const u8 {
     return "0.1.0";

@@ -263,6 +263,95 @@ pub fn transformerStack(
     return hidden;
 }
 
+/// Batched forward pass through a single Transformer block.
+/// input: [batch_size * max_seq_len, hidden_dim]
+/// Linear projections (Q/K/V/O/FFN) run as one big batched GEMM.
+/// Attention scores computed per-sentence.
+pub fn transformerBlockBatched(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const TransformerBlockWeights(WeightType),
+    config: TransformerConfig,
+    batch_size: usize,
+    max_seq_len: usize,
+    sentence_lengths: []const usize,
+) !Tensor {
+    // 1. Multi-head attention (batched projections, per-sentence attention scores)
+    var attn_output = try attention_generic.multiHeadAttentionFusedBatched(
+        WeightType,
+        allocator,
+        input,
+        &weights.attention,
+        config.getAttentionConfig(),
+        batch_size,
+        max_seq_len,
+        sentence_lengths,
+    );
+    defer attn_output.deinit();
+
+    // Residual connection
+    try ops.addInPlace(&attn_output, input);
+
+    // Layer norm
+    var normed1 = try ops.layerNorm(
+        allocator,
+        &attn_output,
+        &weights.attn_ln_gamma,
+        &weights.attn_ln_beta,
+        config.layer_norm_eps,
+    );
+    defer normed1.deinit();
+
+    // 2. Feed forward with residual (batched — one big GEMM)
+    var ff_hidden = try matmulWithWeightBias(WeightType, allocator, &normed1, &weights.ff_linear1_weight, &weights.ff_linear1_bias);
+    defer ff_hidden.deinit();
+
+    ops.gelu(&ff_hidden);
+
+    var ff_output = try matmulWithWeightBias(WeightType, allocator, &ff_hidden, &weights.ff_linear2_weight, &weights.ff_linear2_bias);
+    errdefer ff_output.deinit();
+
+    // Residual connection
+    try ops.addInPlace(&ff_output, &normed1);
+
+    // Layer norm
+    try ops.layerNormInPlace(
+        &ff_output,
+        &weights.ff_ln_gamma,
+        &weights.ff_ln_beta,
+        config.layer_norm_eps,
+    );
+
+    return ff_output;
+}
+
+/// Batched forward pass through multiple Transformer blocks
+pub fn transformerStackBatched(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    blocks: []const TransformerBlockWeights(WeightType),
+    config: TransformerConfig,
+    batch_size: usize,
+    max_seq_len: usize,
+    sentence_lengths: []const usize,
+) !Tensor {
+    if (blocks.len == 0) {
+        return input.clone(allocator);
+    }
+
+    var hidden = try transformerBlockBatched(WeightType, allocator, input, &blocks[0], config, batch_size, max_seq_len, sentence_lengths);
+
+    for (blocks[1..]) |*block| {
+        const new_hidden = try transformerBlockBatched(WeightType, allocator, &hidden, block, config, batch_size, max_seq_len, sentence_lengths);
+        hidden.deinit();
+        hidden = new_hidden;
+    }
+
+    return hidden;
+}
+
 // ============================================================================
 // Convenience Functions (Non-Generic API)
 // ============================================================================

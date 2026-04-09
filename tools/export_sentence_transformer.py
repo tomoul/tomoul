@@ -77,7 +77,7 @@ def export_model(output_dir: Path, quant_format: int = QuantFormat.F32):
 
     # Export model weights
     output_dir.mkdir(parents=True, exist_ok=True)
-    format_suffixes = {QuantFormat.Q8_K: "_q8k"}
+    format_suffixes = {QuantFormat.Q8_K: "_q8k", QuantFormat.F16: "_f16"}
     format_suffix = format_suffixes.get(quant_format, "")
     model_path = output_dir / f"all_minilm_l6_v2{format_suffix}.tl"
     export_tensors(tensors, str(model_path), quant_format=quant_format, verify=True)

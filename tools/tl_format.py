@@ -23,6 +23,7 @@ class QuantFormat:
     Q8_0 = 1  # Q8_0: symmetric 8-bit (per-tensor scale)
     Q4_0 = 2  # Q4_0: symmetric 4-bit (per-tensor scale)
     Q8_K = 3  # Q8_K: block-wise 8-bit (per-block scale, better accuracy)
+    F16 = 4   # Float16 (half-precision, 2x compression)
 
 
 # Block size for block-wise quantization (matches Zig BLOCK_SIZE)
@@ -265,7 +266,7 @@ def export_tensors(
     path.parent.mkdir(parents=True, exist_ok=True)
     tensor_count = len(tensors)
 
-    format_names = {QuantFormat.F32: 'f32', QuantFormat.Q8_0: 'q8_0', QuantFormat.Q4_0: 'q4_0'}
+    format_names = {QuantFormat.F32: 'f32', QuantFormat.Q8_0: 'q8_0', QuantFormat.Q4_0: 'q4_0', QuantFormat.F16: 'f16'}
     print(f"Exporting {tensor_count} tensors as {format_names.get(quant_format, 'unknown')} to {path}")
 
     total_original = 0
@@ -351,6 +352,12 @@ def export_tensors(
                 f.write(scales.tobytes())
                 f.write(quantized.tobytes())
                 data_size = 4 + num_blocks * 4 + len(quantized)
+
+            elif quant_format == QuantFormat.F16:
+                # Half-precision: just convert to float16
+                data = tensor.astype(np.float16).tobytes()
+                f.write(data)
+                data_size = len(data)
 
             else:
                 raise ValueError(f"Unsupported quantization format: {quant_format}")
@@ -471,9 +478,9 @@ def add_quantize_args(parser):
     """Add standard quantization arguments to an argparse parser."""
     parser.add_argument(
         '--quantize', '-q',
-        choices=['f32', 'q8_0', 'q4_0', 'q8_k'],
+        choices=['f32', 'q8_0', 'q4_0', 'q8_k', 'f16'],
         default='f32',
-        help='Output format: f32 (default), q8_0 (8-bit, ~4x), q4_0 (4-bit, ~8x), q8_k (block-wise 8-bit, best accuracy)'
+        help='Output format: f32 (default), f16 (half, ~2x), q8_0 (8-bit, ~4x), q4_0 (4-bit, ~8x), q8_k (block-wise 8-bit, best accuracy)'
     )
     parser.add_argument(
         '--no-verify',
@@ -489,5 +496,6 @@ def get_quant_format(format_str: str) -> int:
         'q8_0': QuantFormat.Q8_0,
         'q4_0': QuantFormat.Q4_0,
         'q8_k': QuantFormat.Q8_K,
+        'f16': QuantFormat.F16,
     }
     return formats.get(format_str, QuantFormat.F32)
