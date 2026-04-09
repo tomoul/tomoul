@@ -1,0 +1,17 @@
+.{
+    .name = .tomoul,
+    .version = "0.1.0",
+    .fingerprint = 0xa6980deb0ce61226,
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{
+        .zblas = .{
+            .url = "https://github.com/tomoul/zblas/archive/refs/heads/master.tar.gz",
+            .hash = "N-V-__8AAD-NAwBYR09AE-fXI5GfSil3L9ntL5MZKP44-yD7",
+        },
+    },
+}

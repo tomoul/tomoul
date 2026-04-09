@@ -96,13 +96,13 @@ pub fn build(b: *std.Build) void {
     ops_module.addImport("tensor.zig", tensor_module);
     ops_module.addOptions("build_options", ops_options);
 
-    // Create zblas module (pure Zig, no external deps)
+    // Create zblas module from external dependency (pure Zig, no external deps)
     // Always create it but only import when use_zblas is true
-    const zblas_module = b.createModule(.{
-        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+    const zblas_dep = b.dependency("zblas", .{
         .target = target,
         .optimize = optimize,
     });
+    const zblas_module = zblas_dep.module("zblas");
     if (use_zblas and !use_blas) {
         ops_module.addImport("zblas", zblas_module);
     }
@@ -431,12 +431,11 @@ pub fn build(b: *std.Build) void {
     wasm_ops_module.addOptions("build_options", wasm_ops_options);
 
     // zblas for WASM (pure Zig - perfect for WASM)
-    const wasm_zblas_module = b.createModule(.{
-        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+    const wasm_zblas_dep = b.dependency("zblas", .{
         .target = wasm_target,
         .optimize = .ReleaseSmall,
     });
-    wasm_ops_module.addImport("zblas", wasm_zblas_module);
+    wasm_ops_module.addImport("zblas", wasm_zblas_dep.module("zblas"));
 
     const wasm_quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
@@ -673,12 +672,11 @@ fn buildNativeLib(
     ops_module.addOptions("build_options", ops_build_options);
 
     // zblas for native lib builds (pure Zig - no external dependencies)
-    const zblas_module = b.createModule(.{
-        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+    const lib_zblas_dep = b.dependency("zblas", .{
         .target = target,
         .optimize = optimize,
     });
-    ops_module.addImport("zblas", zblas_module);
+    ops_module.addImport("zblas", lib_zblas_dep.module("zblas"));
 
     const quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
