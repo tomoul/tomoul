@@ -2,7 +2,7 @@
     .name = .tomoul,
     .version = "0.1.0",
     .fingerprint = 0xa6980deb0ce61226,
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.15.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -386,6 +386,9 @@ pub fn build(b: *std.Build) void {
     st_model_module.addImport("audio.zig", audio_module);
     st_model_module.addImport("tokenizer.zig", st_tokenizer_module);
 
+    // Export for downstream consumers (e.g., habor CLI)
+    b.modules.put("sentence_transformer", st_model_module) catch @panic("OOM");
+
     const st_test_module = b.createModule(.{
         .root_source_file = b.path("tests/test_sentence_transformer.zig"),
         .target = target,
@@ -605,6 +608,13 @@ fn buildWasmModel(
         });
     }
 
+    // Embed vocab if provided
+    if (model.vocab_path) |vp| {
+        wasm_binding.addAnonymousImport("vocab", .{
+            .root_source_file = b.path(vp),
+        });
+    }
+
     // Create the wasm executable
     const wasm_name = b.fmt("tomoul_{s}", .{model.name});
     const wasm = b.addExecutable(.{
@@ -793,6 +803,13 @@ fn buildNativeLib(
         weights_path,
     );
 
+    // Embed vocab if provided
+    if (model.vocab_path) |vp| {
+        c_binding_module.addAnonymousImport("vocab", .{
+            .root_source_file = b.path(vp),
+        });
+    }
+
     // Build static library
     const lib_name = b.fmt("tomoul_{s}", .{model.name});
     const static_lib = b.addLibrary(.{
@@ -822,6 +839,13 @@ fn buildNativeLib(
         model.supports_bundled,
         weights_path,
     );
+
+    // Embed vocab if provided
+    if (model.vocab_path) |vp| {
+        c_binding_module_shared.addAnonymousImport("vocab", .{
+            .root_source_file = b.path(vp),
+        });
+    }
 
     const shared_lib = b.addLibrary(.{
         .linkage = .dynamic,

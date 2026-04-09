@@ -48,6 +48,7 @@ pub const ModelConfig = struct {
     model_module: ?[]const u8 = null,
     cli_module: ?[]const u8 = null, // CLI executable source
     weights_path: ?[]const u8 = null, // Default weights (float32)
+    vocab_path: ?[]const u8 = null, // Vocab file for text models (embedded alongside weights)
     example_dir: ?[]const u8 = null,
     hf_repo: ?[]const u8 = null,
 
@@ -158,19 +159,26 @@ pub const models = [_]ModelConfig{
         .description = "Sentence Embeddings (all-MiniLM-L6-v2, 384-dim)",
         .model_module = "src/models/sentence_transformer/model.zig",
         .cli_module = "src/models/sentence_transformer/cli.zig",
+        .wasm_binding = "src/models/sentence_transformer/wasm.zig",
+        .c_binding = "src/models/sentence_transformer/c.zig",
         .weights_path = "artifacts/all_minilm_l6_v2.tl",
+        .vocab_path = "artifacts/all_minilm_l6_v2_vocab.txt",
         .export_symbols = &.{
             "init",
             "embed",
+            "get_input_buffer_ptr",
+            "get_max_input_bytes",
+            "get_output_buffer_ptr",
             "is_ready",
             "get_version",
+            "reset",
         },
         .weight_variants = &.{
-            .{ .suffix = "-q8", .path = "artifacts/all_minilm_l6_v2_q8.tl", .description = "Q8 quantized - 4x smaller" },
+            .{ .suffix = "-q8k", .path = "artifacts/all_minilm_l6_v2_q8k.tl", .description = "Q8_K block-wise - 3.6x smaller, 0.9997+ accuracy" },
         },
         .has_example = false,
         .has_cli = true,
-        .supports_bundled = false,
+        .supports_bundled = true,
         .release_mode = .fast,
     },
     // Whisper Speech-to-Text models (Phase 10)
