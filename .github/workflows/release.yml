@@ -24,6 +24,9 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: write
+
 env:
   ZIG_VERSION: '0.15.2'
 
