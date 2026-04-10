@@ -346,6 +346,80 @@ test "GPU Q8K: dequant + embed matches CPU F32 within tolerance" {
 }
 
 // =============================================================================
+// T6b: Q8K latency benchmark — CPU Q8K vs GPU Q8K
+// =============================================================================
+
+test "GPU Q8K vs CPU Q8K: latency comparison" {
+    const allocator = std.testing.allocator;
+
+    // CPU Q8K model
+    var st_q8k = SentenceTransformer.init(allocator, MODEL_Q8K_PATH, VOCAB_PATH) catch |err| {
+        std.debug.print("\nSkipping: Q8K model not found ({}).\n", .{err});
+        return;
+    };
+    defer st_q8k.deinit();
+
+    // GPU Q8K model (dequantizes to F32 for GPU upload)
+    var gpu_q8k = GpuModel.init(allocator, &st_q8k.model) catch |err| {
+        std.debug.print("\nSkipping: GPU init failed ({}).\n", .{err});
+        return;
+    };
+    defer gpu_q8k.deinit();
+
+    const iterations = 5;
+
+    // Warmup
+    _ = try st_q8k.embed("warmup");
+    _ = try gpu_q8k.embed(&st_q8k.tokenizer, "warmup");
+
+    // CPU Q8K single sentence
+    var cpu_timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        _ = try st_q8k.embed("Hello world");
+    }
+    const cpu_single_ns = cpu_timer.read();
+    const cpu_single_ms = @as(f64, @floatFromInt(cpu_single_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(iterations));
+
+    // GPU Q8K single sentence
+    var gpu_timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        _ = try gpu_q8k.embed(&st_q8k.tokenizer, "Hello world");
+    }
+    const gpu_single_ns = gpu_timer.read();
+    const gpu_single_ms = @as(f64, @floatFromInt(gpu_single_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(iterations));
+
+    // CPU Q8K batch (sequential)
+    var cpu_batch_timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        for (test_sentences) |s| _ = try st_q8k.embed(s);
+    }
+    const cpu_batch_ns = cpu_batch_timer.read();
+    const cpu_batch_ms = @as(f64, @floatFromInt(cpu_batch_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(iterations));
+
+    // GPU Q8K batch
+    var gpu_batch_timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        var gpu_results: [test_sentences.len][384]f32 = undefined;
+        try gpu_q8k.embedBatch(&st_q8k.tokenizer, &test_sentences, &gpu_results);
+    }
+    const gpu_batch_ns = gpu_batch_timer.read();
+    const gpu_batch_ms = @as(f64, @floatFromInt(gpu_batch_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(iterations));
+
+    std.debug.print("\n  Q8K Single Sentence:\n    CPU: {d:.2} ms\n    GPU: {d:.2} ms\n    Speedup: {d:.2}x\n", .{
+        cpu_single_ms,
+        gpu_single_ms,
+        cpu_single_ms / gpu_single_ms,
+    });
+    std.debug.print("  Q8K Batch ({d} sentences):\n    CPU sequential: {d:.2} ms\n    GPU batch: {d:.2} ms\n    Speedup: {d:.2}x\n    GPU per-sentence: {d:.2} ms\n", .{
+        test_sentences.len,
+        cpu_batch_ms,
+        gpu_batch_ms,
+        cpu_batch_ms / gpu_batch_ms,
+        gpu_batch_ms / @as(f64, @floatFromInt(test_sentences.len)),
+    });
+}
+
+// =============================================================================
 // T7: F16 model GPU inference — cast to F32 on init
 // =============================================================================
 

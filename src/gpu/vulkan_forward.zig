@@ -1,4 +1,4 @@
-// src/gpu/gpu_forward.zig
+// src/gpu/vulkan_forward.zig
 //
 // GPU Forward Pass for Transformer Encoder
 //

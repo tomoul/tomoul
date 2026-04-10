@@ -1,34 +1,34 @@
-// src/gpu/vulkan_backend.zig
+// src/gpu/metal_backend.zig
 //
-// Vulkan HAL Backend
+// Metal HAL Backend
 //
-// Wraps GpuForward (Vulkan compute shaders) and provides forward/forwardBatch
+// Wraps MetalForward (Metal compute shaders) and provides forward/forwardBatch
 // methods that hal.zig bridges into the GpuBackend vtable.
 //
 // This module has NO dependency on hal.zig — avoiding circular imports.
 // hal.zig imports this module and wraps it behind the GpuBackend interface.
 //
-// Platforms: Linux, Windows, Android, WSL2 (via dzn/D3D12)
+// Platforms: macOS, iOS (Apple Silicon with Metal support)
 
 const std = @import("std");
-const gpu_fwd = @import("vulkan_forward");
+const metal_fwd = @import("metal_forward");
 
 const Self = @This();
 
 allocator: std.mem.Allocator,
-fwd: gpu_fwd.GpuForward,
+fwd: metal_fwd.MetalForward,
 device_name_buf: [256]u8,
 device_name_len: usize,
 
-/// Initialize Vulkan backend: create device, upload weights, compile shaders.
-/// Config/Embedding/Layer types are from vulkan_forward (no HAL dependency).
+/// Initialize Metal backend: create device, upload weights, compile shaders.
+/// Config/Embedding/Layer types are from metal_forward (no HAL dependency).
 pub fn init(
     allocator: std.mem.Allocator,
-    config: gpu_fwd.GpuConfig,
-    embeddings: gpu_fwd.EmbeddingData,
-    layers: []const gpu_fwd.LayerData,
+    config: metal_fwd.GpuConfig,
+    embeddings: metal_fwd.EmbeddingData,
+    layers: []const metal_fwd.LayerData,
 ) !*Self {
-    const fwd = try gpu_fwd.GpuForward.init(allocator, config, embeddings, layers);
+    const fwd = try metal_fwd.MetalForward.init(allocator, config, embeddings, layers);
 
     const self = try allocator.create(Self);
     self.* = Self{
@@ -38,10 +38,12 @@ pub fn init(
         .device_name_len = 0,
     };
 
-    // Cache device name
+    // Cache device name (null-terminated for C API)
     const name = self.fwd.ctx.getDeviceName();
-    self.device_name_len = name.len;
-    @memcpy(self.device_name_buf[0..name.len], name);
+    const copy_len = @min(name.len, 255);
+    self.device_name_len = copy_len + 1; // include null terminator
+    @memcpy(self.device_name_buf[0..copy_len], name[0..copy_len]);
+    self.device_name_buf[copy_len] = 0;
 
     return self;
 }
