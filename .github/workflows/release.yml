@@ -207,7 +207,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: weights-${{ matrix.model }}
-          path: artifacts/*.tl
+          path: artifacts/
 
   # ==========================================================================
   # Job 2: Generate C Header (from C binding file)
