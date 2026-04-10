@@ -607,8 +607,10 @@ jobs:
           # Copy libraries
           find all-artifacts -path "*/lib/*" -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" \) -exec cp {} hf-upload/lib/ \; 2>/dev/null || true
 
-          # Copy model weights from generated weights artifact
+          # Copy model weights, vocab, and reference data from generated weights artifact
           find all-artifacts/weights-${MODEL} -name "*.tl" -exec cp {} hf-upload/ \; 2>/dev/null || true
+          find all-artifacts/weights-${MODEL} -name "*_vocab.txt" -exec cp {} hf-upload/ \; 2>/dev/null || true
+          find all-artifacts/weights-${MODEL} -name "*_reference_embeddings.json" -exec cp {} hf-upload/ \; 2>/dev/null || true
 
           echo "=== Upload structure for $MODEL ==="
           find hf-upload -type f | head -50
