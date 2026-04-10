@@ -555,7 +555,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Hugging Face CLI
-        run: pip install huggingface_hub
+        run: pip install huggingface_hub[cli]
 
       - name: Organize artifacts for upload
         run: |
@@ -712,7 +712,7 @@ jobs:
           MODEL="${{ matrix.model }}"
           HF_REPO=$(python3 -c "import json; m=json.load(open('all-artifacts/model-metadata/model_metadata.json')); print(m['$MODEL']['hf_repo'])")
 
-          huggingface-cli login --token $HF_TOKEN
+          hf auth login --token $HF_TOKEN
 
           # Create repo if needed
           python3 << EOF
@@ -723,7 +723,7 @@ jobs:
               api.create_repo("$HF_REPO", repo_type="model", exist_ok=True)
           EOF
 
-          huggingface-cli upload "$HF_REPO" hf-upload/ . \
+          hf upload "$HF_REPO" hf-upload/ . \
             --repo-type model \
             --commit-message "Release ${{ github.ref_name }}"
 
