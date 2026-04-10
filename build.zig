@@ -462,6 +462,38 @@ pub fn build(b: *std.Build) void {
         const gpu_fwd_test_step = b.step("test-gpu-forward", "Run GPU forward pass tests");
         gpu_fwd_test_step.dependOn(&run_gpu_fwd_tests.step);
         gpu_test_step.dependOn(&run_gpu_fwd_tests.step);
+
+        // GPU model wrapper (wraps SentenceTransformerModel for GPU inference)
+        const gpu_model_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/gpu_model.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_model_module.addImport("vulkan", vulkan_module);
+        gpu_model_module.addImport("gpu_forward", gpu_forward_module);
+        gpu_model_module.addImport("model", st_model_module);
+        gpu_model_module.addImport("tokenizer", st_tokenizer_module);
+        gpu_model_module.addImport("transformer", transformer_module);
+        gpu_model_module.link_libc = true;
+        gpu_model_module.linkSystemLibrary("vulkan", .{});
+
+        // GPU vs CPU model test (loads real weights)
+        const gpu_model_test_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_gpu_model.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_model_test_module.addImport("gpu_model", gpu_model_module);
+        gpu_model_test_module.addImport("model", st_model_module);
+        gpu_model_test_module.addImport("tokenizer", st_tokenizer_module);
+
+        const gpu_model_tests = b.addTest(.{
+            .root_module = gpu_model_test_module,
+        });
+
+        const run_gpu_model_tests = b.addRunArtifact(gpu_model_tests);
+        const gpu_model_test_step = b.step("test-gpu-model", "Run GPU vs CPU model comparison tests");
+        gpu_model_test_step.dependOn(&run_gpu_model_tests.step);
     }
 
     // ==========================================================================
