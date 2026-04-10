@@ -4,7 +4,7 @@
 // Uses small synthetic weights (hidden=8, heads=2, ffn=16, 1 layer) for fast testing.
 
 const std = @import("std");
-const gpu_fwd = @import("gpu_forward");
+const gpu_fwd = @import("vulkan_forward");
 const gpu = @import("vulkan");
 
 // Small model config for testing

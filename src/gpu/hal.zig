@@ -171,7 +171,7 @@ fn tryGpuBackend(
         .linux, .windows => {
             // Vulkan backend (no circular dependency — vulkan_backend doesn't import hal)
             const VulkanBackend = @import("vulkan_backend");
-            const gpu_fwd = @import("gpu_forward");
+            const gpu_fwd = @import("vulkan_forward");
 
             // HAL types have identical layout to gpu_fwd types, safe to reinterpret
             const gpu_config = gpu_fwd.GpuConfig{
@@ -207,8 +207,41 @@ fn tryGpuBackend(
             };
         },
         .macos, .ios => {
-            // Metal backend (future)
-            return null;
+            // Metal backend (no circular dependency — metal_backend doesn't import hal)
+            const MetalBackend = @import("metal_backend");
+            const metal_fwd = @import("metal_forward");
+
+            const metal_config = metal_fwd.GpuConfig{
+                .hidden_dim = config.hidden_dim,
+                .num_heads = config.num_heads,
+                .head_dim = config.head_dim,
+                .ffn_dim = config.ffn_dim,
+                .num_layers = config.num_layers,
+                .vocab_size = config.vocab_size,
+                .max_seq_len = config.max_seq_len,
+                .max_batch_tokens = config.max_batch_tokens,
+            };
+
+            const metal_embeddings = metal_fwd.EmbeddingData{
+                .word_emb = embeddings.word_emb,
+                .pos_emb = embeddings.pos_emb,
+                .type_emb = embeddings.type_emb,
+                .ln_gamma = embeddings.ln_gamma,
+                .ln_beta = embeddings.ln_beta,
+            };
+
+            const metal_layers: []const metal_fwd.LayerData = @ptrCast(layers);
+
+            const backend = MetalBackend.init(allocator, metal_config, metal_embeddings, metal_layers) catch |err| {
+                std.log.info("GPU: Metal unavailable ({s}), using CPU fallback", .{@errorName(err)});
+                return null;
+            };
+
+            return GpuBackend{
+                .ptr = @ptrCast(backend),
+                .vtable = &metal_vtable,
+                .backend_type = .metal,
+            };
         },
         else => return null,
     }
@@ -244,6 +277,38 @@ const vulkan_vtable: GpuBackend.VTable = .{
     .forwardBatch = &vulkanForwardBatch,
     .getDeviceName = &vulkanGetDeviceName,
     .deinit = &vulkanDeinit,
+};
+
+// Metal vtable — bridges MetalBackend methods to GpuBackend interface
+fn metalForward(ptr: *anyopaque, input_ids: []const u32, output: []f32) anyerror!void {
+    const MetalBackend = @import("metal_backend");
+    const self: *MetalBackend = @ptrCast(@alignCast(ptr));
+    try self.forward(input_ids, output);
+}
+
+fn metalForwardBatch(ptr: *anyopaque, batch_ids: []const []const u32, output: []f32) anyerror!void {
+    const MetalBackend = @import("metal_backend");
+    const self: *MetalBackend = @ptrCast(@alignCast(ptr));
+    try self.forwardBatch(batch_ids, output);
+}
+
+fn metalGetDeviceName(ptr: *anyopaque) []const u8 {
+    const MetalBackend = @import("metal_backend");
+    const self: *const MetalBackend = @ptrCast(@alignCast(ptr));
+    return self.getDeviceName();
+}
+
+fn metalDeinit(ptr: *anyopaque) void {
+    const MetalBackend = @import("metal_backend");
+    const self: *MetalBackend = @ptrCast(@alignCast(ptr));
+    self.deinit();
+}
+
+const metal_vtable: GpuBackend.VTable = .{
+    .forward = &metalForward,
+    .forwardBatch = &metalForwardBatch,
+    .getDeviceName = &metalGetDeviceName,
+    .deinit = &metalDeinit,
 };
 
 /// CPU fallback — wraps the existing CPU inference path behind the HAL interface.

@@ -428,13 +428,13 @@ pub fn build(b: *std.Build) void {
         });
         vulkan_module.addImport("vk_loader", vk_loader_module);
 
-        // --- GPU forward pass (embeds SPIR-V shaders via @embedFile) ---
-        const gpu_forward_module = b.createModule(.{
-            .root_source_file = b.path("src/gpu/gpu_forward.zig"),
+        // --- Vulkan forward pass (embeds SPIR-V shaders via @embedFile) ---
+        const vulkan_forward_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vulkan_forward.zig"),
             .target = target,
             .optimize = optimize,
         });
-        gpu_forward_module.addImport("vulkan", vulkan_module);
+        vulkan_forward_module.addImport("vulkan", vulkan_module);
 
         // --- HAL interface (backend-agnostic) ---
         const hal_module = b.createModule(.{
@@ -449,11 +449,38 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        vulkan_backend_module.addImport("gpu_forward", gpu_forward_module);
+        vulkan_backend_module.addImport("vulkan_forward", vulkan_forward_module);
 
-        // HAL imports vulkan_backend + gpu_forward for auto-detection
+        // --- Metal low-level wrapper (Obj-C runtime, zero link-time Metal dep) ---
+        const metal_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/metal.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // needed for dlopen + libobjc
+        });
+        metal_module.linkSystemLibrary("objc", .{}); // for objc_msgSend, sel_registerName, objc_getClass
+
+        // --- Metal forward pass (embeds MSL shaders via @embedFile) ---
+        const metal_forward_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/metal_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        metal_forward_module.addImport("metal", metal_module);
+
+        // --- Metal backend (implements HAL for macOS/iOS) ---
+        const metal_backend_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/metal_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        metal_backend_module.addImport("metal_forward", metal_forward_module);
+
+        // HAL imports all backends for auto-detection
         hal_module.addImport("vulkan_backend", vulkan_backend_module);
-        hal_module.addImport("gpu_forward", gpu_forward_module);
+        hal_module.addImport("vulkan_forward", vulkan_forward_module);
+        hal_module.addImport("metal_backend", metal_backend_module);
+        hal_module.addImport("metal_forward", metal_forward_module);
 
         // Basic Vulkan compute tests (vec_add, sgemm)
         const gpu_test_module = b.createModule(.{
@@ -478,7 +505,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         gpu_fwd_test_module.addImport("vulkan", vulkan_module);
-        gpu_fwd_test_module.addImport("gpu_forward", gpu_forward_module);
+        gpu_fwd_test_module.addImport("vulkan_forward", vulkan_forward_module);
 
         const gpu_fwd_tests = b.addTest(.{
             .root_module = gpu_fwd_test_module,
@@ -897,13 +924,13 @@ fn buildNativeLib(
     });
     lib_vulkan_module.addImport("vk_loader", lib_vk_loader_module);
 
-    // GPU forward pass (embeds SPIR-V shaders)
-    const lib_gpu_forward_module = b.createModule(.{
-        .root_source_file = b.path("src/gpu/gpu_forward.zig"),
+    // Vulkan forward pass (embeds SPIR-V shaders)
+    const lib_vulkan_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vulkan_forward.zig"),
         .target = target,
         .optimize = optimize,
     });
-    lib_gpu_forward_module.addImport("vulkan", lib_vulkan_module);
+    lib_vulkan_forward_module.addImport("vulkan", lib_vulkan_module);
 
     // Vulkan backend (implements HAL)
     const lib_vulkan_backend_module = b.createModule(.{
@@ -911,7 +938,32 @@ fn buildNativeLib(
         .target = target,
         .optimize = optimize,
     });
-    lib_vulkan_backend_module.addImport("gpu_forward", lib_gpu_forward_module);
+    lib_vulkan_backend_module.addImport("vulkan_forward", lib_vulkan_forward_module);
+
+    // --- Metal low-level wrapper (Obj-C runtime, zero link-time Metal dep) ---
+    const lib_metal_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/metal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    lib_metal_module.linkSystemLibrary("objc", .{});
+
+    // --- Metal forward pass (embeds MSL shaders via @embedFile) ---
+    const lib_metal_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/metal_forward.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_metal_forward_module.addImport("metal", lib_metal_module);
+
+    // --- Metal backend (implements HAL for macOS/iOS) ---
+    const lib_metal_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/metal_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_metal_backend_module.addImport("metal_forward", lib_metal_forward_module);
 
     // HAL interface (backend-agnostic)
     const lib_hal_module = b.createModule(.{
@@ -920,7 +972,9 @@ fn buildNativeLib(
         .optimize = optimize,
     });
     lib_hal_module.addImport("vulkan_backend", lib_vulkan_backend_module);
-    lib_hal_module.addImport("gpu_forward", lib_gpu_forward_module);
+    lib_hal_module.addImport("vulkan_forward", lib_vulkan_forward_module);
+    lib_hal_module.addImport("metal_backend", lib_metal_backend_module);
+    lib_hal_module.addImport("metal_forward", lib_metal_forward_module);
 
     // GPU model wrapper (uses HAL auto-detection)
     const lib_gpu_model_module = b.createModule(.{
