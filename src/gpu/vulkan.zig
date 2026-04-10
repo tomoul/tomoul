@@ -278,7 +278,7 @@ pub const VulkanContext = struct {
         const pool_sizes = [_]vk.VkDescriptorPoolSize{
             .{
                 .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .descriptorCount = 128, // enough for many pipelines
+                .descriptorCount = 512, // enough for full transformer forward pass
             },
         };
 
@@ -286,7 +286,7 @@ pub const VulkanContext = struct {
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 32,
+            .maxSets = 128,
             .poolSizeCount = pool_sizes.len,
             .pPoolSizes = &pool_sizes,
         };
@@ -301,6 +301,17 @@ pub const VulkanContext = struct {
     /// Get device name as a slice
     pub fn getDeviceName(self: *const Self) []const u8 {
         return self.device_name[0..self.device_name_len];
+    }
+
+    /// Reset the descriptor pool, freeing all allocated descriptor sets.
+    /// Call before re-allocating descriptor sets for a new forward pass.
+    pub fn resetDescriptorPool(self: *Self) void {
+        _ = vk.vkResetDescriptorPool(self.device, self.descriptor_pool, 0);
+    }
+
+    /// Create a storage buffer (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+    pub fn createStorageBuffer(self: *Self, size: usize, host_visible: bool) VulkanError!GpuBuffer {
+        return self.createBuffer(size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host_visible);
     }
 
     // =========================================================================
@@ -695,5 +706,112 @@ pub const VulkanContext = struct {
         vk.vkDestroyCommandPool(self.device, self.command_pool, null);
         vk.vkDestroyDevice(self.device, null);
         vk.vkDestroyInstance(self.instance, null);
+    }
+
+    // =========================================================================
+    // Batched Command Buffer Recording
+    // =========================================================================
+
+    /// Begin recording a command buffer for multiple dispatches.
+    /// Use cmdDispatch() to record individual dispatches, then submitAndWait().
+    pub fn beginCommandBuffer(self: *Self) VulkanError!void {
+        _ = vk.vkResetCommandBuffer(self.command_buffer, 0);
+
+        const begin_info = vk.VkCommandBufferBeginInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = null,
+            .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = null,
+        };
+
+        if (vk.vkBeginCommandBuffer(self.command_buffer, &begin_info) != vk.VK_SUCCESS) {
+            return VulkanError.CommandBufferBeginFailed;
+        }
+    }
+
+    /// Record a compute dispatch into the current command buffer (no submit).
+    /// Automatically inserts a compute→compute memory barrier before the dispatch.
+    pub fn cmdDispatch(
+        self: *Self,
+        pipe: *const ComputePipeline,
+        descriptor_set: vk.VkDescriptorSet,
+        group_count_x: u32,
+        group_count_y: u32,
+        group_count_z: u32,
+        push_constants: ?[]const u8,
+    ) void {
+        // Memory barrier: ensure previous compute writes are visible
+        const barrier = vk.VkMemoryBarrier{
+            .sType = vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        vk.vkCmdPipelineBarrier(
+            self.command_buffer,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            1,
+            &barrier,
+            0,
+            null,
+            0,
+            null,
+        );
+
+        vk.vkCmdBindPipeline(self.command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
+        vk.vkCmdBindDescriptorSets(
+            self.command_buffer,
+            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipe.layout,
+            0,
+            1,
+            &descriptor_set,
+            0,
+            null,
+        );
+
+        if (push_constants) |pc| {
+            vk.vkCmdPushConstants(
+                self.command_buffer,
+                pipe.layout,
+                vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                @intCast(pc.len),
+                pc.ptr,
+            );
+        }
+
+        vk.vkCmdDispatch(self.command_buffer, group_count_x, group_count_y, group_count_z);
+    }
+
+    /// End recording and submit the command buffer, then wait for completion.
+    pub fn submitAndWait(self: *Self) VulkanError!void {
+        if (vk.vkEndCommandBuffer(self.command_buffer) != vk.VK_SUCCESS) {
+            return VulkanError.CommandBufferEndFailed;
+        }
+
+        _ = vk.vkResetFences(self.device, 1, &self.fence);
+
+        const submit_info = vk.VkSubmitInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = null,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = null,
+            .pWaitDstStageMask = null,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &self.command_buffer,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = null,
+        };
+
+        if (vk.vkQueueSubmit(self.compute_queue, 1, &submit_info, self.fence) != vk.VK_SUCCESS) {
+            return VulkanError.QueueSubmitFailed;
+        }
+
+        if (vk.vkWaitForFences(self.device, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64)) != vk.VK_SUCCESS) {
+            return VulkanError.FenceWaitFailed;
+        }
     }
 };

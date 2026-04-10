@@ -1,0 +1,105 @@
+#version 450
+
+// SGEMM + Bias: C = A @ B + bias
+// Tiled with shared memory, register blocking (4x4 per thread)
+// Same tile structure as sgemm.comp but with fused bias add
+//
+// A: [M, K], B: [K, N], bias: [N], C: [M, N]
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer BufferA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufferB { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer BufferC { float C[]; };
+layout(set = 0, binding = 3) readonly buffer BufferBias { float bias[]; };
+
+layout(push_constant) uniform Params {
+    uint M;  // rows of A / rows of C
+    uint N;  // cols of B / cols of C
+    uint K;  // cols of A / rows of B
+};
+
+const uint TILE_M = 64;
+const uint TILE_N = 64;
+const uint TILE_K = 16;
+const uint THREAD_TILE_M = 4;
+const uint THREAD_TILE_N = 4;
+
+shared float As[TILE_K][TILE_M];
+shared float Bs[TILE_K][TILE_N];
+
+void main() {
+    uint wg_row = gl_WorkGroupID.y * TILE_M;
+    uint wg_col = gl_WorkGroupID.x * TILE_N;
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+
+    float acc[THREAD_TILE_M][THREAD_TILE_N];
+    for (uint i = 0; i < THREAD_TILE_M; i++)
+        for (uint j = 0; j < THREAD_TILE_N; j++)
+            acc[i][j] = 0.0;
+
+    uint thread_row = local_row * THREAD_TILE_M;
+    uint thread_col = local_col * THREAD_TILE_N;
+    uint num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        uint k_offset = kt * TILE_K;
+
+        // Load A tile (transposed in shared memory)
+        for (uint load = 0; load < 4; load++) {
+            uint flat_idx = (local_row * 16 + local_col) * 4 + load;
+            uint a_k = flat_idx / TILE_M;
+            uint a_m = flat_idx % TILE_M;
+            uint global_m = wg_row + a_m;
+            uint global_k = k_offset + a_k;
+            if (global_m < M && global_k < K && a_k < TILE_K)
+                As[a_k][a_m] = A[global_m * K + global_k];
+            else if (a_k < TILE_K)
+                As[a_k][a_m] = 0.0;
+        }
+
+        // Load B tile
+        for (uint load = 0; load < 4; load++) {
+            uint flat_idx = (local_row * 16 + local_col) * 4 + load;
+            uint b_k = flat_idx / TILE_N;
+            uint b_n = flat_idx % TILE_N;
+            uint global_k = k_offset + b_k;
+            uint global_n = wg_col + b_n;
+            if (global_k < K && global_n < N && b_k < TILE_K)
+                Bs[b_k][b_n] = B[global_k * N + global_n];
+            else if (b_k < TILE_K)
+                Bs[b_k][b_n] = 0.0;
+        }
+
+        barrier();
+
+        // Accumulate
+        for (uint k = 0; k < TILE_K; k++) {
+            float a_vals[THREAD_TILE_M];
+            for (uint i = 0; i < THREAD_TILE_M; i++)
+                a_vals[i] = As[k][thread_row + i];
+
+            float b_vals[THREAD_TILE_N];
+            for (uint j = 0; j < THREAD_TILE_N; j++)
+                b_vals[j] = Bs[k][thread_col + j];
+
+            for (uint i = 0; i < THREAD_TILE_M; i++)
+                for (uint j = 0; j < THREAD_TILE_N; j++)
+                    acc[i][j] += a_vals[i] * b_vals[j];
+        }
+
+        barrier();
+    }
+
+    // Write results with bias
+    for (uint i = 0; i < THREAD_TILE_M; i++) {
+        uint global_row = wg_row + thread_row + i;
+        if (global_row >= M) continue;
+        for (uint j = 0; j < THREAD_TILE_N; j++) {
+            uint global_col = wg_col + thread_col + j;
+            if (global_col >= N) continue;
+            C[global_row * N + global_col] = acc[i][j] + bias[global_col];
+        }
+    }
+}

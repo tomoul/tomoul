@@ -420,6 +420,16 @@ pub fn build(b: *std.Build) void {
         vulkan_module.link_libc = true;
         vulkan_module.linkSystemLibrary("vulkan", .{});
 
+        const gpu_forward_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/gpu_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_forward_module.addImport("vulkan", vulkan_module);
+        gpu_forward_module.link_libc = true;
+        gpu_forward_module.linkSystemLibrary("vulkan", .{});
+
+        // Basic Vulkan compute tests (vec_add, sgemm)
         const gpu_test_module = b.createModule(.{
             .root_source_file = b.path("tests/test_vulkan_compute.zig"),
             .target = target,
@@ -434,6 +444,24 @@ pub fn build(b: *std.Build) void {
         const run_gpu_tests = b.addRunArtifact(gpu_tests);
         const gpu_test_step = b.step("test-gpu", "Run Vulkan GPU compute tests");
         gpu_test_step.dependOn(&run_gpu_tests.step);
+
+        // GPU forward pass tests (layernorm, gelu, attention, full forward)
+        const gpu_fwd_test_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_gpu_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_fwd_test_module.addImport("vulkan", vulkan_module);
+        gpu_fwd_test_module.addImport("gpu_forward", gpu_forward_module);
+
+        const gpu_fwd_tests = b.addTest(.{
+            .root_module = gpu_fwd_test_module,
+        });
+
+        const run_gpu_fwd_tests = b.addRunArtifact(gpu_fwd_tests);
+        const gpu_fwd_test_step = b.step("test-gpu-forward", "Run GPU forward pass tests");
+        gpu_fwd_test_step.dependOn(&run_gpu_fwd_tests.step);
+        gpu_test_step.dependOn(&run_gpu_fwd_tests.step);
     }
 
     // ==========================================================================

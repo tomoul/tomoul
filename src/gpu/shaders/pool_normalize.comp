@@ -1,0 +1,55 @@
+#version 450
+
+// Mean Pooling + L2 Normalization
+// Phase 1: output[d] = mean(input[t][d]) for t in 0..seq_len-1
+// Phase 2: output[d] /= L2_norm(output)
+//
+// Uses shared memory for intermediate pooled result to avoid read-after-write hazards
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float input_buf[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float output_buf[]; };
+
+layout(push_constant) uniform Params {
+    uint seq_len;
+    uint hidden_dim;
+};
+
+shared float pool_result[512];  // max hidden_dim
+shared float sdata[256];        // for reductions
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Phase 1: Mean pooling per dimension
+    for (uint d = tid; d < hidden_dim; d += 256) {
+        float sum = 0.0;
+        for (uint t = 0; t < seq_len; t++) {
+            sum += input_buf[t * hidden_dim + d];
+        }
+        pool_result[d] = sum / float(seq_len);
+    }
+    barrier();
+
+    // Phase 2: Compute L2 norm (sum of squares across all dimensions)
+    float local_ss = 0.0;
+    for (uint d = tid; d < hidden_dim; d += 256) {
+        local_ss += pool_result[d] * pool_result[d];
+    }
+    sdata[tid] = local_ss;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float l2_norm = sqrt(sdata[0]);
+    barrier();
+
+    // Phase 3: Normalize and write output
+    float inv_norm = (l2_norm > 1e-12) ? (1.0 / l2_norm) : 0.0;
+    for (uint d = tid; d < hidden_dim; d += 256) {
+        output_buf[d] = pool_result[d] * inv_norm;
+    }
+}
