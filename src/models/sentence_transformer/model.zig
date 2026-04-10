@@ -29,8 +29,8 @@ const QuantizedTensorQ8K = quant.QuantizedTensorQ8K;
 const F16Tensor = quant.F16Tensor;
 
 const tokenizer_mod = @import("tokenizer.zig");
-const Tokenizer = tokenizer_mod.Tokenizer;
-const TokenizerOutput = tokenizer_mod.TokenizerOutput;
+pub const Tokenizer = tokenizer_mod.Tokenizer;
+pub const TokenizerOutput = tokenizer_mod.TokenizerOutput;
 
 // =============================================================================
 // Configuration
