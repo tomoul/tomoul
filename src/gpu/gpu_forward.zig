@@ -26,6 +26,17 @@
 const std = @import("std");
 const gpu = @import("vulkan");
 
+// Embedded SPIR-V shaders (compiled at build time, no external files needed)
+const spv_sgemm_bias = @embedFile("shaders/sgemm_bias.spv");
+const spv_layernorm = @embedFile("shaders/layernorm.spv");
+const spv_gelu = @embedFile("shaders/gelu.spv");
+const spv_residual_add = @embedFile("shaders/residual_add.spv");
+const spv_attention = @embedFile("shaders/attention.spv");
+const spv_embedding_lookup = @embedFile("shaders/embedding_lookup.spv");
+const spv_pool_normalize = @embedFile("shaders/pool_normalize.spv");
+const spv_attention_batch = @embedFile("shaders/attention_batch.spv");
+const spv_pool_normalize_batch = @embedFile("shaders/pool_normalize_batch.spv");
+
 // ============================================================================
 // Push Constant Structs (must match GLSL shader layouts exactly)
 // ============================================================================
@@ -107,9 +118,8 @@ const LayerGpuWeights = struct {
 };
 
 pub const GpuForwardError = error{
-    ShaderLoadFailed,
     VulkanInitFailed,
-} || gpu.VulkanError || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError || std.fs.File.StatError;
+} || gpu.VulkanError || std.mem.Allocator.Error;
 
 // ============================================================================
 // GPU Forward Pass Context
@@ -182,17 +192,17 @@ pub const GpuForward = struct {
 
         std.debug.print("GPU: Using device: {s}\n", .{self.ctx.getDeviceName()});
 
-        // 2. Create compute pipelines from SPIR-V shaders
-        self.sgemm_bias_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/sgemm_bias.spv", 4, @sizeOf(SgemmBiasPC));
-        self.layernorm_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/layernorm.spv", 3, @sizeOf(LayerNormPC));
-        self.gelu_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/gelu.spv", 1, @sizeOf(ElementPC));
-        self.residual_add_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/residual_add.spv", 2, @sizeOf(ElementPC));
-        self.attention_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/attention.spv", 4, @sizeOf(AttentionPC));
-        self.embedding_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/embedding_lookup.spv", 5, @sizeOf(EmbeddingPC));
-        self.pool_normalize_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/pool_normalize.spv", 2, @sizeOf(PoolNormPC));
-        // Batch-specific pipelines: attention_batch (5 bindings), pool_normalize_batch (4 bindings)
-        self.attention_batch_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/attention_batch.spv", 5, @sizeOf(AttentionBatchPC));
-        self.pool_normalize_batch_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/pool_normalize_batch.spv", 4, @sizeOf(PoolNormBatchPC));
+        // 2. Create compute pipelines from embedded SPIR-V shaders (no external files)
+        self.sgemm_bias_pipe = try self.ctx.createComputePipeline(spv_sgemm_bias, 4, @sizeOf(SgemmBiasPC));
+        self.layernorm_pipe = try self.ctx.createComputePipeline(spv_layernorm, 3, @sizeOf(LayerNormPC));
+        self.gelu_pipe = try self.ctx.createComputePipeline(spv_gelu, 1, @sizeOf(ElementPC));
+        self.residual_add_pipe = try self.ctx.createComputePipeline(spv_residual_add, 2, @sizeOf(ElementPC));
+        self.attention_pipe = try self.ctx.createComputePipeline(spv_attention, 4, @sizeOf(AttentionPC));
+        self.embedding_pipe = try self.ctx.createComputePipeline(spv_embedding_lookup, 5, @sizeOf(EmbeddingPC));
+        self.pool_normalize_pipe = try self.ctx.createComputePipeline(spv_pool_normalize, 2, @sizeOf(PoolNormPC));
+        // Batch-specific pipelines
+        self.attention_batch_pipe = try self.ctx.createComputePipeline(spv_attention_batch, 5, @sizeOf(AttentionBatchPC));
+        self.pool_normalize_batch_pipe = try self.ctx.createComputePipeline(spv_pool_normalize_batch, 4, @sizeOf(PoolNormBatchPC));
 
         // 3. Upload embedding weights
         self.word_emb_buf = try uploadF32(&self.ctx, embeddings.word_emb);
@@ -365,7 +375,7 @@ pub const GpuForward = struct {
         {
             const desc = try self.ctx.allocateDescriptorSet(&self.embedding_pipe);
             try self.ctx.bindBuffers(desc, &[_]gpu.GpuBuffer{
-                self.ids_buf, self.word_emb_buf, self.pos_emb_buf,
+                self.ids_buf,      self.word_emb_buf, self.pos_emb_buf,
                 self.type_emb_buf, self.buf_a,
             });
             const pc = EmbeddingPC{ .seq_len = total_tokens, .hidden_dim = hidden };
@@ -585,25 +595,6 @@ pub const GpuForward = struct {
 // ============================================================================
 // File Helpers
 // ============================================================================
-
-fn loadPipeline(
-    ctx: *gpu.VulkanContext,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    num_buffers: u32,
-    pc_size: u32,
-) !gpu.ComputePipeline {
-    const file = std.fs.cwd().openFile(path, .{}) catch |e| {
-        std.debug.print("GPU: Failed to open shader: {s}: {}\n", .{ path, e });
-        return e;
-    };
-    defer file.close();
-    const stat = try file.stat();
-    const data = try allocator.alloc(u8, stat.size);
-    defer allocator.free(data);
-    const bytes = try file.readAll(data);
-    return ctx.createComputePipeline(data[0..bytes], num_buffers, pc_size);
-}
 
 fn uploadF32(ctx: *gpu.VulkanContext, data: []const f32) !gpu.GpuBuffer {
     const size = data.len * @sizeOf(f32);

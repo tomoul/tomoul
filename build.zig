@@ -409,25 +409,51 @@ pub fn build(b: *std.Build) void {
     st_test_step.dependOn(&run_st_tests.step);
 
     // ==========================================================================
-    // Vulkan GPU compute tests
+    // GPU HAL (Hardware Abstraction Layer) + Vulkan Backend
     // ==========================================================================
     {
+        // --- Runtime Vulkan loader (dlopen — zero link-time dependency) ---
+        const vk_loader_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vk_loader.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // needed for dlopen to search standard library paths
+        });
+
+        // --- Low-level Vulkan wrapper (uses vk_loader at runtime) ---
         const vulkan_module = b.createModule(.{
             .root_source_file = b.path("src/gpu/vulkan.zig"),
             .target = target,
             .optimize = optimize,
         });
-        vulkan_module.link_libc = true;
-        vulkan_module.linkSystemLibrary("vulkan", .{});
+        vulkan_module.addImport("vk_loader", vk_loader_module);
 
+        // --- GPU forward pass (embeds SPIR-V shaders via @embedFile) ---
         const gpu_forward_module = b.createModule(.{
             .root_source_file = b.path("src/gpu/gpu_forward.zig"),
             .target = target,
             .optimize = optimize,
         });
         gpu_forward_module.addImport("vulkan", vulkan_module);
-        gpu_forward_module.link_libc = true;
-        gpu_forward_module.linkSystemLibrary("vulkan", .{});
+
+        // --- HAL interface (backend-agnostic) ---
+        const hal_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/hal.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        // --- Vulkan backend (implements HAL for Linux/Windows/Android) ---
+        const vulkan_backend_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vulkan_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        vulkan_backend_module.addImport("gpu_forward", gpu_forward_module);
+
+        // HAL imports vulkan_backend + gpu_forward for auto-detection
+        hal_module.addImport("vulkan_backend", vulkan_backend_module);
+        hal_module.addImport("gpu_forward", gpu_forward_module);
 
         // Basic Vulkan compute tests (vec_add, sgemm)
         const gpu_test_module = b.createModule(.{
@@ -463,19 +489,16 @@ pub fn build(b: *std.Build) void {
         gpu_fwd_test_step.dependOn(&run_gpu_fwd_tests.step);
         gpu_test_step.dependOn(&run_gpu_fwd_tests.step);
 
-        // GPU model wrapper (wraps SentenceTransformerModel for GPU inference)
+        // GPU model wrapper (uses HAL auto-detection)
         const gpu_model_module = b.createModule(.{
             .root_source_file = b.path("src/gpu/gpu_model.zig"),
             .target = target,
             .optimize = optimize,
         });
-        gpu_model_module.addImport("vulkan", vulkan_module);
-        gpu_model_module.addImport("gpu_forward", gpu_forward_module);
+        gpu_model_module.addImport("hal", hal_module);
         gpu_model_module.addImport("model", st_model_module);
         gpu_model_module.addImport("tokenizer", st_tokenizer_module);
         gpu_model_module.addImport("transformer", transformer_module);
-        gpu_model_module.link_libc = true;
-        gpu_model_module.linkSystemLibrary("vulkan", .{});
 
         // GPU vs CPU model test (loads real weights)
         const gpu_model_test_module = b.createModule(.{

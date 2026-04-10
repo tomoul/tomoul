@@ -1,8 +1,10 @@
 // src/gpu/gpu_model.zig
 //
 // GPU-accelerated Sentence Transformer wrapper.
-// Wraps the existing SentenceTransformerModel and provides embedGpu()
-// that runs the full forward pass on GPU via Vulkan compute shaders.
+//
+// Uses the HAL (Hardware Abstraction Layer) to automatically select the best
+// available GPU backend (Vulkan, Metal, or CPU fallback). The user never
+// needs to know which backend is running.
 //
 // Usage:
 //   var model = try SentenceTransformerModel.init(alloc, path);
@@ -11,14 +13,11 @@
 //   const embedding = try gpu.embed(&tokenizer, "hello world");
 
 const std = @import("std");
-const gpu_fwd = @import("gpu_forward");
-const gpu = @import("vulkan");
+const hal = @import("hal");
 
-// These types come from the model module
+// Model types
 const model_mod = @import("model");
 const SentenceTransformerModel = model_mod.SentenceTransformerModel;
-const SentenceTransformerConfig = model_mod.SentenceTransformerConfig;
-const SentenceTransformer = model_mod.SentenceTransformer;
 const Tokenizer = @import("tokenizer").Tokenizer;
 const transformer_mod = @import("transformer");
 const TransformerBlockWeightsF32 = transformer_mod.TransformerBlockWeightsF32;
@@ -27,20 +26,20 @@ const TransformerBlockWeightsF16 = transformer_mod.TransformerBlockWeightsF16;
 
 pub const GpuModel = struct {
     allocator: std.mem.Allocator,
-    fwd: gpu_fwd.GpuForward,
+    backend: hal.GpuBackend,
     hidden_dim: u32,
 
     const Self = @This();
 
     /// Initialize GPU model from an already-loaded SentenceTransformerModel.
-    /// Uploads all F32 weights to GPU. For Q8K/F16 models, weights are
-    /// dequantized to F32 for GPU upload (GPU Q8K kernels are future work).
+    /// Automatically selects the best GPU backend (Vulkan, Metal, or CPU fallback).
+    /// For Q8K/F16 models, weights are dequantized to F32 for GPU upload.
     pub fn init(allocator: std.mem.Allocator, model: *const SentenceTransformerModel) !Self {
         const config = model.config;
         const hidden: u32 = @intCast(config.hidden_dim);
         const num_heads: u32 = @intCast(config.num_heads);
 
-        const gpu_config = gpu_fwd.GpuConfig{
+        const hal_config = hal.HalConfig{
             .hidden_dim = hidden,
             .num_heads = num_heads,
             .head_dim = hidden / num_heads,
@@ -48,10 +47,10 @@ pub const GpuModel = struct {
             .num_layers = @intCast(config.num_layers),
             .vocab_size = @intCast(config.vocab_size),
             .max_seq_len = @intCast(config.max_seq_len),
-            .max_batch_tokens = @intCast(config.max_seq_len * 32), // support batch up to 32 sentences
+            .max_batch_tokens = @intCast(config.max_seq_len * 32),
         };
 
-        const embeddings = gpu_fwd.EmbeddingData{
+        const embeddings = hal.EmbeddingData{
             .word_emb = model.word_embeddings.data,
             .pos_emb = model.position_embeddings.data,
             .type_emb = model.token_type_embeddings.data,
@@ -61,7 +60,7 @@ pub const GpuModel = struct {
 
         // Extract per-layer weight data (dequantize Q8K/F16 → F32 for GPU upload)
         const num_layers = config.num_layers;
-        const layer_data = try allocator.alloc(gpu_fwd.LayerData, num_layers);
+        const layer_data = try allocator.alloc(hal.LayerData, num_layers);
         defer allocator.free(layer_data);
 
         // Arena for temporary dequantized weight buffers (freed after GpuForward.init uploads them)
@@ -87,23 +86,34 @@ pub const GpuModel = struct {
             },
         }
 
-        const fwd = try gpu_fwd.GpuForward.init(allocator, gpu_config, embeddings, layer_data);
+        const backend = hal.autoDetect(allocator, hal_config, embeddings, layer_data);
 
         return Self{
             .allocator = allocator,
-            .fwd = fwd,
+            .backend = backend,
             .hidden_dim = hidden,
         };
     }
 
-    /// Embed a single text on GPU → normalized 384-dim vector
+    /// Embed a single text → normalized 384-dim vector.
+    /// Uses GPU if available, returns error if backend is CPU (caller should use CPU path).
     pub fn embed(self: *Self, tokenizer: *Tokenizer, text: []const u8) ![384]f32 {
         var enc = try tokenizer.encode(text);
         defer enc.deinit(self.allocator);
 
         var output: [384]f32 = undefined;
-        try self.fwd.forward(enc.input_ids, &output);
+        try self.backend.forward(enc.input_ids, &output);
         return output;
+    }
+
+    /// Returns true if a real GPU backend is active (not CPU fallback).
+    pub fn isGpuActive(self: *const Self) bool {
+        return self.backend.backend_type != .cpu;
+    }
+
+    /// Get the name of the active compute device.
+    pub fn getDeviceName(self: *const Self) []const u8 {
+        return self.backend.getDeviceName();
     }
 
     /// Embed a batch of texts on GPU → array of normalized 384-dim vectors
@@ -129,7 +139,7 @@ pub const GpuModel = struct {
         const flat = try self.allocator.alloc(f32, texts.len * hidden);
         defer self.allocator.free(flat);
 
-        try self.fwd.forwardBatch(batch_ids, flat);
+        try self.backend.forwardBatch(batch_ids, flat);
 
         // Copy to structured output
         for (0..texts.len) |i| {
@@ -138,15 +148,15 @@ pub const GpuModel = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.fwd.deinit();
+        self.backend.deinit();
     }
 
     // =========================================================================
     // Weight extraction helpers
     // =========================================================================
 
-    fn extractLayerF32(blk: *const TransformerBlockWeightsF32) gpu_fwd.LayerData {
-        return gpu_fwd.LayerData{
+    fn extractLayerF32(blk: *const TransformerBlockWeightsF32) hal.LayerData {
+        return hal.LayerData{
             .q_weight = blk.attention.q_weight.data,
             .q_bias = blk.attention.q_bias.data,
             .k_weight = blk.attention.k_weight.data,
@@ -166,8 +176,8 @@ pub const GpuModel = struct {
         };
     }
 
-    fn extractLayerQ8K(arena: std.mem.Allocator, blk: *const TransformerBlockWeightsQ8K) !gpu_fwd.LayerData {
-        return gpu_fwd.LayerData{
+    fn extractLayerQ8K(arena: std.mem.Allocator, blk: *const TransformerBlockWeightsQ8K) !hal.LayerData {
+        return hal.LayerData{
             .q_weight = try dequantQ8K(arena, &blk.attention.q_weight),
             .q_bias = blk.attention.q_bias.data,
             .k_weight = try dequantQ8K(arena, &blk.attention.k_weight),
@@ -187,8 +197,8 @@ pub const GpuModel = struct {
         };
     }
 
-    fn extractLayerF16(arena: std.mem.Allocator, blk: *const TransformerBlockWeightsF16) !gpu_fwd.LayerData {
-        return gpu_fwd.LayerData{
+    fn extractLayerF16(arena: std.mem.Allocator, blk: *const TransformerBlockWeightsF16) !hal.LayerData {
+        return hal.LayerData{
             .q_weight = try dequantF16(arena, &blk.attention.q_weight),
             .q_bias = blk.attention.q_bias.data,
             .k_weight = try dequantF16(arena, &blk.attention.k_weight),
