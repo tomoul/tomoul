@@ -458,7 +458,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true, // needed for dlopen + libobjc
         });
-        metal_module.linkSystemLibrary("objc", .{}); // for objc_msgSend, sel_registerName, objc_getClass
+        // Only link libobjc on Apple platforms (Metal is dead code elsewhere)
+        const os_tag = target.query.os_tag orelse @import("builtin").os.tag;
+        if (os_tag == .macos or os_tag == .ios) {
+            metal_module.linkSystemLibrary("objc", .{}); // for objc_msgSend, sel_registerName, objc_getClass
+        }
 
         // --- Metal forward pass (embeds MSL shaders via @embedFile) ---
         const metal_forward_module = b.createModule(.{
@@ -476,11 +480,36 @@ pub fn build(b: *std.Build) void {
         });
         metal_backend_module.addImport("metal_forward", metal_forward_module);
 
+        // --- WebGPU low-level bridge (extern JS imports for WASM) ---
+        const webgpu_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/webgpu.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        // --- WebGPU forward pass (embeds WGSL shaders via @embedFile) ---
+        const webgpu_forward_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/webgpu_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        webgpu_forward_module.addImport("webgpu", webgpu_module);
+
+        // --- WebGPU backend (implements HAL for WASM/browser) ---
+        const webgpu_backend_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/webgpu_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        webgpu_backend_module.addImport("webgpu_forward", webgpu_forward_module);
+
         // HAL imports all backends for auto-detection
         hal_module.addImport("vulkan_backend", vulkan_backend_module);
         hal_module.addImport("vulkan_forward", vulkan_forward_module);
         hal_module.addImport("metal_backend", metal_backend_module);
         hal_module.addImport("metal_forward", metal_forward_module);
+        hal_module.addImport("webgpu_backend", webgpu_backend_module);
+        hal_module.addImport("webgpu_forward", webgpu_forward_module);
 
         // Basic Vulkan compute tests (vec_add, sgemm)
         const gpu_test_module = b.createModule(.{
@@ -743,10 +772,74 @@ fn buildWasmModel(
     wasm_binding.addImport("tensor", wasm_tensor_module);
     wasm_binding.addImport("model", wasm_model_module);
 
+    // =========================================================================
+    // GPU modules for WASM (WebGPU acceleration via JS bridge)
+    // =========================================================================
+
+    // Tokenizer module (needed by gpu_model)
+    const wasm_tokenizer_module = b.createModule(.{
+        .root_source_file = b.path("src/models/sentence_transformer/tokenizer.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_model_module.addImport("tokenizer.zig", wasm_tokenizer_module);
+
+    // WebGPU modules (active on wasm32)
+    // Note: Vulkan and Metal modules are NOT built for wasm32 — they contain
+    // platform-specific code (objc_msgSend @ptrCast, Vulkan loaders) that
+    // triggers LLVM Invalid Cast errors on 32-bit targets (Zig issue #24345).
+    const wasm_webgpu_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    const wasm_webgpu_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu_forward.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_webgpu_forward_module.addImport("webgpu", wasm_webgpu_module);
+
+    const wasm_webgpu_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu_backend.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_webgpu_backend_module.addImport("webgpu_forward", wasm_webgpu_forward_module);
+
+    // HAL interface (auto-detects WebGPU on wasm32-freestanding)
+    const wasm_hal_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/hal.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_hal_module.addImport("webgpu_backend", wasm_webgpu_backend_module);
+    wasm_hal_module.addImport("webgpu_forward", wasm_webgpu_forward_module);
+
+    // GPU model wrapper (uses HAL auto-detection)
+    const wasm_gpu_model_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/gpu_model.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_gpu_model_module.addImport("hal", wasm_hal_module);
+    wasm_gpu_model_module.addImport("model", wasm_model_module);
+    wasm_gpu_model_module.addImport("tokenizer", wasm_tokenizer_module);
+    wasm_gpu_model_module.addImport("transformer", wasm_transformer_module);
+
+    wasm_binding.addImport("gpu_model", wasm_gpu_model_module);
+
     // Embed model weights if bundled
+    // For WASM, prefer Q8K variant if available (smaller download, fits in less memory)
     if (model.supports_bundled) {
+        const wasm_weights = blk: {
+            for (model.weight_variants) |v| {
+                if (std.mem.eql(u8, v.suffix, "-q8k")) break :blk v.path;
+            }
+            break :blk weights_path;
+        };
         wasm_binding.addAnonymousImport("model_weights", .{
-            .root_source_file = b.path(weights_path),
+            .root_source_file = b.path(wasm_weights),
         });
     }
 
@@ -947,7 +1040,11 @@ fn buildNativeLib(
         .optimize = optimize,
         .link_libc = true,
     });
-    lib_metal_module.linkSystemLibrary("objc", .{});
+    // Only link libobjc on Apple platforms (Metal is dead code elsewhere)
+    const lib_os_tag = target.query.os_tag orelse @import("builtin").os.tag;
+    if (lib_os_tag == .macos or lib_os_tag == .ios) {
+        lib_metal_module.linkSystemLibrary("objc", .{});
+    }
 
     // --- Metal forward pass (embeds MSL shaders via @embedFile) ---
     const lib_metal_forward_module = b.createModule(.{
@@ -965,6 +1062,29 @@ fn buildNativeLib(
     });
     lib_metal_backend_module.addImport("metal_forward", lib_metal_forward_module);
 
+    // --- WebGPU low-level bridge (extern JS imports for WASM) ---
+    const lib_webgpu_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // --- WebGPU forward pass (embeds WGSL shaders via @embedFile) ---
+    const lib_webgpu_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu_forward.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_webgpu_forward_module.addImport("webgpu", lib_webgpu_module);
+
+    // --- WebGPU backend (implements HAL for WASM/browser) ---
+    const lib_webgpu_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_webgpu_backend_module.addImport("webgpu_forward", lib_webgpu_forward_module);
+
     // HAL interface (backend-agnostic)
     const lib_hal_module = b.createModule(.{
         .root_source_file = b.path("src/gpu/hal.zig"),
@@ -975,6 +1095,8 @@ fn buildNativeLib(
     lib_hal_module.addImport("vulkan_forward", lib_vulkan_forward_module);
     lib_hal_module.addImport("metal_backend", lib_metal_backend_module);
     lib_hal_module.addImport("metal_forward", lib_metal_forward_module);
+    lib_hal_module.addImport("webgpu_backend", lib_webgpu_backend_module);
+    lib_hal_module.addImport("webgpu_forward", lib_webgpu_forward_module);
 
     // GPU model wrapper (uses HAL auto-detection)
     const lib_gpu_model_module = b.createModule(.{

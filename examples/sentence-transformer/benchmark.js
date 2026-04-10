@@ -17,10 +17,16 @@ const platform = process.platform;
 const arch = process.arch;
 
 let libSuffix;
+let libPrefix = 'lib';
+let libDir = 'zig-out/lib';
 if (platform === 'linux') {
-    libSuffix = arch === 'x64' ? '.so' : '.so';
+    libSuffix = '.so';
 } else if (platform === 'darwin') {
     libSuffix = '.dylib';
+} else if (platform === 'win32') {
+    libSuffix = '.dll';
+    libPrefix = '';
+    libDir = 'zig-out/bin'; // Zig puts DLLs in bin/ on Windows
 } else {
     console.error(`Unsupported platform: ${platform}`);
     process.exit(1);
@@ -36,12 +42,12 @@ const weightFiles = {
     'f16': 'all_minilm_l6_v2_f16.tl',
 };
 
-const LIB_PATH = path.join(PROJECT_ROOT, 'zig-out/lib', `libtomoul_sentence_transformer${libSuffix}`);
+const LIB_PATH = path.join(PROJECT_ROOT, libDir, `${libPrefix}tomoul_sentence_transformer${libSuffix}`);
 const WEIGHTS_PATH = path.join(PROJECT_ROOT, 'artifacts', weightFiles[VARIANT] || weightFiles['f32']);
 const VOCAB_PATH = path.join(PROJECT_ROOT, 'artifacts/all_minilm_l6_v2_vocab.txt');
 
 // Also check release/lib/ if zig-out doesn't have it
-const LIB_PATH_ALT = path.join(PROJECT_ROOT, 'release/lib', `libtomoul_sentence_transformer${libSuffix}`);
+const LIB_PATH_ALT = path.join(PROJECT_ROOT, 'release/lib', `${libPrefix}tomoul_sentence_transformer${libSuffix}`);
 
 const libPath = fs.existsSync(LIB_PATH) ? LIB_PATH : LIB_PATH_ALT;
 

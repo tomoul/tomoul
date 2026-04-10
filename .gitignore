@@ -1,6 +1,8 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+*.o
+*.wasm
 
 # Release staging directory (artifacts uploaded to HuggingFace)
 release/

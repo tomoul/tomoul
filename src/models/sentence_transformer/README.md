@@ -31,7 +31,9 @@ In Q8_K mode, only transformer block linear weights are quantized. Embeddings an
 
 ## Benchmarks
 
-Measured on AMD CPU + RTX 4090, 50 iterations, warm start:
+### CPU — WSL (AMD CPU + RTX 4090)
+
+Measured on AMD CPU, 50 iterations, warm start:
 
 | Engine | Weights | Single (ms) | 5-sent (ms/sent) | 10-sent (ms/sent) | Notes |
 |---|---|---|---|---|---|
@@ -41,11 +43,26 @@ Measured on AMD CPU + RTX 4090, 50 iterations, warm start:
 | PyTorch CPU (MKL) | F32 | 3.6 | 3.6 | 1.0 (batched) | `transformers` pipeline |
 | PyTorch CUDA (RTX 4090) | F32 | 2.6 | — | 0.55 (batched) | GPU baseline |
 
-Q8_K is the recommended variant: **3.6× smaller** model (24 MB vs 87 MB), **2.5× faster** than F32, and matches or beats PyTorch CPU — with negligible accuracy loss (cosine similarity ≥ 0.9997 vs F32).
+### GPU (Vulkan) — Windows (RTX 4090)
 
-**Optimizations applied:** arena allocator for inference scratch, fused strided multi-head attention (no per-head copies), vectorized GELU (Padé tanh approximation), SIMD bias addition, in-place layerNorm, zblas skinny-M SGEMM kernel, zblas Q8_K weight-only quantized SGEMM. See [zblas](https://github.com/tomoul/zblas) for BLAS-level optimization details.
+Measured on Windows, NVIDIA GeForce RTX 4090 (24 GB VRAM), Vulkan compute shaders, warm start:
 
-**Accuracy:** All 5 reference sentences achieve cosine similarity ≥ 0.99 against HuggingFace `sentence-transformers` output (both F32 and Q8_K variants).
+| Engine | Backend | Weights | Single (ms) | 5-sent batch (ms) | Per-sent batch (ms) | CPU→GPU Speedup |
+|---|---|---|---|---|---|---|
+| **Tomoul** (Zig, ReleaseFast) | Vulkan | **Q8_K** | **3.55** | **5.47** | **1.09** | 5.36× single, 19.15× batch |
+| **Tomoul** (Zig, ReleaseFast) | Vulkan | F32 | 3.90 | 5.64 | 1.13 | 5.31× single, 19.34× batch |
+| Tomoul CPU baseline | — | F32 | 20.70 | 104.77 | 20.95 | — |
+| PyTorch CUDA | CUDA | F32 | 2.97 | — | 0.50 (10-sent) | — |
+
+Tomoul Vulkan is within **1.2× of PyTorch CUDA** on single inference while using **portable Vulkan compute shaders** with zero dependency on vendor-specific libraries (no cuBLAS/cuDNN). Q8_K delivers **3.56× smaller** weights (24 MB vs 87 MB) with negligible accuracy loss (cosine similarity ≥ 0.986 vs CPU F32).
+
+**Key advantage:** Vulkan runs on any GPU with a Vulkan driver (NVIDIA, AMD, Intel) — no CUDA toolkit required. The entire Tomoul runtime is a **14 MB DLL** vs ~2 GB for PyTorch + CUDA.
+
+Q8_K is the recommended variant: **3.6× smaller** model (24 MB vs 87 MB), **2.5× faster** than F32 on CPU, and competitive with PyTorch CUDA on GPU — with negligible accuracy loss (cosine similarity ≥ 0.9997 vs F32).
+
+**Optimizations applied:** arena allocator for inference scratch, fused strided multi-head attention (no per-head copies), vectorized GELU (Padé tanh approximation), SIMD bias addition, in-place layerNorm, zblas skinny-M SGEMM kernel, zblas Q8_K weight-only quantized SGEMM, Vulkan compute shaders with SPIR-V (9 embedded shaders: sgemm_bias, layernorm, gelu, residual_add, attention, embedding_lookup, pool_normalize, attention_batch, pool_normalize_batch). See [zblas](https://github.com/tomoul/zblas) for BLAS-level optimization details.
+
+**Accuracy:** All 5 reference sentences achieve cosine similarity ≥ 0.99 against HuggingFace `sentence-transformers` output (F32, Q8_K, and GPU variants).
 
 ## Quick Start
 

@@ -15,6 +15,11 @@ const std = @import("std");
 // Import core modules (provided by build.zig)
 const model_mod = @import("model");
 const SentenceTransformer = model_mod.SentenceTransformer;
+const SentenceTransformerModel = model_mod.SentenceTransformerModel;
+
+// GPU model (provided by build.zig)
+const gpu_model_mod = @import("gpu_model");
+const GpuModel = gpu_model_mod.GpuModel;
 
 // Model weights and vocab are embedded at compile time
 const model_bytes = @embedFile("model_weights");
@@ -24,8 +29,10 @@ const vocab_bytes = @embedFile("vocab");
 // Memory Management
 // =============================================================================
 
-// Static heap — model ~87MB (F32) or ~24MB (Q8K), inference ~2MB temp
-var heap: [96 * 1024 * 1024]u8 = undefined;
+// Static heap — Q8K: dequantized word embeddings ~45MB, Q8K blocks ~12MB,
+// tokenizer ~3MB, other embeddings ~1MB, inference scratch ~2MB ≈ ~63MB peak.
+// FixedBufferAllocator can't reclaim freed temps, so need headroom.
+var heap: [128 * 1024 * 1024]u8 = undefined;
 var fba = std.heap.FixedBufferAllocator.init(&heap);
 const allocator = fba.allocator();
 
@@ -49,19 +56,33 @@ var is_initialized: bool = false;
 // =============================================================================
 
 /// Initialize the sentence transformer from embedded weights and vocab.
-/// Returns: 1 on success, 0 on failure.
+/// Returns: 1 on success, error code on failure:
+///   2 = out of memory, 3 = data error, 0 = other
 export fn init() u32 {
     if (is_initialized) {
         return 1;
     }
 
-    model_instance = SentenceTransformer.initFromBytes(allocator, model_bytes, vocab_bytes) catch {
-        return 0;
+    model_instance = SentenceTransformer.initFromBytes(allocator, model_bytes, vocab_bytes) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => 2,
+            else => 3,
+        };
     };
 
     init_end_index = fba.end_index;
     is_initialized = true;
     return 1;
+}
+
+/// Debug: return how many bytes of the heap are used.
+export fn get_heap_used() u32 {
+    return @intCast(fba.end_index);
+}
+
+/// Debug: return heap capacity.
+export fn get_heap_size() u32 {
+    return @intCast(heap.len);
 }
 
 /// Get pointer to the input text buffer.
@@ -120,5 +141,62 @@ export fn get_version() u32 {
 export fn reset() void {
     if (is_initialized) {
         fba.end_index = init_end_index;
+    }
+}
+
+// =============================================================================
+// GPU Exports (WebGPU acceleration)
+// =============================================================================
+
+var gpu_instance: ?GpuModel = null;
+var gpu_initialized: bool = false;
+
+/// Initialize the GPU backend from the already-loaded CPU model.
+/// Must call init() first. Returns: 1 on success, 0 on failure.
+export fn gpu_init() u32 {
+    if (!is_initialized) return 0;
+    if (gpu_initialized) return 1;
+
+    gpu_instance = GpuModel.init(allocator, &model_instance.?.model) catch {
+        return 0;
+    };
+
+    gpu_initialized = true;
+    return 1;
+}
+
+/// Check if a real GPU backend is active (not CPU fallback).
+/// Returns: 1 if GPU active, 0 if not.
+export fn gpu_is_active() u32 {
+    if (!gpu_initialized) return 0;
+    return if (gpu_instance.?.isGpuActive()) @as(u32, 1) else @as(u32, 0);
+}
+
+/// Embed text using the GPU backend.
+/// text_len: Number of UTF-8 bytes in the input buffer.
+/// Returns: EMBEDDING_DIM (384) on success, 0 on error.
+export fn gpu_embed(text_len: usize) u32 {
+    if (!gpu_initialized) return 0;
+    if (text_len == 0 or text_len > MAX_INPUT_BYTES) return 0;
+
+    // Reset allocator to post-init state for temp allocations
+    fba.end_index = init_end_index;
+
+    const input_text = input_buffer[0..text_len];
+
+    const embedding = gpu_instance.?.embed(&model_instance.?.tokenizer, input_text) catch {
+        return 0;
+    };
+
+    @memcpy(&output_buffer, &embedding);
+    return EMBEDDING_DIM;
+}
+
+/// Destroy the GPU backend and release GPU resources.
+export fn gpu_destroy() void {
+    if (gpu_initialized) {
+        gpu_instance.?.deinit();
+        gpu_instance = null;
+        gpu_initialized = false;
     }
 }

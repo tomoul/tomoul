@@ -81,6 +81,7 @@ pub const LayerData = struct {
 pub const BackendType = enum {
     vulkan,
     metal,
+    webgpu,
     cpu,
 };
 
@@ -243,6 +244,45 @@ fn tryGpuBackend(
                 .backend_type = .metal,
             };
         },
+        .freestanding => {
+            // WebGPU backend for WASM (browser GPU via JS bridge)
+            if (comptime builtin.cpu.arch == .wasm32) {
+                const WebGpuBackend = @import("webgpu_backend");
+                const webgpu_fwd = @import("webgpu_forward");
+
+                const webgpu_config = webgpu_fwd.GpuConfig{
+                    .hidden_dim = config.hidden_dim,
+                    .num_heads = config.num_heads,
+                    .head_dim = config.head_dim,
+                    .ffn_dim = config.ffn_dim,
+                    .num_layers = config.num_layers,
+                    .vocab_size = config.vocab_size,
+                    .max_seq_len = config.max_seq_len,
+                    .max_batch_tokens = config.max_batch_tokens,
+                };
+
+                const webgpu_embeddings = webgpu_fwd.EmbeddingData{
+                    .word_emb = embeddings.word_emb,
+                    .pos_emb = embeddings.pos_emb,
+                    .type_emb = embeddings.type_emb,
+                    .ln_gamma = embeddings.ln_gamma,
+                    .ln_beta = embeddings.ln_beta,
+                };
+
+                const webgpu_layers: []const webgpu_fwd.LayerData = @ptrCast(layers);
+
+                const backend = WebGpuBackend.init(allocator, webgpu_config, webgpu_embeddings, webgpu_layers) catch {
+                    return null;
+                };
+
+                return GpuBackend{
+                    .ptr = @ptrCast(backend),
+                    .vtable = &webgpu_vtable,
+                    .backend_type = .webgpu,
+                };
+            }
+            return null;
+        },
         else => return null,
     }
 }
@@ -309,6 +349,38 @@ const metal_vtable: GpuBackend.VTable = .{
     .forwardBatch = &metalForwardBatch,
     .getDeviceName = &metalGetDeviceName,
     .deinit = &metalDeinit,
+};
+
+// WebGPU vtable — bridges WebGpuBackend methods to GpuBackend interface
+fn webgpuForward(ptr: *anyopaque, input_ids: []const u32, output: []f32) anyerror!void {
+    const WebGpuBackend = @import("webgpu_backend");
+    const self: *WebGpuBackend = @ptrCast(@alignCast(ptr));
+    try self.forward(input_ids, output);
+}
+
+fn webgpuForwardBatch(ptr: *anyopaque, batch_ids: []const []const u32, output: []f32) anyerror!void {
+    const WebGpuBackend = @import("webgpu_backend");
+    const self: *WebGpuBackend = @ptrCast(@alignCast(ptr));
+    try self.forwardBatch(batch_ids, output);
+}
+
+fn webgpuGetDeviceName(ptr: *anyopaque) []const u8 {
+    const WebGpuBackend = @import("webgpu_backend");
+    const self: *const WebGpuBackend = @ptrCast(@alignCast(ptr));
+    return self.getDeviceName();
+}
+
+fn webgpuDeinit(ptr: *anyopaque) void {
+    const WebGpuBackend = @import("webgpu_backend");
+    const self: *WebGpuBackend = @ptrCast(@alignCast(ptr));
+    self.deinit();
+}
+
+const webgpu_vtable: GpuBackend.VTable = .{
+    .forward = &webgpuForward,
+    .forwardBatch = &webgpuForwardBatch,
+    .getDeviceName = &webgpuGetDeviceName,
+    .deinit = &webgpuDeinit,
 };
 
 /// CPU fallback — wraps the existing CPU inference path behind the HAL interface.
