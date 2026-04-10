@@ -268,6 +268,55 @@ test "Batch consistency: embedBatch matches individual embed" {
     }
 }
 
+test "Batch consistency Q8K: embedBatch matches individual embed" {
+    const allocator = std.testing.allocator;
+    const Q8K_MODEL_PATH = "artifacts/all_minilm_l6_v2_q8k.tl";
+
+    var st = SentenceTransformer.init(allocator, Q8K_MODEL_PATH, VOCAB_PATH) catch |err| {
+        std.debug.print("\nSkipping: Q8K model not found ({}).\n", .{err});
+        return;
+    };
+    defer st.deinit();
+
+    // Use enough sentences with enough tokens to trigger blocked path (M > 32)
+    // 5 sentences × ~10 tokens each → total_tokens ≈ 50-60 (> SKINNY_M_THRESHOLD=32)
+    const texts = [_][]const u8{
+        "The quick brown fox jumps over the lazy dog",
+        "Machine learning is a subset of artificial intelligence",
+        "I had pizza for lunch yesterday",
+        "The capital of France is Paris",
+        "Quantum computing uses qubits instead of classical bits",
+    };
+
+    // Individual embeddings
+    var singles: [texts.len][384]f32 = undefined;
+    for (0..texts.len) |i| {
+        singles[i] = try st.embed(texts[i]);
+    }
+
+    // Batch embeddings
+    const batch = try st.embedBatch(&texts);
+    defer allocator.free(batch);
+
+    std.debug.print("\nQ8K batch vs sequential ({d} sentences):\n", .{texts.len});
+    for (0..texts.len) |i| {
+        var dot: f32 = 0;
+        var norm_s: f32 = 0;
+        var norm_b: f32 = 0;
+        var max_diff: f32 = 0;
+        for (0..384) |j| {
+            dot += singles[i][j] * batch[i][j];
+            norm_s += singles[i][j] * singles[i][j];
+            norm_b += batch[i][j] * batch[i][j];
+            const d = @abs(singles[i][j] - batch[i][j]);
+            if (d > max_diff) max_diff = d;
+        }
+        const cosine = dot / (@sqrt(norm_s) * @sqrt(norm_b));
+        std.debug.print("  Sentence {d}: cosine={d:.6}, max_diff={d:.6}\n", .{ i, cosine, max_diff });
+        try std.testing.expect(cosine > 0.99);
+    }
+}
+
 // =============================================================================
 // Benchmark (print, don't assert)
 // =============================================================================
