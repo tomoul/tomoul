@@ -22,6 +22,8 @@ const SentenceTransformer = model_mod.SentenceTransformer;
 const Tokenizer = @import("tokenizer").Tokenizer;
 const transformer_mod = @import("transformer");
 const TransformerBlockWeightsF32 = transformer_mod.TransformerBlockWeightsF32;
+const TransformerBlockWeightsQ8K = transformer_mod.TransformerBlockWeightsQ8K;
+const TransformerBlockWeightsF16 = transformer_mod.TransformerBlockWeightsF16;
 
 pub const GpuModel = struct {
     allocator: std.mem.Allocator,
@@ -57,10 +59,15 @@ pub const GpuModel = struct {
             .ln_beta = model.embed_ln_beta.data,
         };
 
-        // Extract per-layer weight data
+        // Extract per-layer weight data (dequantize Q8K/F16 → F32 for GPU upload)
         const num_layers = config.num_layers;
         const layer_data = try allocator.alloc(gpu_fwd.LayerData, num_layers);
         defer allocator.free(layer_data);
+
+        // Arena for temporary dequantized weight buffers (freed after GpuForward.init uploads them)
+        var dequant_arena = std.heap.ArenaAllocator.init(allocator);
+        defer dequant_arena.deinit();
+        const da = dequant_arena.allocator();
 
         switch (model.weights) {
             .f32 => |f| {
@@ -68,15 +75,15 @@ pub const GpuModel = struct {
                     layer_data[i] = extractLayerF32(blk);
                 }
             },
-            .q8k => {
-                // TODO: dequantize Q8K weights to F32 for GPU upload
-                std.debug.print("GPU: Q8K weights not yet supported, use F32 model\n", .{});
-                return error.VulkanInitFailed;
+            .q8k => |q| {
+                for (q.blocks, 0..) |*blk, i| {
+                    layer_data[i] = try extractLayerQ8K(da, blk);
+                }
             },
-            .f16 => {
-                // TODO: dequantize F16 weights to F32 for GPU upload
-                std.debug.print("GPU: F16 weights not yet supported, use F32 model\n", .{});
-                return error.VulkanInitFailed;
+            .f16 => |h| {
+                for (h.blocks, 0..) |*blk, i| {
+                    layer_data[i] = try extractLayerF16(da, blk);
+                }
             },
         }
 
@@ -157,5 +164,73 @@ pub const GpuModel = struct {
             .ff_ln_gamma = blk.ff_ln_gamma.data,
             .ff_ln_beta = blk.ff_ln_beta.data,
         };
+    }
+
+    fn extractLayerQ8K(arena: std.mem.Allocator, blk: *const TransformerBlockWeightsQ8K) !gpu_fwd.LayerData {
+        return gpu_fwd.LayerData{
+            .q_weight = try dequantQ8K(arena, &blk.attention.q_weight),
+            .q_bias = blk.attention.q_bias.data,
+            .k_weight = try dequantQ8K(arena, &blk.attention.k_weight),
+            .k_bias = blk.attention.k_bias.data,
+            .v_weight = try dequantQ8K(arena, &blk.attention.v_weight),
+            .v_bias = blk.attention.v_bias.data,
+            .o_weight = try dequantQ8K(arena, &blk.attention.o_weight),
+            .o_bias = blk.attention.o_bias.data,
+            .ff1_weight = try dequantQ8K(arena, &blk.ff_linear1_weight),
+            .ff1_bias = blk.ff_linear1_bias.data,
+            .ff2_weight = try dequantQ8K(arena, &blk.ff_linear2_weight),
+            .ff2_bias = blk.ff_linear2_bias.data,
+            .attn_ln_gamma = blk.attn_ln_gamma.data,
+            .attn_ln_beta = blk.attn_ln_beta.data,
+            .ff_ln_gamma = blk.ff_ln_gamma.data,
+            .ff_ln_beta = blk.ff_ln_beta.data,
+        };
+    }
+
+    fn extractLayerF16(arena: std.mem.Allocator, blk: *const TransformerBlockWeightsF16) !gpu_fwd.LayerData {
+        return gpu_fwd.LayerData{
+            .q_weight = try dequantF16(arena, &blk.attention.q_weight),
+            .q_bias = blk.attention.q_bias.data,
+            .k_weight = try dequantF16(arena, &blk.attention.k_weight),
+            .k_bias = blk.attention.k_bias.data,
+            .v_weight = try dequantF16(arena, &blk.attention.v_weight),
+            .v_bias = blk.attention.v_bias.data,
+            .o_weight = try dequantF16(arena, &blk.attention.o_weight),
+            .o_bias = blk.attention.o_bias.data,
+            .ff1_weight = try dequantF16(arena, &blk.ff_linear1_weight),
+            .ff1_bias = blk.ff_linear1_bias.data,
+            .ff2_weight = try dequantF16(arena, &blk.ff_linear2_weight),
+            .ff2_bias = blk.ff_linear2_bias.data,
+            .attn_ln_gamma = blk.attn_ln_gamma.data,
+            .attn_ln_beta = blk.attn_ln_beta.data,
+            .ff_ln_gamma = blk.ff_ln_gamma.data,
+            .ff_ln_beta = blk.ff_ln_beta.data,
+        };
+    }
+
+    // =========================================================================
+    // Dequantization helpers (Q8K/F16 → F32 slice, arena-allocated)
+    // =========================================================================
+
+    /// Dequantize Q8K tensor: value = int8_data[i] * scale[i / block_size]
+    fn dequantQ8K(arena: std.mem.Allocator, qt: anytype) ![]const f32 {
+        const n = qt.element_count;
+        const result = try arena.alloc(f32, n);
+        const block_size = qt.block_size;
+        for (0..n) |i| {
+            const block_idx = i / block_size;
+            result[i] = @as(f32, @floatFromInt(qt.data[i])) * qt.scales[block_idx];
+        }
+        return result;
+    }
+
+    /// Convert F16 tensor to F32 slice
+    fn dequantF16(arena: std.mem.Allocator, ht: anytype) ![]const f32 {
+        const n = ht.data.len;
+        const result = try arena.alloc(f32, n);
+        for (0..n) |i| {
+            result[i] = @floatCast(ht.data[i]);
+        }
+        return result;
     }
 };

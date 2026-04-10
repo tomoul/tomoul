@@ -18,6 +18,8 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const GpuModel = @import("gpu_model").GpuModel;
 
 const MODEL_PATH = "artifacts/all_minilm_l6_v2.tl";
+const MODEL_Q8K_PATH = "artifacts/all_minilm_l6_v2_q8k.tl";
+const MODEL_F16_PATH = "artifacts/all_minilm_l6_v2_f16.tl";
 const VOCAB_PATH = "artifacts/all_minilm_l6_v2_vocab.txt";
 
 // Tolerance for GPU vs CPU comparison.
@@ -290,4 +292,102 @@ test "GPU batch vs CPU batch: latency comparison" {
         speedup,
         gpu_ms / @as(f64, @floatFromInt(batch_size)),
     });
+}
+
+// =============================================================================
+// T6: Q8K model GPU inference — dequantized to F32 on init
+// =============================================================================
+
+test "GPU Q8K: dequant + embed matches CPU F32 within tolerance" {
+    const allocator = std.testing.allocator;
+
+    // Load F32 CPU model for reference embeddings
+    var st_f32 = SentenceTransformer.init(allocator, MODEL_PATH, VOCAB_PATH) catch |err| {
+        std.debug.print("\nSkipping: F32 model not found ({}).\n", .{err});
+        return;
+    };
+    defer st_f32.deinit();
+
+    // Load Q8K model
+    var q8k_model = SentenceTransformerModel.init(allocator, MODEL_Q8K_PATH) catch |err| {
+        std.debug.print("\nSkipping: Q8K model not found ({}).\n", .{err});
+        return;
+    };
+    defer q8k_model.deinit();
+
+    // Init GPU model from Q8K weights (dequantizes to F32 for GPU upload)
+    var gpu_q8k = GpuModel.init(allocator, &q8k_model) catch |err| {
+        std.debug.print("\nSkipping: Vulkan init failed ({}).\n", .{err});
+        return;
+    };
+    defer gpu_q8k.deinit();
+
+    // Compare GPU Q8K vs CPU F32
+    // Q8K dequantization introduces small errors, so use looser tolerance
+    const q8k_cosine_threshold: f32 = 0.95;
+
+    std.debug.print("\n", .{});
+    var all_pass = true;
+    for (test_sentences) |sentence| {
+        const cpu_emb = try st_f32.embed(sentence);
+        const gpu_emb = try gpu_q8k.embed(&st_f32.tokenizer, sentence);
+
+        const sim = cosineSimilarity(&cpu_emb, &gpu_emb);
+        const max_diff = maxAbsDiff(&cpu_emb, &gpu_emb);
+        const pass = sim >= q8k_cosine_threshold;
+        if (!pass) all_pass = false;
+
+        std.debug.print("  Q8K cos={d:.6} max_diff={d:.6} {s} | \"{s}\"\n", .{
+            sim, max_diff, if (pass) "PASS" else "FAIL",
+            sentence[0..@min(sentence.len, 50)],
+        });
+    }
+    try std.testing.expect(all_pass);
+}
+
+// =============================================================================
+// T7: F16 model GPU inference — cast to F32 on init
+// =============================================================================
+
+test "GPU F16: cast + embed matches CPU F32 within tolerance" {
+    const allocator = std.testing.allocator;
+
+    var st_f32 = SentenceTransformer.init(allocator, MODEL_PATH, VOCAB_PATH) catch |err| {
+        std.debug.print("\nSkipping: F32 model not found ({}).\n", .{err});
+        return;
+    };
+    defer st_f32.deinit();
+
+    var f16_model = SentenceTransformerModel.init(allocator, MODEL_F16_PATH) catch |err| {
+        std.debug.print("\nSkipping: F16 model not found ({}).\n", .{err});
+        return;
+    };
+    defer f16_model.deinit();
+
+    var gpu_f16 = GpuModel.init(allocator, &f16_model) catch |err| {
+        std.debug.print("\nSkipping: Vulkan init failed ({}).\n", .{err});
+        return;
+    };
+    defer gpu_f16.deinit();
+
+    // F16→F32 precision loss is small, so threshold is tighter than Q8K
+    const f16_cosine_threshold: f32 = 0.97;
+
+    std.debug.print("\n", .{});
+    var all_pass = true;
+    for (test_sentences) |sentence| {
+        const cpu_emb = try st_f32.embed(sentence);
+        const gpu_emb = try gpu_f16.embed(&st_f32.tokenizer, sentence);
+
+        const sim = cosineSimilarity(&cpu_emb, &gpu_emb);
+        const max_diff = maxAbsDiff(&cpu_emb, &gpu_emb);
+        const pass = sim >= f16_cosine_threshold;
+        if (!pass) all_pass = false;
+
+        std.debug.print("  F16 cos={d:.6} max_diff={d:.6} {s} | \"{s}\"\n", .{
+            sim, max_diff, if (pass) "PASS" else "FAIL",
+            sentence[0..@min(sentence.len, 50)],
+        });
+    }
+    try std.testing.expect(all_pass);
 }
