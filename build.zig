@@ -423,10 +423,11 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
 
-    // WASM build options - always use zblas (no OpenBLAS in WASM)
+    // WASM build options - disable zblas (its @Vector SIMD causes LLVM 20 invalid cast on wasm32)
+    // WASM uses the scalar fallback in ops.zig
     const wasm_ops_options = b.addOptions();
     wasm_ops_options.addOption(bool, "use_blas", false);
-    wasm_ops_options.addOption(bool, "use_zblas", true);
+    wasm_ops_options.addOption(bool, "use_zblas", false);
 
     const wasm_ops_module = b.createModule(.{
         .root_source_file = b.path("src/core/ops.zig"),
@@ -436,13 +437,6 @@ pub fn build(b: *std.Build) void {
     wasm_ops_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_ops_module.addOptions("build_options", wasm_ops_options);
 
-    // zblas for WASM (pure Zig - perfect for WASM)
-    const wasm_zblas_dep = b.dependency("zblas", .{
-        .target = wasm_target,
-        .optimize = .ReleaseFast,
-    });
-    wasm_ops_module.addImport("zblas", wasm_zblas_dep.module("zblas"));
-
     const wasm_quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
         .target = wasm_target,
@@ -450,7 +444,6 @@ pub fn build(b: *std.Build) void {
     });
     wasm_quantization_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_quantization_module.addImport("ops.zig", wasm_ops_module);
-    wasm_quantization_module.addImport("zblas", wasm_zblas_dep.module("zblas"));
 
     const wasm_loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
