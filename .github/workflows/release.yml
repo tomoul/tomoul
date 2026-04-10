@@ -195,9 +195,10 @@ jobs:
           MODEL="${{ matrix.model }}"
 
           # Run the model-specific export script
+          mkdir -p artifacts
           if [ -f "tools/export_${MODEL}.py" ]; then
             echo "Running tools/export_${MODEL}.py..."
-            python tools/export_${MODEL}.py
+            python tools/export_${MODEL}.py -o artifacts/
           else
             echo "No export script found for ${MODEL}, skipping..."
           fi
