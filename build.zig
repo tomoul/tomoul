@@ -420,7 +420,7 @@ pub fn build(b: *std.Build) void {
     const wasm_tensor_module = b.createModule(.{
         .root_source_file = b.path("src/core/tensor.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
 
     // WASM build options - always use zblas (no OpenBLAS in WASM)
@@ -431,7 +431,7 @@ pub fn build(b: *std.Build) void {
     const wasm_ops_module = b.createModule(.{
         .root_source_file = b.path("src/core/ops.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
     wasm_ops_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_ops_module.addOptions("build_options", wasm_ops_options);
@@ -439,14 +439,14 @@ pub fn build(b: *std.Build) void {
     // zblas for WASM (pure Zig - perfect for WASM)
     const wasm_zblas_dep = b.dependency("zblas", .{
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
     wasm_ops_module.addImport("zblas", wasm_zblas_dep.module("zblas"));
 
     const wasm_quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
     wasm_quantization_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_quantization_module.addImport("ops.zig", wasm_ops_module);
@@ -455,7 +455,7 @@ pub fn build(b: *std.Build) void {
     const wasm_loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
     wasm_loader_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_loader_module.addImport("quantization.zig", wasm_quantization_module);
@@ -464,7 +464,7 @@ pub fn build(b: *std.Build) void {
     const wasm_attention_module = b.createModule(.{
         .root_source_file = b.path("src/core/attention.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
     wasm_attention_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_attention_module.addImport("ops.zig", wasm_ops_module);
@@ -474,7 +474,7 @@ pub fn build(b: *std.Build) void {
     const wasm_transformer_module = b.createModule(.{
         .root_source_file = b.path("src/core/transformer.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
     wasm_transformer_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_transformer_module.addImport("ops.zig", wasm_ops_module);
@@ -587,7 +587,7 @@ fn buildWasmModel(
     const wasm_model_module = b.createModule(.{
         .root_source_file = b.path(model_module_path),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
     wasm_model_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_model_module.addImport("ops.zig", wasm_ops_module);
@@ -600,7 +600,7 @@ fn buildWasmModel(
     const wasm_binding = b.createModule(.{
         .root_source_file = b.path(wasm_binding_path),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseFast,
     });
     wasm_binding.addImport("tensor", wasm_tensor_module);
     wasm_binding.addImport("model", wasm_model_module);
