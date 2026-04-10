@@ -34,8 +34,10 @@ const SgemmBiasPC = extern struct { m: u32, n: u32, k: u32 };
 const LayerNormPC = extern struct { rows: u32, cols: u32, eps: f32 };
 const ElementPC = extern struct { count: u32 };
 const AttentionPC = extern struct { seq_len: u32, num_heads: u32, head_dim: u32, scale: f32 };
+const AttentionBatchPC = extern struct { total_tokens: u32, num_heads: u32, head_dim: u32, scale: f32, batch_size: u32 };
 const EmbeddingPC = extern struct { seq_len: u32, hidden_dim: u32 };
 const PoolNormPC = extern struct { seq_len: u32, hidden_dim: u32 };
+const PoolNormBatchPC = extern struct { batch_size: u32, hidden_dim: u32 };
 
 // ============================================================================
 // Public Configuration Types
@@ -49,6 +51,9 @@ pub const GpuConfig = struct {
     num_layers: u32,
     vocab_size: u32,
     max_seq_len: u32,
+    /// Max total tokens for batch forward (default = max_seq_len).
+    /// Set higher for batched inference, e.g. 32 * avg_seq_len.
+    max_batch_tokens: u32 = 0, // 0 means use max_seq_len
 };
 
 pub const EmbeddingData = struct {
@@ -123,6 +128,9 @@ pub const GpuForward = struct {
     attention_pipe: gpu.ComputePipeline,
     embedding_pipe: gpu.ComputePipeline,
     pool_normalize_pipe: gpu.ComputePipeline,
+    // Batch-specific pipelines
+    attention_batch_pipe: gpu.ComputePipeline,
+    pool_normalize_batch_pipe: gpu.ComputePipeline,
 
     // Embedding weights (persistent on GPU)
     word_emb_buf: gpu.GpuBuffer,
@@ -143,6 +151,11 @@ pub const GpuForward = struct {
     ffn_buf: gpu.GpuBuffer, // [max_seq, ffn_dim] — FFN intermediate
     ids_buf: gpu.GpuBuffer, // [3 * max_seq] u32 — token/position/type IDs
     output_buf: gpu.GpuBuffer, // [hidden] f32 — final pooled+normalized output
+    // Batch-specific buffers
+    offsets_buf: gpu.GpuBuffer, // [max_batch] u32 — per-sentence start offsets
+    lengths_buf: gpu.GpuBuffer, // [max_batch] u32 — per-sentence token counts
+    batch_output_buf: gpu.GpuBuffer, // [max_batch * hidden] f32 — batched output
+    max_batch_tokens: u32, // max total tokens across all sentences in a batch
 
     const Self = @This();
 
@@ -177,6 +190,9 @@ pub const GpuForward = struct {
         self.attention_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/attention.spv", 4, @sizeOf(AttentionPC));
         self.embedding_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/embedding_lookup.spv", 5, @sizeOf(EmbeddingPC));
         self.pool_normalize_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/pool_normalize.spv", 2, @sizeOf(PoolNormPC));
+        // Batch-specific pipelines: attention_batch (5 bindings), pool_normalize_batch (4 bindings)
+        self.attention_batch_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/attention_batch.spv", 5, @sizeOf(AttentionBatchPC));
+        self.pool_normalize_batch_pipe = try loadPipeline(&self.ctx, allocator, "src/gpu/shaders/pool_normalize_batch.spv", 4, @sizeOf(PoolNormBatchPC));
 
         // 3. Upload embedding weights
         self.word_emb_buf = try uploadF32(&self.ctx, embeddings.word_emb);
@@ -208,20 +224,27 @@ pub const GpuForward = struct {
             };
         }
 
-        // 5. Allocate activation buffers
-        const max_seq = config.max_seq_len;
+        // 5. Allocate activation buffers (sized for batch if max_batch_tokens > max_seq_len)
+        const max_tokens = if (config.max_batch_tokens > 0) config.max_batch_tokens else config.max_seq_len;
+        self.max_batch_tokens = max_tokens;
         const hidden = config.hidden_dim;
         const ffn = config.ffn_dim;
-        const act_size = max_seq * hidden * @sizeOf(f32);
+        const act_size = max_tokens * hidden * @sizeOf(f32);
 
         self.buf_a = try self.ctx.createStorageBuffer(act_size, true);
         self.buf_b = try self.ctx.createStorageBuffer(act_size, true);
         self.q_buf = try self.ctx.createStorageBuffer(act_size, true);
         self.k_buf = try self.ctx.createStorageBuffer(act_size, true);
         self.v_buf = try self.ctx.createStorageBuffer(act_size, true);
-        self.ffn_buf = try self.ctx.createStorageBuffer(max_seq * ffn * @sizeOf(f32), true);
-        self.ids_buf = try self.ctx.createStorageBuffer(3 * max_seq * @sizeOf(u32), true);
+        self.ffn_buf = try self.ctx.createStorageBuffer(max_tokens * ffn * @sizeOf(f32), true);
+        self.ids_buf = try self.ctx.createStorageBuffer(3 * max_tokens * @sizeOf(u32), true);
         self.output_buf = try self.ctx.createStorageBuffer(hidden * @sizeOf(f32), true);
+
+        // Batch-specific buffers
+        const max_batch: u32 = 64; // max batch size
+        self.offsets_buf = try self.ctx.createStorageBuffer(max_batch * @sizeOf(u32), true);
+        self.lengths_buf = try self.ctx.createStorageBuffer(max_batch * @sizeOf(u32), true);
+        self.batch_output_buf = try self.ctx.createStorageBuffer(max_batch * hidden * @sizeOf(f32), true);
 
         const weight_count = 5 + config.num_layers * 16;
         std.debug.print("GPU: Uploaded {} weight buffers, {} activation buffers\n", .{ weight_count, 8 });
@@ -255,7 +278,7 @@ pub const GpuForward = struct {
         {
             const desc = try self.ctx.allocateDescriptorSet(&self.embedding_pipe);
             try self.ctx.bindBuffers(desc, &[_]gpu.GpuBuffer{
-                self.ids_buf, self.word_emb_buf, self.pos_emb_buf,
+                self.ids_buf,      self.word_emb_buf, self.pos_emb_buf,
                 self.type_emb_buf, self.buf_a,
             });
             const pc = EmbeddingPC{ .seq_len = seq_len, .hidden_dim = hidden };
@@ -283,6 +306,97 @@ pub const GpuForward = struct {
 
         // Readback final embedding
         try self.ctx.readbackFromBuffer(&self.output_buf, std.mem.sliceAsBytes(output[0..hidden]));
+    }
+
+    // ====================================================================
+    // Batched Forward Pass (multiple sentences, single command buffer)
+    // ====================================================================
+
+    /// Process a batch of tokenized sentences in a single GPU submission.
+    /// `batch_ids` is an array of token ID slices (one per sentence).
+    /// `output` must be batch_ids.len * hidden_dim floats.
+    pub fn forwardBatch(self: *Self, batch_ids: []const []const u32, output: []f32) GpuForwardError!void {
+        const batch_size: u32 = @intCast(batch_ids.len);
+        const hidden = self.config.hidden_dim;
+
+        // Compute total tokens and per-sentence offsets/lengths
+        var total_tokens: u32 = 0;
+        const offsets = try self.allocator.alloc(u32, batch_size);
+        defer self.allocator.free(offsets);
+        const lengths = try self.allocator.alloc(u32, batch_size);
+        defer self.allocator.free(lengths);
+
+        for (batch_ids, 0..) |ids, i| {
+            offsets[i] = total_tokens;
+            lengths[i] = @intCast(ids.len);
+            total_tokens += @intCast(ids.len);
+        }
+
+        if (total_tokens > self.max_batch_tokens) {
+            std.debug.print("GPU: batch total tokens {} exceeds max {}\n", .{ total_tokens, self.max_batch_tokens });
+            return error.VulkanInitFailed;
+        }
+
+        // Pack all token IDs with position and type IDs
+        const all_ids = try self.allocator.alloc(u32, total_tokens * 3);
+        defer self.allocator.free(all_ids);
+        var pos: u32 = 0;
+        for (batch_ids, 0..) |ids, i| {
+            const len: u32 = @intCast(ids.len);
+            @memcpy(all_ids[pos .. pos + len], ids);
+            // Position IDs: 0..len-1 per sentence (reset per sentence)
+            for (0..len) |j| all_ids[total_tokens + pos + j] = @intCast(j);
+            // Type IDs: all 0
+            @memset(all_ids[2 * total_tokens + pos .. 2 * total_tokens + pos + len], 0);
+            _ = i;
+            pos += len;
+        }
+        try self.ctx.uploadToBuffer(&self.ids_buf, std.mem.sliceAsBytes(all_ids));
+
+        // Upload offsets and lengths for batch-aware shaders
+        try self.ctx.uploadToBuffer(&self.offsets_buf, std.mem.sliceAsBytes(offsets));
+        try self.ctx.uploadToBuffer(&self.lengths_buf, std.mem.sliceAsBytes(lengths));
+
+        // Reset descriptor pool and begin recording
+        self.ctx.resetDescriptorPool();
+        try self.ctx.beginCommandBuffer();
+
+        // --- Embedding lookup (works on packed tokens directly) ---
+        {
+            const desc = try self.ctx.allocateDescriptorSet(&self.embedding_pipe);
+            try self.ctx.bindBuffers(desc, &[_]gpu.GpuBuffer{
+                self.ids_buf, self.word_emb_buf, self.pos_emb_buf,
+                self.type_emb_buf, self.buf_a,
+            });
+            const pc = EmbeddingPC{ .seq_len = total_tokens, .hidden_dim = hidden };
+            self.ctx.cmdDispatch(&self.embedding_pipe, desc, (total_tokens * hidden + 255) / 256, 1, 1, std.mem.asBytes(&pc));
+        }
+
+        // --- Embedding LayerNorm (element-wise, works on packed) ---
+        try self.recordLayerNorm(total_tokens, self.buf_a, self.embed_ln_gamma_buf, self.embed_ln_beta_buf);
+
+        // --- Transformer Layers (with batch-aware attention) ---
+        for (0..self.config.num_layers) |i| {
+            try self.recordLayerBatch(@intCast(i), total_tokens, batch_size);
+        }
+
+        // --- Batched Pool + Normalize ---
+        {
+            const desc = try self.ctx.allocateDescriptorSet(&self.pool_normalize_batch_pipe);
+            try self.ctx.bindBuffers(desc, &[_]gpu.GpuBuffer{
+                self.buf_a, self.batch_output_buf, self.offsets_buf, self.lengths_buf,
+            });
+            const pc = PoolNormBatchPC{ .batch_size = batch_size, .hidden_dim = hidden };
+            self.ctx.cmdDispatch(&self.pool_normalize_batch_pipe, desc, batch_size, 1, 1, std.mem.asBytes(&pc));
+        }
+
+        // Submit and wait
+        try self.ctx.submitAndWait();
+
+        // Readback all embeddings
+        const out_bytes = batch_size * hidden * @sizeOf(f32);
+        try self.ctx.readbackFromBuffer(&self.batch_output_buf, std.mem.sliceAsBytes(output[0 .. batch_size * hidden]));
+        _ = out_bytes;
     }
 
     // ====================================================================
@@ -346,6 +460,52 @@ pub const GpuForward = struct {
         try self.recordLayerNorm(seq_len, self.buf_a, lw.ff_ln_gamma, lw.ff_ln_beta);
     }
 
+    /// Per-layer dispatch for batched forward — same as recordLayer but uses
+    /// batch-aware attention that respects sentence boundaries.
+    fn recordLayerBatch(self: *Self, layer_idx: u32, total_tokens: u32, batch_size: u32) GpuForwardError!void {
+        const lw = &self.layers[layer_idx];
+        const hidden = self.config.hidden_dim;
+        const ffn_dim = self.config.ffn_dim;
+        const elem_count = total_tokens * hidden;
+
+        // Q, K, V projections (GEMM treats packed tokens as rows — transparent)
+        try self.recordGemm(self.buf_a, lw.q_weight, self.q_buf, lw.q_bias, total_tokens, hidden, hidden);
+        try self.recordGemm(self.buf_a, lw.k_weight, self.k_buf, lw.k_bias, total_tokens, hidden, hidden);
+        try self.recordGemm(self.buf_a, lw.v_weight, self.v_buf, lw.v_bias, total_tokens, hidden, hidden);
+
+        // Batch-aware multi-head attention (uses offsets to prevent cross-sentence attention)
+        {
+            const desc = try self.ctx.allocateDescriptorSet(&self.attention_batch_pipe);
+            try self.ctx.bindBuffers(desc, &[_]gpu.GpuBuffer{
+                self.q_buf, self.k_buf, self.v_buf, self.buf_b, self.offsets_buf,
+            });
+            const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.config.head_dim)));
+            const pc = AttentionBatchPC{
+                .total_tokens = total_tokens,
+                .num_heads = self.config.num_heads,
+                .head_dim = self.config.head_dim,
+                .scale = scale,
+                .batch_size = batch_size,
+            };
+            self.ctx.cmdDispatch(&self.attention_batch_pipe, desc, self.config.num_heads, total_tokens, 1, std.mem.asBytes(&pc));
+        }
+
+        // Output projection, residual, LayerNorm, FFN — all element-wise/per-row, work on packed
+        try self.recordGemm(self.buf_b, lw.o_weight, self.q_buf, lw.o_bias, total_tokens, hidden, hidden);
+        try self.recordAdd(self.q_buf, self.buf_a, elem_count);
+        try self.recordLayerNorm(total_tokens, self.q_buf, lw.attn_ln_gamma, lw.attn_ln_beta);
+        try self.recordGemm(self.q_buf, lw.ff1_weight, self.ffn_buf, lw.ff1_bias, total_tokens, ffn_dim, hidden);
+        {
+            const desc = try self.ctx.allocateDescriptorSet(&self.gelu_pipe);
+            try self.ctx.bindBuffers(desc, &[_]gpu.GpuBuffer{self.ffn_buf});
+            const pc = ElementPC{ .count = total_tokens * ffn_dim };
+            self.ctx.cmdDispatch(&self.gelu_pipe, desc, (pc.count + 255) / 256, 1, 1, std.mem.asBytes(&pc));
+        }
+        try self.recordGemm(self.ffn_buf, lw.ff2_weight, self.buf_a, lw.ff2_bias, total_tokens, hidden, ffn_dim);
+        try self.recordAdd(self.buf_a, self.q_buf, elem_count);
+        try self.recordLayerNorm(total_tokens, self.buf_a, lw.ff_ln_gamma, lw.ff_ln_beta);
+    }
+
     // ====================================================================
     // Dispatch Helpers
     // ====================================================================
@@ -376,6 +536,11 @@ pub const GpuForward = struct {
     // ====================================================================
 
     pub fn deinit(self: *Self) void {
+        // Batch-specific buffers
+        self.ctx.destroyBuffer(&self.batch_output_buf);
+        self.ctx.destroyBuffer(&self.lengths_buf);
+        self.ctx.destroyBuffer(&self.offsets_buf);
+
         // Activation buffers
         self.ctx.destroyBuffer(&self.output_buf);
         self.ctx.destroyBuffer(&self.ids_buf);
@@ -402,6 +567,8 @@ pub const GpuForward = struct {
         self.ctx.destroyBuffer(&self.word_emb_buf);
 
         // Pipelines
+        self.ctx.destroyPipeline(&self.pool_normalize_batch_pipe);
+        self.ctx.destroyPipeline(&self.attention_batch_pipe);
         self.ctx.destroyPipeline(&self.pool_normalize_pipe);
         self.ctx.destroyPipeline(&self.embedding_pipe);
         self.ctx.destroyPipeline(&self.attention_pipe);

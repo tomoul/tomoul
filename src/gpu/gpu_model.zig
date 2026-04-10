@@ -46,6 +46,7 @@ pub const GpuModel = struct {
             .num_layers = @intCast(config.num_layers),
             .vocab_size = @intCast(config.vocab_size),
             .max_seq_len = @intCast(config.max_seq_len),
+            .max_batch_tokens = @intCast(config.max_seq_len * 32), // support batch up to 32 sentences
         };
 
         const embeddings = gpu_fwd.EmbeddingData{
@@ -96,6 +97,37 @@ pub const GpuModel = struct {
         var output: [384]f32 = undefined;
         try self.fwd.forward(enc.input_ids, &output);
         return output;
+    }
+
+    /// Embed a batch of texts on GPU → array of normalized 384-dim vectors
+    /// All sentences processed together in a single GPU submission.
+    pub fn embedBatch(self: *Self, tokenizer: *Tokenizer, texts: []const []const u8, results: [][384]f32) !void {
+        // Tokenize all sentences
+        const encs = try self.allocator.alloc(@import("tokenizer").TokenizerOutput, texts.len);
+        defer self.allocator.free(encs);
+        var initialized: usize = 0;
+        defer for (encs[0..initialized]) |*e| e.deinit(self.allocator);
+
+        const batch_ids = try self.allocator.alloc([]const u32, texts.len);
+        defer self.allocator.free(batch_ids);
+
+        for (texts, 0..) |text, i| {
+            encs[i] = try tokenizer.encode(text);
+            initialized = i + 1;
+            batch_ids[i] = encs[i].input_ids;
+        }
+
+        // Flat output buffer for GPU
+        const hidden = self.hidden_dim;
+        const flat = try self.allocator.alloc(f32, texts.len * hidden);
+        defer self.allocator.free(flat);
+
+        try self.fwd.forwardBatch(batch_ids, flat);
+
+        // Copy to structured output
+        for (0..texts.len) |i| {
+            @memcpy(&results[i], flat[i * hidden .. (i + 1) * hidden]);
+        }
     }
 
     pub fn deinit(self: *Self) void {

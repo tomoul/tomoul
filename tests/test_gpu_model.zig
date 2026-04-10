@@ -152,3 +152,142 @@ test "GPU vs CPU: latency comparison" {
         speedup,
     });
 }
+
+// =============================================================================
+// T3: Batched GPU vs single-GPU embedding comparison
+// =============================================================================
+
+test "GPU batch: embedBatch matches single embed" {
+    const allocator = std.testing.allocator;
+
+    var st = SentenceTransformer.init(allocator, MODEL_PATH, VOCAB_PATH) catch |err| {
+        std.debug.print("\nSkipping: model not found ({}).\n", .{err});
+        return;
+    };
+    defer st.deinit();
+
+    var gpu_model = GpuModel.init(allocator, &st.model) catch |err| {
+        std.debug.print("\nSkipping: Vulkan init failed ({}).\n", .{err});
+        return;
+    };
+    defer gpu_model.deinit();
+
+    // Get single embeddings
+    var single_results: [test_sentences.len][384]f32 = undefined;
+    for (test_sentences, 0..) |sentence, i| {
+        single_results[i] = try gpu_model.embed(&st.tokenizer, sentence);
+    }
+
+    // Get batch embeddings
+    var batch_results: [test_sentences.len][384]f32 = undefined;
+    try gpu_model.embedBatch(&st.tokenizer, &test_sentences, &batch_results);
+
+    // Compare: batch should match single within very tight tolerance
+    // (same computation, same shader, just batched dispatch)
+    std.debug.print("\n", .{});
+    var all_pass = true;
+    for (0..test_sentences.len) |i| {
+        const sim = cosineSimilarity(&single_results[i], &batch_results[i]);
+        const max_diff = maxAbsDiff(&single_results[i], &batch_results[i]);
+        const pass = sim >= 0.999;
+        if (!pass) all_pass = false;
+        std.debug.print("  batch[{d}] cos={d:.6} max_diff={d:.6} {s}\n", .{
+            i, sim, max_diff, if (pass) "PASS" else "FAIL",
+        });
+    }
+    try std.testing.expect(all_pass);
+}
+
+// =============================================================================
+// T4: Batched GPU vs CPU embedding comparison
+// =============================================================================
+
+test "GPU batch vs CPU: cosine_sim >= 0.98" {
+    const allocator = std.testing.allocator;
+
+    var st = SentenceTransformer.init(allocator, MODEL_PATH, VOCAB_PATH) catch |err| {
+        std.debug.print("\nSkipping: model not found ({}).\n", .{err});
+        return;
+    };
+    defer st.deinit();
+
+    var gpu_model = GpuModel.init(allocator, &st.model) catch |err| {
+        std.debug.print("\nSkipping: Vulkan init failed ({}).\n", .{err});
+        return;
+    };
+    defer gpu_model.deinit();
+
+    // GPU batch
+    var gpu_results: [test_sentences.len][384]f32 = undefined;
+    try gpu_model.embedBatch(&st.tokenizer, &test_sentences, &gpu_results);
+
+    // CPU single
+    std.debug.print("\n", .{});
+    var all_pass = true;
+    for (test_sentences, 0..) |sentence, i| {
+        const cpu_emb = try st.embed(sentence);
+        const sim = cosineSimilarity(&cpu_emb, &gpu_results[i]);
+        const pass = sim >= COSINE_TOLERANCE;
+        if (!pass) all_pass = false;
+        std.debug.print("  batch_gpu_vs_cpu[{d}] cos={d:.6} {s}\n", .{
+            i, sim, if (pass) "PASS" else "FAIL",
+        });
+    }
+    try std.testing.expect(all_pass);
+}
+
+// =============================================================================
+// T5: Batch latency benchmark
+// =============================================================================
+
+test "GPU batch vs CPU batch: latency comparison" {
+    const allocator = std.testing.allocator;
+
+    var st = SentenceTransformer.init(allocator, MODEL_PATH, VOCAB_PATH) catch |err| {
+        std.debug.print("\nSkipping: model not found ({}).\n", .{err});
+        return;
+    };
+    defer st.deinit();
+
+    var gpu_model = GpuModel.init(allocator, &st.model) catch |err| {
+        std.debug.print("\nSkipping: Vulkan init failed ({}).\n", .{err});
+        return;
+    };
+    defer gpu_model.deinit();
+
+    const iterations = 3;
+    const batch_size = test_sentences.len;
+
+    // Warmup
+    {
+        var gpu_results: [test_sentences.len][384]f32 = undefined;
+        try gpu_model.embedBatch(&st.tokenizer, &test_sentences, &gpu_results);
+        for (test_sentences) |s| _ = try st.embed(s);
+    }
+
+    // CPU sequential benchmark
+    var cpu_timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        for (test_sentences) |s| _ = try st.embed(s);
+    }
+    const cpu_ns = cpu_timer.read();
+    const cpu_ms = @as(f64, @floatFromInt(cpu_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(iterations));
+
+    // GPU batch benchmark
+    var gpu_timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        var gpu_results: [test_sentences.len][384]f32 = undefined;
+        try gpu_model.embedBatch(&st.tokenizer, &test_sentences, &gpu_results);
+    }
+    const gpu_ns = gpu_timer.read();
+    const gpu_ms = @as(f64, @floatFromInt(gpu_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(iterations));
+
+    const speedup = cpu_ms / gpu_ms;
+    std.debug.print("\n  Batch={d} sentences\n  CPU sequential: {d:.2} ms total\n  GPU batch: {d:.2} ms total\n  Speedup: {d:.2}x\n  GPU per-sentence: {d:.2} ms\n", .{
+        batch_size,
+        cpu_ms,
+        gpu_ms,
+        speedup,
+        gpu_ms / @as(f64, @floatFromInt(batch_size)),
+    });
+}

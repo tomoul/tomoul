@@ -1,0 +1,67 @@
+#version 450
+
+// Batched Mean Pooling + L2 Normalization
+//
+// Pools each sentence independently from a packed activation buffer,
+// then L2-normalizes each output embedding.
+//
+// Dispatch: (batch_size, 1, 1) — one workgroup per sentence.
+//
+// Offsets buffer: [batch_size] uint32 — starting token index for each sentence.
+// Lengths buffer: [batch_size] uint32 — token count for each sentence.
+// Output buffer:  [batch_size * hidden_dim] float — one embedding per sentence.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer Input   { float input_buf[]; };
+layout(set = 0, binding = 1) writeonly buffer Output  { float output_buf[]; };
+layout(set = 0, binding = 2) readonly  buffer Offsets { uint offsets[]; };
+layout(set = 0, binding = 3) readonly  buffer Lengths { uint lengths[]; };
+
+layout(push_constant) uniform Params {
+    uint batch_size;
+    uint hidden_dim;
+};
+
+shared float pool_result[512];  // max hidden_dim
+shared float sdata[256];        // for reductions
+
+void main() {
+    uint batch_idx = gl_WorkGroupID.x;
+    if (batch_idx >= batch_size) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint offset = offsets[batch_idx];
+    uint seq_len = lengths[batch_idx];
+
+    // Phase 1: Mean pooling per dimension
+    for (uint d = tid; d < hidden_dim; d += 256) {
+        float sum = 0.0;
+        for (uint t = 0; t < seq_len; t++) {
+            sum += input_buf[(offset + t) * hidden_dim + d];
+        }
+        pool_result[d] = sum / float(seq_len);
+    }
+    barrier();
+
+    // Phase 2: Compute L2 norm (sum of squares across all dimensions)
+    float local_ss = 0.0;
+    for (uint d = tid; d < hidden_dim; d += 256) {
+        local_ss += pool_result[d] * pool_result[d];
+    }
+    sdata[tid] = local_ss;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float l2_norm = sqrt(sdata[0]);
+    barrier();
+
+    // Phase 3: Normalize and write output
+    float inv_norm = (l2_norm > 1e-12) ? (1.0 / l2_norm) : 0.0;
+    for (uint d = tid; d < hidden_dim; d += 256) {
+        output_buf[batch_idx * hidden_dim + d] = pool_result[d] * inv_norm;
+    }
+}
