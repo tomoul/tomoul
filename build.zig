@@ -868,6 +868,71 @@ fn buildNativeLib(
     const options = b.addOptions();
     options.addOption(bool, "embed_weights", bundled and model.supports_bundled);
 
+    // =========================================================================
+    // GPU modules for native lib (Vulkan/Metal acceleration)
+    // =========================================================================
+
+    // Tokenizer module (needed by model.zig as @import("tokenizer.zig") and by gpu_model separately)
+    const lib_tokenizer_module = b.createModule(.{
+        .root_source_file = b.path("src/models/sentence_transformer/tokenizer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Wire tokenizer into model module so model.zig's @import("tokenizer.zig") resolves to the module
+    model_module.addImport("tokenizer.zig", lib_tokenizer_module);
+
+    // Runtime Vulkan loader (dlopen — zero link-time dependency)
+    const lib_vk_loader_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vk_loader.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // Low-level Vulkan wrapper
+    const lib_vulkan_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vulkan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_vulkan_module.addImport("vk_loader", lib_vk_loader_module);
+
+    // GPU forward pass (embeds SPIR-V shaders)
+    const lib_gpu_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/gpu_forward.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_gpu_forward_module.addImport("vulkan", lib_vulkan_module);
+
+    // Vulkan backend (implements HAL)
+    const lib_vulkan_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vulkan_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_vulkan_backend_module.addImport("gpu_forward", lib_gpu_forward_module);
+
+    // HAL interface (backend-agnostic)
+    const lib_hal_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/hal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_hal_module.addImport("vulkan_backend", lib_vulkan_backend_module);
+    lib_hal_module.addImport("gpu_forward", lib_gpu_forward_module);
+
+    // GPU model wrapper (uses HAL auto-detection)
+    const lib_gpu_model_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/gpu_model.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_gpu_model_module.addImport("hal", lib_hal_module);
+    lib_gpu_model_module.addImport("model", model_module);
+    lib_gpu_model_module.addImport("tokenizer", lib_tokenizer_module);
+    lib_gpu_model_module.addImport("transformer", transformer_module);
+
     // Helper to configure a C binding module
     const configureBindingModule = struct {
         fn configure(
@@ -926,6 +991,9 @@ fn buildNativeLib(
         });
     }
 
+    // Add GPU module to static lib binding
+    c_binding_module.addImport("gpu_model", lib_gpu_model_module);
+
     // Build static library
     const lib_name = b.fmt("tomoul_{s}", .{model.name});
     const static_lib = b.addLibrary(.{
@@ -962,6 +1030,9 @@ fn buildNativeLib(
             .root_source_file = b.path(vp),
         });
     }
+
+    // Add GPU module to shared lib binding
+    c_binding_module_shared.addImport("gpu_model", lib_gpu_model_module);
 
     const shared_lib = b.addLibrary(.{
         .linkage = .dynamic,
