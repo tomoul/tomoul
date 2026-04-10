@@ -27,15 +27,15 @@ const std = @import("std");
 const gpu = @import("vulkan");
 
 // Embedded SPIR-V shaders (compiled at build time, no external files needed)
-const spv_sgemm_bias = @embedFile("shaders/sgemm_bias.spv");
-const spv_layernorm = @embedFile("shaders/layernorm.spv");
-const spv_gelu = @embedFile("shaders/gelu.spv");
-const spv_residual_add = @embedFile("shaders/residual_add.spv");
-const spv_attention = @embedFile("shaders/attention.spv");
-const spv_embedding_lookup = @embedFile("shaders/embedding_lookup.spv");
-const spv_pool_normalize = @embedFile("shaders/pool_normalize.spv");
-const spv_attention_batch = @embedFile("shaders/attention_batch.spv");
-const spv_pool_normalize_batch = @embedFile("shaders/pool_normalize_batch.spv");
+const spv_sgemm_bias = @embedFile("shaders/vulkan/sgemm_bias.spv");
+const spv_layernorm = @embedFile("shaders/vulkan/layernorm.spv");
+const spv_gelu = @embedFile("shaders/vulkan/gelu.spv");
+const spv_residual_add = @embedFile("shaders/vulkan/residual_add.spv");
+const spv_attention = @embedFile("shaders/vulkan/attention.spv");
+const spv_embedding_lookup = @embedFile("shaders/vulkan/embedding_lookup.spv");
+const spv_pool_normalize = @embedFile("shaders/vulkan/pool_normalize.spv");
+const spv_attention_batch = @embedFile("shaders/vulkan/attention_batch.spv");
+const spv_pool_normalize_batch = @embedFile("shaders/vulkan/pool_normalize_batch.spv");
 
 // ============================================================================
 // Push Constant Structs (must match GLSL shader layouts exactly)
