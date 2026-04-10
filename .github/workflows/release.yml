@@ -187,8 +187,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install PyTorch
-        run: pip install torch numpy
+      - name: Install Python dependencies
+        run: pip install -r tools/requirements.txt
 
       - name: Generate model weights
         run: |
