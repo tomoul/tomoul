@@ -153,12 +153,25 @@ jobs:
                   # Derive paths from model name
                   paths = derive_paths(name)
 
+                  # Parse weight_variants
+                  variants = []
+                  variants_match = re.search(r'\.weight_variants\s*=\s*&\.\{(.+?)\}\s*,', block, re.DOTALL)
+                  if variants_match:
+                      variant_blocks = re.finditer(r'\.\{\s*\.suffix\s*=\s*"([^"]*)"\s*,\s*\.path\s*=\s*"([^"]*)"', variants_match.group(1))
+                      for vm in variant_blocks:
+                          suffix = vm.group(1)  # e.g., "-q8k"
+                          # Map suffix to quantize arg: "-q8k" -> "q8_k", "-q8" -> "q8_0", "-q4" -> "q4_0"
+                          fmt_map = {'-q8k': 'q8_k', '-q8': 'q8_0', '-q4': 'q4_0', '-f16': 'f16'}
+                          quant_fmt = fmt_map.get(suffix, suffix.lstrip('-'))
+                          variants.append(quant_fmt)
+
                   models[name] = {
                       'weights_path': paths['weights_path'],
                       'hf_repo': paths['hf_repo'],
                       'description': desc_match.group(1) if desc_match else name,
                       'c_binding': paths['c_binding'],
                       'export_symbols': re.findall(r'"([^"]+)"', symbols_match.group(1)) if symbols_match else [],
+                      'weight_variants': variants,
                   }
 
           with open('model_metadata.json', 'w') as f:
@@ -193,18 +206,35 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r tools/requirements.txt
 
+      - name: Download metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: model-metadata
+          path: .
+
       - name: Generate model weights
         run: |
           MODEL="${{ matrix.model }}"
-
-          # Run the model-specific export script
           mkdir -p artifacts
-          if [ -f "tools/export_${MODEL}.py" ]; then
-            echo "Running tools/export_${MODEL}.py..."
-            python tools/export_${MODEL}.py -o artifacts/
-          else
+
+          if [ ! -f "tools/export_${MODEL}.py" ]; then
             echo "No export script found for ${MODEL}, skipping..."
+            exit 0
           fi
+
+          # Export default (f32) weights
+          echo "Exporting f32 weights..."
+          python tools/export_${MODEL}.py -o artifacts/
+
+          # Export quantized variants from registry metadata
+          VARIANTS=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(' '.join(m.get('$MODEL', {}).get('weight_variants', [])))")
+          for fmt in $VARIANTS; do
+            echo "Exporting $fmt variant..."
+            python tools/export_${MODEL}.py -o artifacts/ --quantize $fmt
+          done
+
+          echo "Generated artifacts:"
+          ls -lh artifacts/
 
       - name: Upload weights
         uses: actions/upload-artifact@v4
