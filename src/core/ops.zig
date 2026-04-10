@@ -2743,3 +2743,288 @@ test "apply attention mask additive" {
     try std.testing.expectEqual(@as(f32, 2.0), scores.data[4]);
     try std.testing.expect(std.math.isNegativeInf(scores.data[5]));
 }
+
+// ============================================================================
+// RMS Normalization (for Gemma, LLaMA, etc.)
+// ============================================================================
+
+/// RMS Normalization — lighter than LayerNorm (no mean centering, no bias)
+/// y = (x / rms(x)) * weight, where rms(x) = sqrt(mean(x^2) + eps)
+/// SIMD-optimized for AVX (8-wide vectors)
+pub fn rmsNorm(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weight: *const Tensor,
+    epsilon: f32,
+) !Tensor {
+    var result = try input.clone(allocator);
+    errdefer result.deinit();
+    rmsNormInPlace(&result, weight, epsilon);
+    return result;
+}
+
+/// In-place RMS normalization
+/// SIMD-optimized for AVX (8-wide vectors)
+pub fn rmsNormInPlace(
+    input: *Tensor,
+    weight: *const Tensor,
+    epsilon: f32,
+) void {
+    const VEC_WIDTH_RMS = 8;
+    const Vec = @Vector(VEC_WIDTH_RMS, f32);
+
+    const hidden_dim = if (input.shape.len == 2) input.shape[1] else input.data.len;
+    const num_rows = if (input.shape.len == 2) input.shape[0] else 1;
+    const hidden_dim_f: f32 = @floatFromInt(hidden_dim);
+
+    for (0..num_rows) |row| {
+        const row_data = input.data[row * hidden_dim ..][0..hidden_dim];
+
+        // Compute sum of squares using SIMD
+        var sum_sq: f32 = 0.0;
+        if (hidden_dim >= VEC_WIDTH_RMS) {
+            var acc: Vec = @splat(0.0);
+            var i: usize = 0;
+            while (i + VEC_WIDTH_RMS <= hidden_dim) : (i += VEC_WIDTH_RMS) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH_RMS].*;
+                acc += v * v;
+            }
+            sum_sq = @reduce(.Add, acc);
+            // Scalar tail
+            while (i < hidden_dim) : (i += 1) {
+                sum_sq += row_data[i] * row_data[i];
+            }
+        } else {
+            for (row_data) |v| {
+                sum_sq += v * v;
+            }
+        }
+
+        // rms = sqrt(mean(x^2) + eps)
+        const inv_rms: f32 = 1.0 / @sqrt(sum_sq / hidden_dim_f + epsilon);
+        const inv_rms_vec: Vec = @splat(inv_rms);
+
+        // Normalize and scale
+        if (hidden_dim >= VEC_WIDTH_RMS) {
+            var i: usize = 0;
+            while (i + VEC_WIDTH_RMS <= hidden_dim) : (i += VEC_WIDTH_RMS) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH_RMS].*;
+                const w: Vec = weight.data[i..][0..VEC_WIDTH_RMS].*;
+                row_data[i..][0..VEC_WIDTH_RMS].* = v * inv_rms_vec * w;
+            }
+            while (i < hidden_dim) : (i += 1) {
+                row_data[i] = row_data[i] * inv_rms * weight.data[i];
+            }
+        } else {
+            for (row_data, 0..) |*v, i| {
+                v.* = v.* * inv_rms * weight.data[i];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SiLU / Swish Activation (for Gemma, LLaMA, etc.)
+// ============================================================================
+
+/// SiLU (Sigmoid Linear Unit) / Swish activation: x * sigmoid(x)
+/// In-place, SIMD-optimized
+pub fn silu(tensor: *Tensor) void {
+    const VEC_WIDTH_SILU = 8;
+    const Vec = @Vector(VEC_WIDTH_SILU, f32);
+    const len = tensor.data.len;
+
+    const ones: Vec = @splat(1.0);
+    const neg_ones: Vec = @splat(-1.0);
+
+    var i: usize = 0;
+    while (i + VEC_WIDTH_SILU <= len) : (i += VEC_WIDTH_SILU) {
+        const x: Vec = tensor.data[i..][0..VEC_WIDTH_SILU].*;
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        const neg_x = neg_ones * x;
+        // Clamp to prevent overflow in exp
+        const clamped = @max(@as(Vec, @splat(-88.0)), @min(@as(Vec, @splat(88.0)), neg_x));
+        const exp_neg_x = @exp(clamped);
+        const sigmoid_x = ones / (ones + exp_neg_x);
+        tensor.data[i..][0..VEC_WIDTH_SILU].* = x * sigmoid_x;
+    }
+    // Scalar tail
+    while (i < len) : (i += 1) {
+        const x = tensor.data[i];
+        const clamped_x = @max(@as(f32, -88.0), @min(@as(f32, 88.0), -x));
+        const sig = 1.0 / (1.0 + @exp(clamped_x));
+        tensor.data[i] = x * sig;
+    }
+}
+
+/// Allocating version of SiLU
+pub fn siluAlloc(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
+    var result = try tensor.clone(allocator);
+    silu(&result);
+    return result;
+}
+
+// ============================================================================
+// Rotary Position Embeddings (RoPE) — for Gemma, LLaMA, etc.
+// ============================================================================
+
+/// Apply Rotary Position Embeddings in-place to Q and K tensors.
+/// Operates on the "split-half" convention: first half = cos rotation, second half = sin rotation.
+///
+/// q: [seq_len, num_heads * head_dim] — query projections
+/// k: [seq_len, num_kv_heads * head_dim] — key projections
+/// head_dim: dimension per head (rotation applied per head)
+/// num_heads: number of query heads
+/// num_kv_heads: number of key heads (GQA)
+/// position_offset: starting position index (for cached generation)
+/// rope_base: base frequency (10000.0 for Gemma 1)
+pub fn ropeInPlace(
+    q: *Tensor,
+    k: *Tensor,
+    head_dim: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    position_offset: usize,
+    rope_base: f32,
+) void {
+    const seq_len = q.shape[0];
+    const half_dim = head_dim / 2;
+
+    for (0..seq_len) |pos_idx| {
+        const position: f32 = @floatFromInt(position_offset + pos_idx);
+
+        // Apply RoPE to Q heads
+        for (0..num_heads) |h| {
+            const head_offset = h * head_dim;
+            const row_offset = pos_idx * (num_heads * head_dim) + head_offset;
+            applyRopeToHead(q.data[row_offset..][0..head_dim], position, half_dim, rope_base);
+        }
+
+        // Apply RoPE to K heads
+        for (0..num_kv_heads) |h| {
+            const head_offset = h * head_dim;
+            const row_offset = pos_idx * (num_kv_heads * head_dim) + head_offset;
+            applyRopeToHead(k.data[row_offset..][0..head_dim], position, half_dim, rope_base);
+        }
+    }
+}
+
+/// Apply rotary embedding to a single head's data [head_dim]
+/// Uses the split-half convention: [x0, x1, ..., x_{d/2-1}, x_{d/2}, ..., x_{d-1}]
+/// For each pair (x_i, x_{i+d/2}):
+///   x_i'       = x_i * cos(θ_i) - x_{i+d/2} * sin(θ_i)
+///   x_{i+d/2}' = x_i * sin(θ_i) + x_{i+d/2} * cos(θ_i)
+/// where θ_i = position * base^(-2i/d)
+fn applyRopeToHead(head_data: []f32, position: f32, half_dim: usize, base: f32) void {
+    for (0..half_dim) |i| {
+        const freq_exp: f32 = -2.0 * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(half_dim * 2));
+        const theta = position * std.math.pow(f32, base, freq_exp);
+        const cos_t = @cos(theta);
+        const sin_t = @sin(theta);
+
+        const x0 = head_data[i];
+        const x1 = head_data[i + half_dim];
+        head_data[i] = x0 * cos_t - x1 * sin_t;
+        head_data[i + half_dim] = x0 * sin_t + x1 * cos_t;
+    }
+}
+
+// ============================================================================
+// Tests: RMSNorm, SiLU, RoPE
+// ============================================================================
+
+test "rmsNorm basic" {
+    const allocator = std.testing.allocator;
+
+    // Input: [1, 4] = [1.0, 2.0, 3.0, 4.0]
+    var input_shape = [_]usize{ 1, 4 };
+    var input = try Tensor.init(allocator, &input_shape);
+    defer input.deinit();
+    input.data[0] = 1.0;
+    input.data[1] = 2.0;
+    input.data[2] = 3.0;
+    input.data[3] = 4.0;
+
+    // Weight: all ones
+    var w_shape = [_]usize{4};
+    var weight = try Tensor.init(allocator, &w_shape);
+    defer weight.deinit();
+    weight.data[0] = 1.0;
+    weight.data[1] = 1.0;
+    weight.data[2] = 1.0;
+    weight.data[3] = 1.0;
+
+    var result = try rmsNorm(allocator, &input, &weight, 1e-6);
+    defer result.deinit();
+
+    // rms = sqrt(mean([1,4,9,16]) + 1e-6) = sqrt(7.5 + 1e-6) ≈ 2.7386
+    // output = input / rms ≈ [0.3651, 0.7303, 1.0954, 1.4606]
+    const rms_val = @sqrt(@as(f32, 7.5) + 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0) / rms_val, result.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0) / rms_val, result.data[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0) / rms_val, result.data[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0) / rms_val, result.data[3], 0.001);
+}
+
+test "silu basic" {
+    const allocator = std.testing.allocator;
+
+    var shape = [_]usize{4};
+    var tensor = try Tensor.init(allocator, &shape);
+    defer tensor.deinit();
+    tensor.data[0] = 0.0;
+    tensor.data[1] = 1.0;
+    tensor.data[2] = -1.0;
+    tensor.data[3] = 5.0;
+
+    silu(&tensor);
+
+    // silu(0) = 0 * sigmoid(0) = 0 * 0.5 = 0
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), tensor.data[0], 0.001);
+    // silu(1) = 1 * sigmoid(1) ≈ 1 * 0.7311 = 0.7311
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7311), tensor.data[1], 0.001);
+    // silu(-1) = -1 * sigmoid(-1) ≈ -1 * 0.2689 = -0.2689
+    try std.testing.expectApproxEqAbs(@as(f32, -0.2689), tensor.data[2], 0.001);
+    // silu(5) ≈ 5 * 0.9933 = 4.9665
+    try std.testing.expectApproxEqAbs(@as(f32, 4.9665), tensor.data[3], 0.01);
+}
+
+test "ropeInPlace basic" {
+    const allocator = std.testing.allocator;
+
+    // Q: [1, 4] (1 head, head_dim=4)
+    var q_shape = [_]usize{ 1, 4 };
+    var q = try Tensor.init(allocator, &q_shape);
+    defer q.deinit();
+    q.data[0] = 1.0;
+    q.data[1] = 0.0;
+    q.data[2] = 0.0;
+    q.data[3] = 1.0;
+
+    // K: same shape
+    var k = try Tensor.init(allocator, &q_shape);
+    defer k.deinit();
+    k.data[0] = 1.0;
+    k.data[1] = 0.0;
+    k.data[2] = 0.0;
+    k.data[3] = 1.0;
+
+    // Apply RoPE at position 0 — should be identity rotation (cos(0)=1, sin(0)=0)
+    ropeInPlace(&q, &k, 4, 1, 1, 0, 10000.0);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), q.data[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), q.data[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), q.data[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), q.data[3], 0.001);
+
+    // Apply RoPE at position 1 — values should rotate
+    q.data[0] = 1.0;
+    q.data[1] = 0.0;
+    q.data[2] = 0.0;
+    q.data[3] = 0.0;
+    ropeInPlace(&q, &k, 4, 1, 1, 1, 10000.0);
+
+    // At position 1, dimension 0: theta = 1.0 * 10000^(0/4) = 1.0
+    // x0' = 1.0 * cos(1.0) - 0.0 * sin(1.0) = cos(1.0) ≈ 0.5403
+    try std.testing.expectApproxEqAbs(@as(f32, @cos(1.0)), q.data[0], 0.001);
+}

@@ -149,6 +149,15 @@ pub fn build(b: *std.Build) void {
     attention_module.addImport("ops.zig", ops_module);
     attention_module.addImport("quantization.zig", quantization_module);
 
+    // Cache module (KV cache for autoregressive decoding)
+    const cache_module = b.createModule(.{
+        .root_source_file = b.path("src/core/cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cache_module.addImport("tensor.zig", tensor_module);
+    attention_module.addImport("cache.zig", cache_module);
+
     // Transformer module (supports F32, Q8, Q4, Q8_K via comptime generics)
     const transformer_module = b.createModule(.{
         .root_source_file = b.path("src/core/transformer.zig"),
@@ -159,14 +168,6 @@ pub fn build(b: *std.Build) void {
     transformer_module.addImport("ops.zig", ops_module);
     transformer_module.addImport("quantization.zig", quantization_module);
     transformer_module.addImport("attention.zig", attention_module);
-
-    // Cache module (KV cache for autoregressive decoding)
-    const cache_module = b.createModule(.{
-        .root_source_file = b.path("src/core/cache.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    cache_module.addImport("tensor.zig", tensor_module);
 
     // Audio module (mel spectrogram, FFT, audio loading - pure Zig)
     const audio_module = b.createModule(.{
@@ -407,6 +408,38 @@ pub fn build(b: *std.Build) void {
     const run_st_tests = b.addRunArtifact(st_tests);
     const st_test_step = b.step("test-sentence-transformer", "Run sentence transformer validation tests");
     st_test_step.dependOn(&run_st_tests.step);
+
+    // ==========================================================================
+    // Gemma validation tests
+    // ==========================================================================
+    const gemma_model_module = b.createModule(.{
+        .root_source_file = b.path("src/models/gemma/model.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gemma_model_module.addImport("tensor.zig", tensor_module);
+    gemma_model_module.addImport("ops.zig", ops_module);
+    gemma_model_module.addImport("loader.zig", loader_module);
+    gemma_model_module.addImport("quantization.zig", quantization_module);
+    gemma_model_module.addImport("attention.zig", attention_module);
+    gemma_model_module.addImport("transformer.zig", transformer_module);
+    gemma_model_module.addImport("cache.zig", cache_module);
+    gemma_model_module.addImport("audio.zig", audio_module);
+
+    const gemma_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/test_gemma.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gemma_test_module.addImport("model", gemma_model_module);
+
+    const gemma_tests = b.addTest(.{
+        .root_module = gemma_test_module,
+    });
+
+    const run_gemma_tests = b.addRunArtifact(gemma_tests);
+    const gemma_test_step = b.step("test-gemma", "Run Gemma validation tests");
+    gemma_test_step.dependOn(&run_gemma_tests.step);
 
     // ==========================================================================
     // WebAssembly targets (data-driven from model_registry.zig)
@@ -720,6 +753,15 @@ fn buildNativeLib(
     attention_module.addImport("ops.zig", ops_module);
     attention_module.addImport("quantization.zig", quantization_module);
 
+    // Cache module (KV cache for autoregressive models) - Native lib
+    const cache_module = b.createModule(.{
+        .root_source_file = b.path("src/core/cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cache_module.addImport("tensor.zig", tensor_module);
+    attention_module.addImport("cache.zig", cache_module);
+
     // Generic transformer module (supports F32, Q8, Q4, Q8_K) - Native
     const transformer_module = b.createModule(.{
         .root_source_file = b.path("src/core/transformer.zig"),
@@ -751,6 +793,7 @@ fn buildNativeLib(
     model_module.addImport("quantization.zig", quantization_module);
     model_module.addImport("attention.zig", attention_module);
     model_module.addImport("transformer.zig", transformer_module);
+    model_module.addImport("cache.zig", cache_module);
     model_module.addImport("audio.zig", audio_module);
 
     // Create build options for bundled/lite mode

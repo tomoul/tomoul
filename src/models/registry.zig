@@ -236,4 +236,33 @@ pub const models = [_]ModelConfig{
         .supports_bundled = false, // Weights loaded separately at runtime
         .release_mode = .fast,
     },
+    // Gemma Text Generation (decoder-only LLM)
+    .{
+        .name = "gemma-2b",
+        .kind = .text,
+        .description = "Text Generation (Gemma 2B - 2 billion params)",
+        .model_module = "src/models/gemma/model.zig",
+        .cli_module = "src/models/gemma/cli.zig",
+        .c_binding = "src/models/gemma/c.zig",
+        .weights_path = "artifacts/gemma_2b.tl",
+        .hf_repo = "tomoul/gemma-2b",
+        .export_symbols = &.{
+            "init",
+            "generate",
+            "get_output_buffer_ptr",
+            "get_output_length",
+            "destroy",
+            "is_ready",
+            "get_version",
+        },
+        .weight_variants = &.{
+            .{ .suffix = "-q8", .path = "artifacts/gemma_2b_q8.tl", .description = "Q8 quantized - 4x smaller" },
+            .{ .suffix = "-q8k", .path = "artifacts/gemma_2b_q8k.tl", .description = "Q8_K block-wise - better accuracy" },
+            .{ .suffix = "-q4", .path = "artifacts/gemma_2b_q4.tl", .description = "Q4 quantized - 8x smaller" },
+        },
+        .has_example = false,
+        .has_cli = true,
+        .supports_bundled = false,
+        .release_mode = .fast,
+    },
 };

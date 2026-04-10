@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemma 2B - Tomoul Demo</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #f97316; margin-bottom: 0.5rem; }
+        .subtitle { color: #94a3b8; margin-bottom: 2rem; }
+        .input-group { margin-bottom: 1rem; }
+        label { display: block; color: #94a3b8; margin-bottom: 0.5rem; font-size: 0.875rem; }
+        textarea { width: 100%; padding: 0.75rem; background: #1e293b; border: 1px solid #334155; border-radius: 0.5rem; color: #e2e8f0; font-size: 0.95rem; resize: vertical; min-height: 80px; }
+        textarea:focus { outline: none; border-color: #f97316; }
+        input[type="number"], input[type="range"] { background: #1e293b; border: 1px solid #334155; border-radius: 0.375rem; color: #e2e8f0; padding: 0.5rem; font-size: 0.9rem; }
+        input[type="number"] { width: 80px; }
+        input[type="range"] { width: 200px; vertical-align: middle; }
+        .controls { display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 1.5rem; }
+        .control-item { display: flex; align-items: center; gap: 0.5rem; }
+        .control-item label { margin: 0; white-space: nowrap; }
+        button { background: #f97316; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-size: 1rem; cursor: pointer; margin-right: 0.5rem; margin-bottom: 0.5rem; }
+        button:hover { background: #ea580c; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+        .examples { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.5rem; }
+        .examples button { background: #1e293b; border: 1px solid #334155; font-size: 0.8rem; padding: 0.5rem 0.75rem; }
+        .examples button:hover { border-color: #f97316; }
+        .result { background: #1e293b; border-radius: 0.5rem; padding: 1.25rem; margin-top: 1rem; }
+        .result h3 { color: #f97316; margin-bottom: 0.75rem; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+        .stat { background: #0f172a; padding: 0.75rem; border-radius: 0.375rem; }
+        .stat-label { color: #64748b; font-size: 0.75rem; text-transform: uppercase; }
+        .stat-value { color: #f8fafc; font-size: 1.25rem; font-weight: 600; }
+        .output-text { background: #0f172a; border-radius: 0.375rem; padding: 1rem; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.9rem; line-height: 1.6; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; }
+        .output-text .prompt-echo { color: #64748b; }
+        .output-text .generated { color: #e2e8f0; }
+        .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #475569; border-top-color: #f97316; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 0.5rem; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Gemma 2B</h1>
+        <p class="subtitle">Text Generation &middot; 2 Billion Parameters &middot; Powered by Tomoul</p>
+
+        <div class="input-group">
+            <label>Prompt:</label>
+            <textarea id="prompt" rows="3">The meaning of life is</textarea>
+        </div>
+
+        <div class="controls">
+            <div class="control-item">
+                <label>Max tokens:</label>
+                <input type="number" id="maxTokens" value="128" min="1" max="2048">
+            </div>
+            <div class="control-item">
+                <label>Temperature:</label>
+                <input type="range" id="tempSlider" min="0" max="1.5" step="0.1" value="0.0">
+                <span id="tempValue">0.0</span>
+            </div>
+        </div>
+
+        <button id="genBtn" onclick="generate()">Generate</button>
+
+        <div class="examples">
+            <button onclick="loadExample('story')">Story</button>
+            <button onclick="loadExample('code')">Code</button>
+            <button onclick="loadExample('explain')">Explain</button>
+            <button onclick="loadExample('qa')">Q&amp;A</button>
+            <button onclick="loadExample('creative')">Creative</button>
+        </div>
+
+        <div id="result" class="result" style="display:none;">
+            <h3>Output</h3>
+            <div class="stats" id="stats"></div>
+            <div class="output-text" id="outputText"></div>
+        </div>
+    </div>
+
+    <script>
+        const EXAMPLES = {
+            story: "Once upon a time in a kingdom beneath the sea, there lived a young dolphin who dreamed of",
+            code: "Write a Python function that finds all prime numbers up to n using the Sieve of Eratosthenes:\n\n```python\ndef sieve_of_eratosthenes(n):",
+            explain: "Explain quantum computing to a 10-year-old in simple terms:\n\n",
+            qa: "Question: What causes the seasons on Earth?\nAnswer:",
+            creative: "A haiku about artificial intelligence:\n\n",
+        };
+
+        document.getElementById('tempSlider').addEventListener('input', (e) => {
+            document.getElementById('tempValue').textContent = parseFloat(e.target.value).toFixed(1);
+        });
+
+        function loadExample(name) {
+            document.getElementById('prompt').value = EXAMPLES[name];
+        }
+
+        async function generate() {
+            const btn = document.getElementById('genBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>Generating...';
+
+            const prompt = document.getElementById('prompt').value.trim();
+            const maxTokens = parseInt(document.getElementById('maxTokens').value) || 128;
+            const temperature = parseFloat(document.getElementById('tempSlider').value);
+
+            if (!prompt) {
+                btn.disabled = false;
+                btn.textContent = 'Generate';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt, max_tokens: maxTokens, temperature }),
+                });
+                const data = await res.json();
+
+                if (data.error) throw new Error(data.error);
+
+                // Stats
+                document.getElementById('stats').innerHTML = `
+                    <div class="stat"><div class="stat-label">Time</div><div class="stat-value">${data.elapsed_ms}ms</div></div>
+                    <div class="stat"><div class="stat-label">Temperature</div><div class="stat-value">${data.temperature.toFixed(1)}</div></div>
+                    <div class="stat"><div class="stat-label">Max Tokens</div><div class="stat-value">${data.max_tokens}</div></div>
+                `;
+
+                // Output with prompt highlighted differently
+                const outputEl = document.getElementById('outputText');
+                outputEl.innerHTML = '';
+                const promptSpan = document.createElement('span');
+                promptSpan.className = 'prompt-echo';
+                promptSpan.textContent = data.prompt;
+                const genSpan = document.createElement('span');
+                genSpan.className = 'generated';
+                genSpan.textContent = data.generated;
+                outputEl.appendChild(promptSpan);
+                outputEl.appendChild(genSpan);
+
+                document.getElementById('result').style.display = 'block';
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Generate';
+        }
+
+        // Submit on Ctrl/Cmd+Enter
+        document.getElementById('prompt').addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault();
+                generate();
+            }
+        });
+    </script>
+</body>
+</html>

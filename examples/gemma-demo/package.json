@@ -1,0 +1,20 @@
+{
+  "name": "tomoul-gemma-demo",
+  "version": "1.0.0",
+  "description": "Text generation demo using Tomoul native library (Gemma 2B)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "benchmark": "node benchmark.js",
+    "benchmark:python": "python3 benchmark_pytorch.py"
+  },
+  "keywords": ["gemma", "text-generation", "llm", "inference"],
+  "author": "Tomoul",
+  "license": "MIT",
+  "dependencies": {
+    "koffi": "^2.14.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -14,6 +14,7 @@ const std = @import("std");
 const Tensor = @import("tensor.zig").Tensor;
 const ops = @import("ops.zig");
 const quant = @import("quantization.zig");
+const cache_mod = @import("cache.zig");
 
 const QuantizedTensorQ8 = quant.QuantizedTensorQ8;
 const QuantizedTensorQ4 = quant.QuantizedTensorQ4;
@@ -97,6 +98,22 @@ pub const AttentionConfig = struct {
     num_heads: usize, // 12 for base, 16 for large
     hidden_dim: usize, // 768 for base, 1024 for large
     head_dim: usize, // hidden_dim / num_heads
+};
+
+/// GQA configuration — extends AttentionConfig with KV head count
+pub const GQAConfig = struct {
+    num_heads: usize, // Query heads (e.g., 8 for Gemma 2B)
+    num_kv_heads: usize, // KV heads (1 for MQA, num_heads for MHA)
+    head_dim: usize, // Per-head dimension (e.g., 256)
+    hidden_dim: usize, // num_heads * head_dim
+
+    pub fn kv_dim(self: GQAConfig) usize {
+        return self.num_kv_heads * self.head_dim;
+    }
+
+    pub fn heads_per_group(self: GQAConfig) usize {
+        return self.num_heads / self.num_kv_heads;
+    }
 };
 
 /// Get the weight format enum for a given weight type
@@ -586,6 +603,264 @@ pub fn multiHeadAttentionQ8K(
     config: AttentionConfig,
 ) !Tensor {
     return multiHeadAttention(QuantizedTensorQ8K, allocator, input, weights, config);
+}
+
+// ============================================================================
+// Grouped-Query Attention (GQA) — for Gemma, LLaMA, Mistral, etc.
+// ============================================================================
+
+/// GQA attention weights — separate Q/K/V/O projections with different KV dimensions.
+/// Q projection: [hidden_dim, hidden_dim] (num_heads * head_dim → hidden_dim)
+/// K/V projection: [hidden_dim, kv_dim] (num_kv_heads * head_dim → kv_dim)
+/// O projection: [hidden_dim, hidden_dim]
+/// No biases (Gemma/LLaMA convention).
+pub fn GQAWeights(comptime WeightType: type) type {
+    return struct {
+        q_weight: WeightType, // [hidden_dim, hidden_dim] pre-transposed
+        k_weight: WeightType, // [hidden_dim, kv_dim] pre-transposed
+        v_weight: WeightType, // [hidden_dim, kv_dim] pre-transposed
+        o_weight: WeightType, // [hidden_dim, hidden_dim] pre-transposed
+
+        const Self = @This();
+
+        pub fn format() WeightFormat {
+            return comptime getWeightFormat(WeightType);
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.q_weight.deinit();
+            self.k_weight.deinit();
+            self.v_weight.deinit();
+            self.o_weight.deinit();
+        }
+    };
+}
+
+pub const GQAWeightsF32 = GQAWeights(Tensor);
+pub const GQAWeightsQ8 = GQAWeights(QuantizedTensorQ8);
+pub const GQAWeightsQ4 = GQAWeights(QuantizedTensorQ4);
+pub const GQAWeightsQ8K = GQAWeights(QuantizedTensorQ8K);
+pub const GQAWeightsF16 = GQAWeights(F16Tensor);
+
+/// Grouped-Query Attention with causal masking.
+/// Supports MHA (num_kv_heads == num_heads), GQA, and MQA (num_kv_heads == 1).
+///
+/// input: [seq_len, hidden_dim]
+/// Returns: [seq_len, hidden_dim]
+///
+/// Each KV head is shared across (num_heads / num_kv_heads) query heads.
+pub fn groupedQueryAttention(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const GQAWeights(WeightType),
+    gqa_config: GQAConfig,
+) !Tensor {
+    const seq_len = input.shape[0];
+    const num_heads = gqa_config.num_heads;
+    const num_kv_heads = gqa_config.num_kv_heads;
+    _ = num_kv_heads; // autofix
+    const head_dim = gqa_config.head_dim;
+    const hidden_dim = gqa_config.hidden_dim;
+    const heads_per_group = gqa_config.heads_per_group();
+    const kv_dim = gqa_config.kv_dim();
+
+    // Project Q: [seq_len, hidden_dim] @ W_q -> [seq_len, hidden_dim]
+    var q = try matmulWithWeight(WeightType, allocator, input, &weights.q_weight);
+    defer q.deinit();
+
+    // Project K: [seq_len, hidden_dim] @ W_k -> [seq_len, kv_dim]
+    var k = try matmulWithWeight(WeightType, allocator, input, &weights.k_weight);
+    defer k.deinit();
+
+    // Project V: [seq_len, hidden_dim] @ W_v -> [seq_len, kv_dim]
+    var v = try matmulWithWeight(WeightType, allocator, input, &weights.v_weight);
+    defer v.deinit();
+
+    // Allocate output [seq_len, hidden_dim]
+    var out_shape = [_]usize{ seq_len, hidden_dim };
+    var concat = try Tensor.init(allocator, &out_shape);
+    errdefer concat.deinit();
+
+    // Scores buffer [seq_len, seq_len]
+    const scores_buf = try allocator.alloc(f32, seq_len * seq_len);
+    defer allocator.free(scores_buf);
+
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const neg_inf = -std.math.inf(f32);
+
+    // Compute attention for each query head
+    for (0..num_heads) |h| {
+        const q_head_offset = h * head_dim;
+        const kv_head = h / heads_per_group; // Which KV head this query head maps to
+        const kv_head_offset = kv_head * head_dim;
+
+        // Compute scores: Q_h @ K_kv^T * scale with causal mask
+        for (0..seq_len) |i| {
+            const q_base = i * hidden_dim + q_head_offset;
+            for (0..seq_len) |j| {
+                if (j > i) {
+                    scores_buf[i * seq_len + j] = neg_inf;
+                    continue;
+                }
+                const k_base = j * kv_dim + kv_head_offset;
+                var dot: f32 = 0.0;
+                for (0..head_dim) |d| {
+                    dot += q.data[q_base + d] * k.data[k_base + d];
+                }
+                scores_buf[i * seq_len + j] = dot * scale;
+            }
+        }
+
+        // Softmax each row
+        for (0..seq_len) |i| {
+            const row = scores_buf[i * seq_len ..][0..seq_len];
+            var max_val: f32 = row[0];
+            for (row[1..]) |sv| {
+                if (sv > max_val) max_val = sv;
+            }
+            var sum_val: f32 = 0.0;
+            for (row) |*sv| {
+                sv.* = @exp(sv.* - max_val);
+                sum_val += sv.*;
+            }
+            const inv_sum = 1.0 / sum_val;
+            for (row) |*sv| {
+                sv.* *= inv_sum;
+            }
+        }
+
+        // Output = scores @ V_kv, written to concat at q_head_offset
+        for (0..seq_len) |i| {
+            const score_row = scores_buf[i * seq_len ..][0..seq_len];
+            const out_base = i * hidden_dim + q_head_offset;
+            for (0..head_dim) |d| {
+                concat.data[out_base + d] = 0.0;
+            }
+            for (0..seq_len) |j| {
+                const s = score_row[j];
+                if (s == 0.0) continue;
+                const v_base = j * kv_dim + kv_head_offset;
+                for (0..head_dim) |d| {
+                    concat.data[out_base + d] += s * v.data[v_base + d];
+                }
+            }
+        }
+    }
+
+    // Output projection: [seq_len, hidden_dim] @ W_o -> [seq_len, hidden_dim]
+    const output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
+    concat.deinit();
+
+    return output;
+}
+
+/// Grouped-Query Attention for single token with KV cache (autoregressive decoding).
+///
+/// input: [1, hidden_dim] — single token embedding
+/// kv_cache: KV cache with previous tokens' K/V
+/// layer: which layer's cache to use
+/// position: current token position
+///
+/// Returns: [1, hidden_dim]
+pub fn groupedQueryAttentionCached(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const GQAWeights(WeightType),
+    gqa_config: GQAConfig,
+    kv_cache: *cache_mod.KVCache,
+    layer: usize,
+    position: usize,
+) !Tensor {
+    const num_heads = gqa_config.num_heads;
+    const num_kv_heads = gqa_config.num_kv_heads;
+    _ = num_kv_heads; // autofix
+    const head_dim = gqa_config.head_dim;
+    const hidden_dim = gqa_config.hidden_dim;
+    const kv_dim = gqa_config.kv_dim();
+    const heads_per_group = gqa_config.heads_per_group();
+
+    // Project current token: Q [1, hidden_dim], K [1, kv_dim], V [1, kv_dim]
+    var q = try matmulWithWeight(WeightType, allocator, input, &weights.q_weight);
+    defer q.deinit();
+
+    var k_new = try matmulWithWeight(WeightType, allocator, input, &weights.k_weight);
+    defer k_new.deinit();
+
+    var v_new = try matmulWithWeight(WeightType, allocator, input, &weights.v_weight);
+    defer v_new.deinit();
+
+    // Append new K/V to cache (before incrementing length)
+    try kv_cache.append(layer, &k_new, &v_new);
+    // Note: caller increments cache length after all layers
+
+    // Get full K/V including the just-appended token
+    const cache_len = position + 1; // positions 0..position inclusive
+    const all_k = kv_cache.keys[layer].data[0 .. cache_len * kv_dim];
+    const all_v = kv_cache.values[layer].data[0 .. cache_len * kv_dim];
+
+    // Allocate output [1, hidden_dim]
+    var out_shape = [_]usize{ 1, hidden_dim };
+    var concat = try Tensor.init(allocator, &out_shape);
+    errdefer concat.deinit();
+
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    // Scores buffer [1, cache_len]
+    const scores_buf = try allocator.alloc(f32, cache_len);
+    defer allocator.free(scores_buf);
+
+    // For each query head
+    for (0..num_heads) |h| {
+        const q_head_offset = h * head_dim;
+        const kv_head = h / heads_per_group;
+        const kv_head_offset = kv_head * head_dim;
+
+        // Compute scores: q_h dot all_k for each cached position
+        for (0..cache_len) |j| {
+            const k_base = j * kv_dim + kv_head_offset;
+            var dot: f32 = 0.0;
+            for (0..head_dim) |d| {
+                dot += q.data[q_head_offset + d] * all_k[k_base + d];
+            }
+            scores_buf[j] = dot * scale;
+        }
+
+        // Softmax
+        var max_val: f32 = scores_buf[0];
+        for (scores_buf[1..cache_len]) |sv| {
+            if (sv > max_val) max_val = sv;
+        }
+        var sum_val: f32 = 0.0;
+        for (scores_buf[0..cache_len]) |*sv| {
+            sv.* = @exp(sv.* - max_val);
+            sum_val += sv.*;
+        }
+        const inv_sum = 1.0 / sum_val;
+        for (scores_buf[0..cache_len]) |*sv| {
+            sv.* *= inv_sum;
+        }
+
+        // Output = scores @ V_kv
+        for (0..head_dim) |d| {
+            concat.data[q_head_offset + d] = 0.0;
+        }
+        for (0..cache_len) |j| {
+            const s = scores_buf[j];
+            if (s == 0.0) continue;
+            const v_base = j * kv_dim + kv_head_offset;
+            for (0..head_dim) |d| {
+                concat.data[q_head_offset + d] += s * all_v[v_base + d];
+            }
+        }
+    }
+
+    // Output projection
+    const output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
+    concat.deinit();
+
+    return output;
 }
 
 // ============================================================================
