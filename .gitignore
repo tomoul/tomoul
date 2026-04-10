@@ -39,7 +39,7 @@ Thumbs.db
 # Model weights (will be generated)
 artifacts/
 *.tl
-models/
+/models/
 
 # But allow test fixtures
 !tests/fixtures/**/*.tl

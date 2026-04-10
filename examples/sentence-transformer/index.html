@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sentence Transformer - Tomoul Demo</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #f97316; margin-bottom: 0.5rem; }
+        .subtitle { color: #94a3b8; margin-bottom: 2rem; }
+        .input-group { margin-bottom: 1.5rem; }
+        label { display: block; color: #94a3b8; margin-bottom: 0.5rem; font-size: 0.875rem; }
+        textarea { width: 100%; padding: 0.75rem; background: #1e293b; border: 1px solid #334155; border-radius: 0.5rem; color: #e2e8f0; font-size: 0.95rem; resize: vertical; min-height: 80px; }
+        textarea:focus { outline: none; border-color: #f97316; }
+        button { background: #f97316; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-size: 1rem; cursor: pointer; margin-right: 0.5rem; margin-bottom: 0.5rem; }
+        button:hover { background: #ea580c; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+        .examples { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.5rem; }
+        .examples button { background: #1e293b; border: 1px solid #334155; font-size: 0.8rem; padding: 0.5rem 0.75rem; }
+        .examples button:hover { border-color: #f97316; }
+        .result { background: #1e293b; border-radius: 0.5rem; padding: 1rem; margin-top: 1rem; }
+        .result h3 { color: #f97316; margin-bottom: 0.75rem; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+        .stat { background: #0f172a; padding: 0.75rem; border-radius: 0.375rem; }
+        .stat-label { color: #64748b; font-size: 0.75rem; text-transform: uppercase; }
+        .stat-value { color: #f8fafc; font-size: 1.25rem; font-weight: 600; }
+        .similarity-matrix { margin-top: 1rem; }
+        .similarity-matrix table { width: 100%; border-collapse: collapse; }
+        .similarity-matrix th, .similarity-matrix td { padding: 0.5rem; text-align: center; border: 1px solid #334155; font-size: 0.8rem; }
+        .similarity-matrix th { background: #0f172a; color: #94a3b8; }
+        .sim-high { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
+        .sim-mid { background: rgba(234, 179, 8, 0.15); color: #fbbf24; }
+        .sim-low { background: rgba(239, 68, 68, 0.1); color: #f87171; }
+        .embedding-preview { font-family: monospace; font-size: 0.75rem; color: #64748b; word-break: break-all; max-height: 60px; overflow: hidden; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Sentence Transformer</h1>
+        <p class="subtitle">all-MiniLM-L6-v2 &middot; 384-dim embeddings &middot; Powered by Tomoul</p>
+
+        <div class="input-group">
+            <label>Enter sentences (one per line):</label>
+            <textarea id="input" rows="6">The quick brown fox jumps over the lazy dog
+Machine learning is a subset of artificial intelligence
+I had pizza for lunch yesterday</textarea>
+        </div>
+
+        <button id="embedBtn" onclick="embed()">Generate Embeddings</button>
+
+        <div class="examples">
+            <button onclick="loadExample('semantic')">Semantic Similarity</button>
+            <button onclick="loadExample('diverse')">Diverse Topics</button>
+            <button onclick="loadExample('paraphrase')">Paraphrases</button>
+        </div>
+
+        <div id="result" class="result" style="display:none;">
+            <h3>Results</h3>
+            <div class="stats" id="stats"></div>
+            <div class="similarity-matrix" id="simMatrix"></div>
+            <div id="embPreview" class="embedding-preview" style="margin-top: 1rem;"></div>
+        </div>
+    </div>
+
+    <script>
+        const EXAMPLES = {
+            semantic: "Dogs are wonderful pets\nCats are great companions\nPython is a programming language\nJava is used for backend development",
+            diverse: "The weather is nice today\nQuantum physics describes subatomic particles\nI enjoy cooking Italian food\nThe stock market rallied this week\nPhotosynthesis converts sunlight to energy",
+            paraphrase: "The movie was excellent\nThe film was really great\nI didn't enjoy the movie at all\nThe movie was terrible",
+        };
+
+        function loadExample(name) {
+            document.getElementById('input').value = EXAMPLES[name];
+        }
+
+        async function embed() {
+            const btn = document.getElementById('embedBtn');
+            btn.disabled = true;
+            btn.textContent = 'Processing...';
+
+            const text = document.getElementById('input').value.trim();
+            const sentences = text.split('\n').filter(s => s.trim());
+
+            if (sentences.length === 0) {
+                btn.disabled = false;
+                btn.textContent = 'Generate Embeddings';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/embed', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: sentences }),
+                });
+                const data = await res.json();
+
+                if (data.error) throw new Error(data.error);
+
+                // Stats
+                document.getElementById('stats').innerHTML = `
+                    <div class="stat"><div class="stat-label">Sentences</div><div class="stat-value">${data.count}</div></div>
+                    <div class="stat"><div class="stat-label">Dimensions</div><div class="stat-value">${data.dimensions}</div></div>
+                    <div class="stat"><div class="stat-label">Time</div><div class="stat-value">${data.elapsed_ms}ms</div></div>
+                    <div class="stat"><div class="stat-label">Per Sentence</div><div class="stat-value">${(data.elapsed_ms / data.count).toFixed(1)}ms</div></div>
+                `;
+
+                // Cosine similarity matrix
+                if (data.count > 1) {
+                    let html = '<h4 style="color:#94a3b8;margin-bottom:0.5rem;">Cosine Similarity Matrix</h4><table><tr><th></th>';
+                    for (let i = 0; i < data.count; i++) html += `<th title="${sentences[i]}">${i + 1}</th>`;
+                    html += '</tr>';
+                    for (let i = 0; i < data.count; i++) {
+                        html += `<tr><th title="${sentences[i]}">${i + 1}</th>`;
+                        for (let j = 0; j < data.count; j++) {
+                            const sim = cosineSim(data.embeddings[i], data.embeddings[j]);
+                            const cls = sim > 0.7 ? 'sim-high' : sim > 0.3 ? 'sim-mid' : 'sim-low';
+                            html += `<td class="${i === j ? '' : cls}">${sim.toFixed(3)}</td>`;
+                        }
+                        html += '</tr>';
+                    }
+                    html += '</table>';
+                    document.getElementById('simMatrix').innerHTML = html;
+                }
+
+                // Preview first embedding
+                const first5 = data.embeddings[0].slice(0, 8).map(v => v.toFixed(4)).join(', ');
+                document.getElementById('embPreview').textContent = `Embedding[0]: [${first5}, ...]`;
+
+                document.getElementById('result').style.display = 'block';
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Generate Embeddings';
+        }
+
+        function cosineSim(a, b) {
+            let dot = 0, na = 0, nb = 0;
+            for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+            return dot / (Math.sqrt(na) * Math.sqrt(nb));
+        }
+    </script>
+</body>
+</html>

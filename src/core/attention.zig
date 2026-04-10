@@ -18,6 +18,7 @@ const quant = @import("quantization.zig");
 const QuantizedTensorQ8 = quant.QuantizedTensorQ8;
 const QuantizedTensorQ4 = quant.QuantizedTensorQ4;
 const QuantizedTensorQ8K = quant.QuantizedTensorQ8K;
+const F16Tensor = quant.F16Tensor;
 
 /// Weight format enumeration for runtime checks and debugging
 pub const WeightFormat = enum {
@@ -25,6 +26,7 @@ pub const WeightFormat = enum {
     q8,
     q4,
     q8_k,
+    f16,
 
     pub fn name(self: WeightFormat) []const u8 {
         return switch (self) {
@@ -32,6 +34,7 @@ pub const WeightFormat = enum {
             .q8 => "Q8_0",
             .q4 => "Q4_0",
             .q8_k => "Q8_K",
+            .f16 => "F16",
         };
     }
 
@@ -41,6 +44,7 @@ pub const WeightFormat = enum {
             .q8 => 8,
             .q4 => 4,
             .q8_k => 8,
+            .f16 => 16,
         };
     }
 };
@@ -86,6 +90,7 @@ pub const AttentionWeightsF32 = AttentionWeights(Tensor);
 pub const AttentionWeightsQ8 = AttentionWeights(QuantizedTensorQ8);
 pub const AttentionWeightsQ4 = AttentionWeights(QuantizedTensorQ4);
 pub const AttentionWeightsQ8K = AttentionWeights(QuantizedTensorQ8K);
+pub const AttentionWeightsF16 = AttentionWeights(F16Tensor);
 
 /// Configuration for attention mechanism
 pub const AttentionConfig = struct {
@@ -100,6 +105,7 @@ fn getWeightFormat(comptime T: type) WeightFormat {
     if (T == QuantizedTensorQ8) return .q8;
     if (T == QuantizedTensorQ4) return .q4;
     if (T == QuantizedTensorQ8K) return .q8_k;
+    if (T == F16Tensor) return .f16;
     @compileError("Unsupported weight type: " ++ @typeName(T));
 }
 
@@ -118,7 +124,28 @@ fn matmulWithWeight(
         .q8 => quant.matmulF32Q8Simd(allocator, input, weight),
         .q4 => quant.matmulF32Q4Simd(allocator, input, weight),
         .q8_k => quant.matmulF32Q8KSimd(allocator, input, weight),
+        .f16 => quant.matmulF32F16(allocator, input, weight),
     };
+}
+
+/// Fused matrix multiplication + bias: C = input @ weight + bias
+fn matmulWithWeightBias(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weight: *const WeightType,
+    bias: *const Tensor,
+) !Tensor {
+    const format = comptime getWeightFormat(WeightType);
+
+    if (format == .f32) {
+        return ops.matmulBias(allocator, input, weight, bias);
+    }
+
+    var result = try matmulWithWeight(WeightType, allocator, input, weight);
+    errdefer result.deinit();
+    try ops.addBiasInPlace(&result, bias);
+    return result;
 }
 
 /// Scaled dot-product attention (float32 only, used after projection)
@@ -164,6 +191,278 @@ fn scaledDotProductAttention(
     return ops.matmul(allocator, &scores, v);
 }
 
+/// Fused scaled dot-product attention operating on strided head slices.
+/// Computes attention for a single head without copying data.
+///
+/// Q_full, K_full, V_full: [seq_len, hidden_dim] (full projected tensors)
+/// head_offset: column offset for this head (h * head_dim)
+/// head_dim: dimension per head
+/// hidden_dim: total hidden dimension (stride)
+/// scores_buf: pre-allocated [seq_len, seq_len] scratch buffer
+/// output: [seq_len, hidden_dim] — results written at column offset
+fn scaledDotProductAttentionStrided(
+    q_data: []const f32,
+    k_data: []const f32,
+    v_data: []const f32,
+    output: []f32,
+    seq_len: usize,
+    head_dim: usize,
+    hidden_dim: usize,
+    head_offset: usize,
+    scores_buf: []f32,
+) void {
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    // 1. Compute scores = Q_h @ K_h^T * scale  → [seq_len, seq_len]
+    //    Q_h row i: q_data[i * hidden_dim + head_offset .. +head_dim] (stride = hidden_dim)
+    //    K_h row j: k_data[j * hidden_dim + head_offset .. +head_dim] (stride = hidden_dim)
+    for (0..seq_len) |i| {
+        const q_row_base = i * hidden_dim + head_offset;
+        for (0..seq_len) |j| {
+            const k_row_base = j * hidden_dim + head_offset;
+            var dot: f32 = 0.0;
+            for (0..head_dim) |d| {
+                dot += q_data[q_row_base + d] * k_data[k_row_base + d];
+            }
+            scores_buf[i * seq_len + j] = dot * scale;
+        }
+    }
+
+    // 2. Softmax each row of scores
+    for (0..seq_len) |i| {
+        const row = scores_buf[i * seq_len ..][0..seq_len];
+        var max_val: f32 = row[0];
+        for (row[1..]) |v| {
+            if (v > max_val) max_val = v;
+        }
+        var sum: f32 = 0.0;
+        for (row) |*v| {
+            v.* = @exp(v.* - max_val);
+            sum += v.*;
+        }
+        const inv_sum = 1.0 / sum;
+        for (row) |*v| {
+            v.* *= inv_sum;
+        }
+    }
+
+    // 3. Output = scores @ V_h → write directly into output[i, head_offset..+head_dim]
+    //    V_h row j: v_data[j * hidden_dim + head_offset .. +head_dim]
+    for (0..seq_len) |i| {
+        const score_row = scores_buf[i * seq_len ..][0..seq_len];
+        const out_base = i * hidden_dim + head_offset;
+        // Zero the output slice
+        for (0..head_dim) |d| {
+            output[out_base + d] = 0.0;
+        }
+        for (0..seq_len) |j| {
+            const s = score_row[j];
+            const v_base = j * hidden_dim + head_offset;
+            for (0..head_dim) |d| {
+                output[out_base + d] += s * v_data[v_base + d];
+            }
+        }
+    }
+}
+
+/// Fused scaled dot-product attention with padding mask, operating on strided head slices.
+/// Positions j >= actual_seq_len are masked to -inf before softmax.
+/// Otherwise identical to scaledDotProductAttentionStrided.
+fn scaledDotProductAttentionStridedMasked(
+    q_data: []const f32,
+    k_data: []const f32,
+    v_data: []const f32,
+    output: []f32,
+    seq_len: usize,
+    actual_seq_len: usize,
+    head_dim: usize,
+    hidden_dim: usize,
+    head_offset: usize,
+    scores_buf: []f32,
+) void {
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const neg_inf = -std.math.inf(f32);
+
+    // 1. Compute scores = Q_h @ K_h^T * scale, masking padding positions
+    for (0..seq_len) |i| {
+        const q_row_base = i * hidden_dim + head_offset;
+        for (0..seq_len) |j| {
+            if (j >= actual_seq_len) {
+                scores_buf[i * seq_len + j] = neg_inf;
+                continue;
+            }
+            const k_row_base = j * hidden_dim + head_offset;
+            var dot: f32 = 0.0;
+            for (0..head_dim) |d| {
+                dot += q_data[q_row_base + d] * k_data[k_row_base + d];
+            }
+            scores_buf[i * seq_len + j] = dot * scale;
+        }
+    }
+
+    // 2. Softmax each row of scores
+    for (0..seq_len) |i| {
+        const row = scores_buf[i * seq_len ..][0..seq_len];
+        var max_val: f32 = row[0];
+        for (row[1..]) |v| {
+            if (v > max_val) max_val = v;
+        }
+        var sum: f32 = 0.0;
+        for (row) |*v| {
+            v.* = @exp(v.* - max_val);
+            sum += v.*;
+        }
+        const inv_sum = 1.0 / sum;
+        for (row) |*v| {
+            v.* *= inv_sum;
+        }
+    }
+
+    // 3. Output = scores @ V_h
+    for (0..seq_len) |i| {
+        const score_row = scores_buf[i * seq_len ..][0..seq_len];
+        const out_base = i * hidden_dim + head_offset;
+        for (0..head_dim) |d| {
+            output[out_base + d] = 0.0;
+        }
+        for (0..seq_len) |j| {
+            const s = score_row[j];
+            const v_base = j * hidden_dim + head_offset;
+            for (0..head_dim) |d| {
+                output[out_base + d] += s * v_data[v_base + d];
+            }
+        }
+    }
+}
+
+/// Fused multi-head attention — no per-head tensor allocation.
+///
+/// Instead of sliceColumns/concatColumns per head, uses strided access
+/// into the full Q/K/V projected tensors. Only allocates one shared
+/// scores buffer [seq_len, seq_len] reused across all heads.
+pub fn multiHeadAttentionFused(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const AttentionWeights(WeightType),
+    config: AttentionConfig,
+) !Tensor {
+    const seq_len = input.shape[0];
+    const hidden_dim = config.hidden_dim;
+    const num_heads = config.num_heads;
+    const head_dim = config.head_dim;
+
+    // Project Q, K, V — these are the only large allocations
+    var q = try matmulWithWeightBias(WeightType, allocator, input, &weights.q_weight, &weights.q_bias);
+    defer q.deinit();
+    var k = try matmulWithWeightBias(WeightType, allocator, input, &weights.k_weight, &weights.k_bias);
+    defer k.deinit();
+    var v = try matmulWithWeightBias(WeightType, allocator, input, &weights.v_weight, &weights.v_bias);
+    defer v.deinit();
+
+    // Allocate output [seq_len, hidden_dim] and one shared scores buffer [seq_len, seq_len]
+    var out_shape = [_]usize{ seq_len, hidden_dim };
+    var concat = try Tensor.init(allocator, &out_shape);
+    errdefer concat.deinit();
+
+    const scores_buf = try allocator.alloc(f32, seq_len * seq_len);
+    defer allocator.free(scores_buf);
+
+    // Compute attention for each head using strided access — no copies
+    for (0..num_heads) |h| {
+        scaledDotProductAttentionStrided(
+            q.data,
+            k.data,
+            v.data,
+            concat.data,
+            seq_len,
+            head_dim,
+            hidden_dim,
+            h * head_dim,
+            scores_buf,
+        );
+    }
+
+    // Final output projection
+    const output = try matmulWithWeightBias(WeightType, allocator, &concat, &weights.o_weight, &weights.o_bias);
+    concat.deinit();
+
+    return output;
+}
+
+/// Batched fused multi-head attention — processes multiple sentences in one forward pass.
+///
+/// Linear projections (Q/K/V/O) run on the full [total_tokens, hidden] tensor as one big GEMM.
+/// Attention scores are computed per-sentence (loop), since they are [seq_len, seq_len] per sentence.
+/// This captures >90% of the batching benefit since the linear GEMMs dominate compute.
+///
+/// input: [total_tokens, hidden_dim] (concatenated padded sentences)
+/// sentence_lengths: seq_len for each sentence in the batch (all must be equal = max_seq_len for padded input)
+/// batch_size: number of sentences
+/// max_seq_len: padded sequence length (total_tokens = batch_size * max_seq_len)
+pub fn multiHeadAttentionFusedBatched(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const AttentionWeights(WeightType),
+    config: AttentionConfig,
+    batch_size: usize,
+    max_seq_len: usize,
+    sentence_lengths: []const usize,
+) !Tensor {
+    const hidden_dim = config.hidden_dim;
+    const num_heads = config.num_heads;
+    const head_dim = config.head_dim;
+    const total_tokens = batch_size * max_seq_len;
+
+    // Batched Q/K/V projection: [total_tokens, hidden] @ [hidden, hidden] — one big GEMM each
+    var q = try matmulWithWeightBias(WeightType, allocator, input, &weights.q_weight, &weights.q_bias);
+    defer q.deinit();
+    var k = try matmulWithWeightBias(WeightType, allocator, input, &weights.k_weight, &weights.k_bias);
+    defer k.deinit();
+    var v = try matmulWithWeightBias(WeightType, allocator, input, &weights.v_weight, &weights.v_bias);
+    defer v.deinit();
+
+    // Allocate output [total_tokens, hidden_dim]
+    var out_shape = [_]usize{ total_tokens, hidden_dim };
+    var concat = try Tensor.init(allocator, &out_shape);
+    errdefer concat.deinit();
+
+    // Shared scores buffer — sized for one sentence [max_seq_len, max_seq_len]
+    const scores_buf = try allocator.alloc(f32, max_seq_len * max_seq_len);
+    defer allocator.free(scores_buf);
+
+    // Per-sentence attention (loop) — attention scores are [seq_len, seq_len] per sentence
+    for (0..batch_size) |s| {
+        const token_offset = s * max_seq_len * hidden_dim;
+        const q_slice = q.data[token_offset..][0 .. max_seq_len * hidden_dim];
+        const k_slice = k.data[token_offset..][0 .. max_seq_len * hidden_dim];
+        const v_slice = v.data[token_offset..][0 .. max_seq_len * hidden_dim];
+        const out_slice = concat.data[token_offset..][0 .. max_seq_len * hidden_dim];
+
+        for (0..num_heads) |h| {
+            scaledDotProductAttentionStridedMasked(
+                q_slice,
+                k_slice,
+                v_slice,
+                out_slice,
+                max_seq_len,
+                sentence_lengths[s],
+                head_dim,
+                hidden_dim,
+                h * head_dim,
+                scores_buf,
+            );
+        }
+    }
+
+    // Batched output projection: [total_tokens, hidden] @ [hidden, hidden] — one big GEMM
+    const output = try matmulWithWeightBias(WeightType, allocator, &concat, &weights.o_weight, &weights.o_bias);
+    concat.deinit();
+
+    return output;
+}
+
 /// Generic multi-head attention
 /// input: [seq_len, hidden_dim]
 /// Returns: [seq_len, hidden_dim]
@@ -183,16 +482,12 @@ pub fn multiHeadAttention(
     const head_dim = config.head_dim;
 
     // Project Q, K, V using appropriate matmul for weight type
-    var q = try matmulWithWeight(WeightType, allocator, input, &weights.q_weight);
+    var q = try matmulWithWeightBias(WeightType, allocator, input, &weights.q_weight, &weights.q_bias);
     defer q.deinit();
-    var k = try matmulWithWeight(WeightType, allocator, input, &weights.k_weight);
+    var k = try matmulWithWeightBias(WeightType, allocator, input, &weights.k_weight, &weights.k_bias);
     defer k.deinit();
-    var v = try matmulWithWeight(WeightType, allocator, input, &weights.v_weight);
+    var v = try matmulWithWeightBias(WeightType, allocator, input, &weights.v_weight, &weights.v_bias);
     defer v.deinit();
-
-    try ops.addBiasInPlace(&q, &weights.q_bias);
-    try ops.addBiasInPlace(&k, &weights.k_bias);
-    try ops.addBiasInPlace(&v, &weights.v_bias);
 
     // Split into heads and compute attention
     var head_outputs = try allocator.alloc(Tensor, num_heads);
@@ -233,8 +528,7 @@ pub fn multiHeadAttention(
     defer concat.deinit();
 
     // Final projection using appropriate matmul for weight type
-    var output = try matmulWithWeight(WeightType, allocator, &concat, &weights.o_weight);
-    try ops.addBiasInPlace(&output, &weights.o_bias);
+    const output = try matmulWithWeightBias(WeightType, allocator, &concat, &weights.o_weight, &weights.o_bias);
 
     return output;
 }

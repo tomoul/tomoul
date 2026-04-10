@@ -1,0 +1,213 @@
+# Sentence Transformer — all-MiniLM-L6-v2
+
+384-dimensional sentence embeddings from [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2). Runs natively on CPU, WASM, iOS, Android — no Python or GPU required.
+
+**Hugging Face:** [tomoul/sentence-transformer](https://huggingface.co/tomoul/sentence-transformer)
+
+## Architecture
+
+| Parameter | Value |
+|---|---|
+| Base model | BERT (6-layer encoder) |
+| Hidden dim | 384 |
+| Attention heads | 12 |
+| FFN intermediate | 1,536 |
+| Vocab size | 30,522 (WordPiece) |
+| Max sequence length | 512 tokens |
+| Output | 384-dim L2-normalized vector |
+| Layer norm eps | 1e-12 |
+
+**Pipeline:** WordPiece tokenize → BERT embeddings (word + position + token_type) → LayerNorm → 6× Transformer blocks (self-attention + FFN with post-LN) → mean pooling → L2 normalize → 384-dim float vector.
+
+### Weight Variants
+
+| Variant | File | Size | Accuracy vs F32 |
+|---|---|---|---|
+| **F32** (default) | `all_minilm_l6_v2.tl` | ~87 MB | baseline |
+| **F16** (half-precision) | `all_minilm_l6_v2_f16.tl` | ~43 MB | effectively lossless |
+| **Q8_K** (8-bit quantized) | `all_minilm_l6_v2_q8k.tl` | ~24 MB | cosine sim ≥ 0.9997 |
+
+In Q8_K mode, only transformer block linear weights are quantized. Embeddings and LayerNorm parameters remain float32. F16 stores all weights as IEEE 754 half-precision (10-bit mantissa). Q8_K is recommended for best size/speed tradeoff.
+
+## Benchmarks
+
+Measured on AMD CPU + RTX 4090, 50 iterations, warm start:
+
+| Engine | Weights | Single (ms) | 5-sent (ms/sent) | 10-sent (ms/sent) | Notes |
+|---|---|---|---|---|---|
+| **Tomoul** (Zig, ReleaseFast) | **Q8_K** | **3.6** | **3.2** | **2.8** | Node.js FFI via koffi |
+| **Tomoul** (Zig, ReleaseFast) | F16 | 5.0 | 7.2 | 4.0 | 1.8× faster than F32, 2× smaller |
+| **Tomoul** (Zig, ReleaseFast) | F32 | 9.2 | 6.8 | 6.8 | Node.js FFI via koffi |
+| PyTorch CPU (MKL) | F32 | 3.6 | 3.6 | 1.0 (batched) | `transformers` pipeline |
+| PyTorch CUDA (RTX 4090) | F32 | 2.6 | — | 0.55 (batched) | GPU baseline |
+
+Q8_K is the recommended variant: **3.6× smaller** model (24 MB vs 87 MB), **2.5× faster** than F32, and matches or beats PyTorch CPU — with negligible accuracy loss (cosine similarity ≥ 0.9997 vs F32).
+
+**Optimizations applied:** arena allocator for inference scratch, fused strided multi-head attention (no per-head copies), vectorized GELU (Padé tanh approximation), SIMD bias addition, in-place layerNorm, zblas skinny-M SGEMM kernel, zblas Q8_K weight-only quantized SGEMM. See [zblas](https://github.com/tomoul/zblas) for BLAS-level optimization details.
+
+**Accuracy:** All 5 reference sentences achieve cosine similarity ≥ 0.99 against HuggingFace `sentence-transformers` output (both F32 and Q8_K variants).
+
+## Quick Start
+
+### Generate Weights
+
+```bash
+# F32 (full precision, ~87 MB)
+python tools/export_sentence_transformer.py -o artifacts/
+
+# F16 (half-precision, ~43 MB, 1.8× faster than F32)
+python tools/export_sentence_transformer.py -o artifacts/ -q f16
+
+# Q8_K (recommended: ~24 MB, 2.5× faster inference)
+python tools/export_sentence_transformer.py -o artifacts/ -q q8_k
+```
+
+Requires: `pip install torch transformers sentence-transformers`
+
+### Build & Run (CLI)
+
+```bash
+# Build CLI
+zig build -Dmodel=sentence_transformer -Doptimize=ReleaseFast
+
+# Embed a sentence
+./zig-out/bin/tomoul_sentence_transformer \
+  --model artifacts/all_minilm_l6_v2.tl \
+  --vocab artifacts/all_minilm_l6_v2_vocab.txt \
+  --text "This is an example sentence"
+
+# Batch mode
+./zig-out/bin/tomoul_sentence_transformer \
+  --model artifacts/all_minilm_l6_v2.tl \
+  --vocab artifacts/all_minilm_l6_v2_vocab.txt \
+  --batch sentences.txt
+```
+
+### Build Shared Library
+
+```bash
+# Shared library (.so / .dylib)
+zig build lib -Dmodel=sentence_transformer -Doptimize=ReleaseFast
+
+# Bundled (weights embedded in binary — no external files needed)
+zig build lib -Dmodel=sentence_transformer -Doptimize=ReleaseSmall -Dbundled=true
+```
+
+Output: `zig-out/lib/libtomoul_sentence_transformer.{so,dylib,a}`
+
+### Build WASM
+
+```bash
+zig build wasm -Dmodel=sentence_transformer
+```
+
+Output: `zig-out/bin/tomoul_sentence_transformer.wasm` (weights embedded)
+
+### Node.js (FFI)
+
+```bash
+cd examples/sentence-transformer
+npm install
+node benchmark.js
+```
+
+```javascript
+const koffi = require('koffi');
+const lib = koffi.load('./libtomoul_sentence_transformer.so');
+
+const init = lib.func('int tomoul_sentence_transformer_init(const char*, const char*)');
+const embed = lib.func('int tomoul_sentence_transformer_embed(const char*, size_t, float*)');
+const destroy = lib.func('void tomoul_sentence_transformer_destroy()');
+
+init('/path/to/all_minilm_l6_v2.tl', '/path/to/vocab.txt');
+const output = new Float32Array(384);
+embed('Hello world', 11, output);
+destroy();
+```
+
+### Python (comparison baseline)
+
+```bash
+cd examples/sentence-transformer
+pip install torch transformers sentence-transformers
+python benchmark_pytorch.py
+```
+
+## C API
+
+```c
+// Initialize — returns 0 on success
+int tomoul_sentence_transformer_init(const char* weights_path, const char* vocab_path);
+
+// Embed text — writes 384 floats to output buffer
+// Returns: 0 success, -1 not initialized, -2 empty input, -3 embed error
+int tomoul_sentence_transformer_embed(const char* text, size_t text_len, float* output);
+
+// Cleanup
+void tomoul_sentence_transformer_destroy(void);
+
+// Status
+int  tomoul_sentence_transformer_is_ready(void);  // 1 = ready, 0 = not
+const char* tomoul_sentence_transformer_version(void);  // "0.1.0"
+```
+
+### WASM API
+
+For browser use, the WASM build uses shared-memory buffers:
+
+| Export | Description |
+|---|---|
+| `init()` | Initialize model (weights embedded at compile time) |
+| `embed()` | Embed text from input buffer → output buffer |
+| `get_input_buffer_ptr()` | Pointer to write UTF-8 text into |
+| `get_max_input_bytes()` | Max input size |
+| `get_output_buffer_ptr()` | Pointer to read 384 floats from |
+| `is_ready()` | 1 if initialized |
+| `get_version()` | Version string pointer |
+| `reset()` | Reset state |
+
+## Cross-Compilation Targets
+
+All targets are built automatically by CI on tagged releases. See [release.yml](../../../.github/workflows/release.yml).
+
+| Target | Artifacts |
+|---|---|
+| Linux x86_64 | executable, `.a`, `.so` |
+| Linux aarch64 | executable, `.a`, `.so` |
+| macOS x86_64 | executable, `.a`, `.dylib` |
+| macOS aarch64 | executable, `.a`, `.dylib` |
+| iOS aarch64 | `.a` |
+| Android aarch64 | `.a` |
+| Android x86_64 | `.a` |
+| WASM | `.wasm` (bundled) |
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `model.zig` | Core model: forward pass, weight loading (F32 + Q8_K), config detection |
+| `tokenizer.zig` | WordPiece tokenizer: lowercase → split → greedy subword matching |
+| `c.zig` | C FFI binding (5 exported functions) |
+| `wasm.zig` | WASM binding with shared-memory buffer API |
+| `cli.zig` | CLI executable with JSON output |
+
+## Tests
+
+```bash
+zig build test-sentence-transformer
+```
+
+Validates:
+- Tokenizer output matches HuggingFace
+- All 5 reference sentences cosine similarity ≥ 0.99 vs Python
+- Edge cases (empty input, special characters, max length)
+
+## References
+
+- [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) — original model
+- [Sentence-BERT paper](https://arxiv.org/abs/1908.10084) — Reimers & Gurevych, 2019
+- [MiniLM paper](https://arxiv.org/abs/2002.10957) — Wang et al., 2020
+
+## License
+
+MIT — see repository root.

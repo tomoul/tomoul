@@ -19,6 +19,7 @@ const attention_generic = @import("attention.zig");
 const QuantizedTensorQ8 = quant.QuantizedTensorQ8;
 const QuantizedTensorQ4 = quant.QuantizedTensorQ4;
 const QuantizedTensorQ8K = quant.QuantizedTensorQ8K;
+const F16Tensor = quant.F16Tensor;
 
 // Re-export from attention_generic for convenience
 pub const WeightFormat = attention_generic.WeightFormat;
@@ -71,6 +72,7 @@ pub const TransformerBlockWeightsF32 = TransformerBlockWeights(Tensor);
 pub const TransformerBlockWeightsQ8 = TransformerBlockWeights(QuantizedTensorQ8);
 pub const TransformerBlockWeightsQ4 = TransformerBlockWeights(QuantizedTensorQ4);
 pub const TransformerBlockWeightsQ8K = TransformerBlockWeights(QuantizedTensorQ8K);
+pub const TransformerBlockWeightsF16 = TransformerBlockWeights(F16Tensor);
 
 /// Configuration for Transformer
 pub const TransformerConfig = struct {
@@ -118,6 +120,7 @@ fn getWeightFormat(comptime T: type) WeightFormat {
     if (T == QuantizedTensorQ8) return .q8;
     if (T == QuantizedTensorQ4) return .q4;
     if (T == QuantizedTensorQ8K) return .q8_k;
+    if (T == F16Tensor) return .f16;
     @compileError("Unsupported weight type: " ++ @typeName(T));
 }
 
@@ -136,7 +139,30 @@ fn matmulWithWeight(
         .q8 => quant.matmulF32Q8Simd(allocator, input, weight),
         .q4 => quant.matmulF32Q4Simd(allocator, input, weight),
         .q8_k => quant.matmulF32Q8KSimd(allocator, input, weight),
+        .f16 => quant.matmulF32F16(allocator, input, weight),
     };
+}
+
+/// Fused matrix multiplication + bias: C = input @ weight + bias
+/// Uses fused sgemmBias for f32, separate matmul+bias for quantized.
+fn matmulWithWeightBias(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weight: *const WeightType,
+    bias: *const Tensor,
+) !Tensor {
+    const format = comptime getWeightFormat(WeightType);
+
+    if (format == .f32) {
+        return ops.matmulBias(allocator, input, weight, bias);
+    }
+
+    // Quantized: separate matmul then bias
+    var result = try matmulWithWeight(WeightType, allocator, input, weight);
+    errdefer result.deinit();
+    try ops.addBiasInPlace(&result, bias);
+    return result;
 }
 
 /// Generic forward pass through a single Transformer block
@@ -161,8 +187,8 @@ pub fn transformerBlock(
     weights: *const TransformerBlockWeights(WeightType),
     config: TransformerConfig,
 ) !Tensor {
-    // 1. Multi-head attention with generic weights
-    var attn_output = try attention_generic.multiHeadAttention(
+    // 1. Multi-head attention with generic weights (fused — no per-head copies)
+    var attn_output = try attention_generic.multiHeadAttentionFused(
         WeightType,
         allocator,
         input,
@@ -188,29 +214,28 @@ pub fn transformerBlock(
     // FFN(x) = Linear(GELU(Linear(x)))
 
     // First linear: hidden -> intermediate (weight pre-transposed)
-    var ff_hidden = try matmulWithWeight(WeightType, allocator, &normed1, &weights.ff_linear1_weight);
+    var ff_hidden = try matmulWithWeightBias(WeightType, allocator, &normed1, &weights.ff_linear1_weight, &weights.ff_linear1_bias);
     defer ff_hidden.deinit();
-    try ops.addBiasInPlace(&ff_hidden, &weights.ff_linear1_bias);
 
     // GELU activation
     ops.gelu(&ff_hidden);
 
     // Second linear: intermediate -> hidden (weight pre-transposed)
-    var ff_output = try matmulWithWeight(WeightType, allocator, &ff_hidden, &weights.ff_linear2_weight);
-    defer ff_output.deinit();
-    try ops.addBiasInPlace(&ff_output, &weights.ff_linear2_bias);
+    var ff_output = try matmulWithWeightBias(WeightType, allocator, &ff_hidden, &weights.ff_linear2_weight, &weights.ff_linear2_bias);
+    errdefer ff_output.deinit();
 
     // Residual connection
     try ops.addInPlace(&ff_output, &normed1);
 
-    // Layer norm
-    return ops.layerNorm(
-        allocator,
+    // Layer norm (in-place — ff_output IS the return value, no clone needed)
+    try ops.layerNormInPlace(
         &ff_output,
         &weights.ff_ln_gamma,
         &weights.ff_ln_beta,
         config.layer_norm_eps,
     );
+
+    return ff_output;
 }
 
 /// Generic forward pass through multiple Transformer blocks
@@ -231,6 +256,95 @@ pub fn transformerStack(
     // Process remaining blocks
     for (blocks[1..]) |*block| {
         const new_hidden = try transformerBlock(WeightType, allocator, &hidden, block, config);
+        hidden.deinit();
+        hidden = new_hidden;
+    }
+
+    return hidden;
+}
+
+/// Batched forward pass through a single Transformer block.
+/// input: [batch_size * max_seq_len, hidden_dim]
+/// Linear projections (Q/K/V/O/FFN) run as one big batched GEMM.
+/// Attention scores computed per-sentence.
+pub fn transformerBlockBatched(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const TransformerBlockWeights(WeightType),
+    config: TransformerConfig,
+    batch_size: usize,
+    max_seq_len: usize,
+    sentence_lengths: []const usize,
+) !Tensor {
+    // 1. Multi-head attention (batched projections, per-sentence attention scores)
+    var attn_output = try attention_generic.multiHeadAttentionFusedBatched(
+        WeightType,
+        allocator,
+        input,
+        &weights.attention,
+        config.getAttentionConfig(),
+        batch_size,
+        max_seq_len,
+        sentence_lengths,
+    );
+    defer attn_output.deinit();
+
+    // Residual connection
+    try ops.addInPlace(&attn_output, input);
+
+    // Layer norm
+    var normed1 = try ops.layerNorm(
+        allocator,
+        &attn_output,
+        &weights.attn_ln_gamma,
+        &weights.attn_ln_beta,
+        config.layer_norm_eps,
+    );
+    defer normed1.deinit();
+
+    // 2. Feed forward with residual (batched — one big GEMM)
+    var ff_hidden = try matmulWithWeightBias(WeightType, allocator, &normed1, &weights.ff_linear1_weight, &weights.ff_linear1_bias);
+    defer ff_hidden.deinit();
+
+    ops.gelu(&ff_hidden);
+
+    var ff_output = try matmulWithWeightBias(WeightType, allocator, &ff_hidden, &weights.ff_linear2_weight, &weights.ff_linear2_bias);
+    errdefer ff_output.deinit();
+
+    // Residual connection
+    try ops.addInPlace(&ff_output, &normed1);
+
+    // Layer norm
+    try ops.layerNormInPlace(
+        &ff_output,
+        &weights.ff_ln_gamma,
+        &weights.ff_ln_beta,
+        config.layer_norm_eps,
+    );
+
+    return ff_output;
+}
+
+/// Batched forward pass through multiple Transformer blocks
+pub fn transformerStackBatched(
+    comptime WeightType: type,
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    blocks: []const TransformerBlockWeights(WeightType),
+    config: TransformerConfig,
+    batch_size: usize,
+    max_seq_len: usize,
+    sentence_lengths: []const usize,
+) !Tensor {
+    if (blocks.len == 0) {
+        return input.clone(allocator);
+    }
+
+    var hidden = try transformerBlockBatched(WeightType, allocator, input, &blocks[0], config, batch_size, max_seq_len, sentence_lengths);
+
+    for (blocks[1..]) |*block| {
+        const new_hidden = try transformerBlockBatched(WeightType, allocator, &hidden, block, config, batch_size, max_seq_len, sentence_lengths);
         hidden.deinit();
         hidden = new_hidden;
     }
@@ -320,6 +434,26 @@ pub fn transformerStackQ8K(
     config: TransformerConfig,
 ) !Tensor {
     return transformerStack(QuantizedTensorQ8K, allocator, input, blocks, config);
+}
+
+/// Transformer block with F16 weights
+pub fn transformerBlockF16(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    weights: *const TransformerBlockWeightsF16,
+    config: TransformerConfig,
+) !Tensor {
+    return transformerBlock(F16Tensor, allocator, input, weights, config);
+}
+
+/// Transformer stack with F16 weights
+pub fn transformerStackF16(
+    allocator: std.mem.Allocator,
+    input: *const Tensor,
+    blocks: []const TransformerBlockWeightsF16,
+    config: TransformerConfig,
+) !Tensor {
+    return transformerStack(F16Tensor, allocator, input, blocks, config);
 }
 
 // ============================================================================

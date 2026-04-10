@@ -85,6 +85,37 @@ zig build -Dmodel=silero_vad -Dbundled=true -Doptimize=ReleaseSmall
 zig build test -Dmodel=silero_vad
 ```
 
+## Performance Benchmarks
+
+Native FFI (shared library) performance on x86_64, measured via Node.js koffi:
+
+| Metric | Value |
+|--------|-------|
+| Single chunk latency | **0.346ms** avg, 0.330ms p50 |
+| Per-chunk (speech) | **0.355ms** (32ms audio → 90× realtime) |
+| Per-chunk (silence) | **0.357ms** (32ms audio → 90× realtime) |
+| Per-chunk (noise) | **0.359ms** (32ms audio → 90× realtime) |
+| Real-time factor | **0.011** (90× realtime) |
+
+**Hardware**: Benchmarked with AVX2 SIMD via zblas.  
+**Note**: At hidden_size=128, the LSTM matvec operations (512×128) are small enough that scalar and SIMD paths show identical throughput — the model is dominated by STFT and Conv1d encoder layers.
+
+### Running the benchmark
+
+```bash
+# Build the native shared library
+cd /path/to/tomoul
+zig build lib -Dmodel=silero_vad --release=fast
+
+# Run benchmark (default 50 runs per WAV file)
+cd examples/silero-vad
+npm install
+node benchmark.js
+
+# Customize iteration count
+BENCH_RUNS=20 node benchmark.js
+```
+
 ## License
 
 MIT License - See root LICENSE file

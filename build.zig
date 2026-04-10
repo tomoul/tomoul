@@ -96,13 +96,13 @@ pub fn build(b: *std.Build) void {
     ops_module.addImport("tensor.zig", tensor_module);
     ops_module.addOptions("build_options", ops_options);
 
-    // Create zblas module (pure Zig, no external deps)
+    // Create zblas module from external dependency (pure Zig, no external deps)
     // Always create it but only import when use_zblas is true
-    const zblas_module = b.createModule(.{
-        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+    const zblas_dep = b.dependency("zblas", .{
         .target = target,
         .optimize = optimize,
     });
+    const zblas_module = zblas_dep.module("zblas");
     if (use_zblas and !use_blas) {
         ops_module.addImport("zblas", zblas_module);
     }
@@ -126,6 +126,9 @@ pub fn build(b: *std.Build) void {
     });
     quantization_module.addImport("tensor.zig", tensor_module);
     quantization_module.addImport("ops.zig", ops_module);
+    if (use_zblas and !use_blas) {
+        quantization_module.addImport("zblas", zblas_module);
+    }
 
     const loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
@@ -235,7 +238,6 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = exe_name,
         .root_module = exe_module,
-        .use_lld = true,
     });
 
     // Enable LTO if requested
@@ -364,6 +366,49 @@ pub fn build(b: *std.Build) void {
     integration_test_step.dependOn(&run_integration_tests.step);
 
     // ==========================================================================
+    // Sentence Transformer validation tests
+    // ==========================================================================
+    const st_tokenizer_module = b.createModule(.{
+        .root_source_file = b.path("src/models/sentence_transformer/tokenizer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const st_model_module = b.createModule(.{
+        .root_source_file = b.path("src/models/sentence_transformer/model.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    st_model_module.addImport("tensor.zig", tensor_module);
+    st_model_module.addImport("ops.zig", ops_module);
+    st_model_module.addImport("loader.zig", loader_module);
+    st_model_module.addImport("quantization.zig", quantization_module);
+    st_model_module.addImport("attention.zig", attention_module);
+    st_model_module.addImport("transformer.zig", transformer_module);
+    st_model_module.addImport("cache.zig", cache_module);
+    st_model_module.addImport("audio.zig", audio_module);
+    st_model_module.addImport("tokenizer.zig", st_tokenizer_module);
+
+    // Export for downstream consumers (e.g., habor CLI)
+    b.modules.put("sentence_transformer", st_model_module) catch @panic("OOM");
+
+    const st_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/test_sentence_transformer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    st_test_module.addImport("model", st_model_module);
+    st_test_module.addImport("tokenizer", st_tokenizer_module);
+
+    const st_tests = b.addTest(.{
+        .root_module = st_test_module,
+    });
+
+    const run_st_tests = b.addRunArtifact(st_tests);
+    const st_test_step = b.step("test-sentence-transformer", "Run sentence transformer validation tests");
+    st_test_step.dependOn(&run_st_tests.step);
+
+    // ==========================================================================
     // WebAssembly targets (data-driven from model_registry.zig)
     // ==========================================================================
     const wasm_target = b.resolveTargetQuery(.{
@@ -392,12 +437,11 @@ pub fn build(b: *std.Build) void {
     wasm_ops_module.addOptions("build_options", wasm_ops_options);
 
     // zblas for WASM (pure Zig - perfect for WASM)
-    const wasm_zblas_module = b.createModule(.{
-        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+    const wasm_zblas_dep = b.dependency("zblas", .{
         .target = wasm_target,
         .optimize = .ReleaseSmall,
     });
-    wasm_ops_module.addImport("zblas", wasm_zblas_module);
+    wasm_ops_module.addImport("zblas", wasm_zblas_dep.module("zblas"));
 
     const wasm_quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
@@ -406,6 +450,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm_quantization_module.addImport("tensor.zig", wasm_tensor_module);
     wasm_quantization_module.addImport("ops.zig", wasm_ops_module);
+    wasm_quantization_module.addImport("zblas", wasm_zblas_dep.module("zblas"));
 
     const wasm_loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
@@ -567,6 +612,13 @@ fn buildWasmModel(
         });
     }
 
+    // Embed vocab if provided
+    if (model.vocab_path) |vp| {
+        wasm_binding.addAnonymousImport("vocab", .{
+            .root_source_file = b.path(vp),
+        });
+    }
+
     // Create the wasm executable
     const wasm_name = b.fmt("tomoul_{s}", .{model.name});
     const wasm = b.addExecutable(.{
@@ -634,12 +686,11 @@ fn buildNativeLib(
     ops_module.addOptions("build_options", ops_build_options);
 
     // zblas for native lib builds (pure Zig - no external dependencies)
-    const zblas_module = b.createModule(.{
-        .root_source_file = b.path("src/core/zblas_src/zblas.zig"),
+    const lib_zblas_dep = b.dependency("zblas", .{
         .target = target,
         .optimize = optimize,
     });
-    ops_module.addImport("zblas", zblas_module);
+    ops_module.addImport("zblas", lib_zblas_dep.module("zblas"));
 
     const quantization_module = b.createModule(.{
         .root_source_file = b.path("src/core/quantization.zig"),
@@ -648,6 +699,7 @@ fn buildNativeLib(
     });
     quantization_module.addImport("tensor.zig", tensor_module);
     quantization_module.addImport("ops.zig", ops_module);
+    quantization_module.addImport("zblas", lib_zblas_dep.module("zblas"));
 
     const loader_module = b.createModule(.{
         .root_source_file = b.path("src/core/loader.zig"),
@@ -727,7 +779,7 @@ fn buildNativeLib(
             });
             c_mod.addImport("tensor", tensor_mod);
             c_mod.addImport("model", model_mod);
-            c_mod.addImport("loader", loader_mod);  // For QuantFormat access
+            c_mod.addImport("loader", loader_mod); // For QuantFormat access
             c_mod.addOptions("build_options", opts);
 
             // Embed model weights if bundled mode
@@ -755,6 +807,13 @@ fn buildNativeLib(
         model.supports_bundled,
         weights_path,
     );
+
+    // Embed vocab if provided
+    if (model.vocab_path) |vp| {
+        c_binding_module.addAnonymousImport("vocab", .{
+            .root_source_file = b.path(vp),
+        });
+    }
 
     // Build static library
     const lib_name = b.fmt("tomoul_{s}", .{model.name});
@@ -785,6 +844,13 @@ fn buildNativeLib(
         model.supports_bundled,
         weights_path,
     );
+
+    // Embed vocab if provided
+    if (model.vocab_path) |vp| {
+        c_binding_module_shared.addAnonymousImport("vocab", .{
+            .root_source_file = b.path(vp),
+        });
+    }
 
     const shared_lib = b.addLibrary(.{
         .linkage = .dynamic,

@@ -1,0 +1,20 @@
+{
+  "name": "tomoul-sentence-transformer-demo",
+  "version": "1.0.0",
+  "description": "Sentence embedding demo using Tomoul native library (all-MiniLM-L6-v2)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "benchmark": "node benchmark.js",
+    "benchmark:python": "python3 benchmark_pytorch.py"
+  },
+  "keywords": ["sentence-transformer", "embeddings", "nlp", "minilm"],
+  "author": "Tomoul",
+  "license": "MIT",
+  "dependencies": {
+    "koffi": "^2.14.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
