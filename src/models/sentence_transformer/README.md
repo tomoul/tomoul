@@ -137,27 +137,46 @@ GPU init dequantizes Q8K→F32 for GPU upload (~87 MB), requiring 256 MB+ heap (
 - `FixedBufferAllocator` arena reset optimization — currently resets to high-water mark per call
 - WebGPU batched forward (`gpu_embed_batch`) to match native Vulkan's 1.33 ms/sent batch throughput
 
-### GPU (Metal) — macOS — TODO
+### GPU (Metal) — macOS (Apple M1 Pro) — April 2026
 
-Metal compute shaders with MSL. Code complete, pending hardware validation on macOS.
+Validated on Apple M1 Pro, Zig 0.15.2, Metal via HAL auto-detection, `zig build test-gpu-model -Doptimize=ReleaseFast`:
 
-**Kernel tests** (`zig build test-gpu-forward` on macOS):
+**Model tests** (real weights, cosine similarity GPU vs CPU):
 
-| Kernel | Max Error vs CPU | Status |
+| Test | Sentence | Cosine Sim | Max Abs Diff | Status |
+|---|---|---|---|---|
+| F32 | "Hello world" | 0.9945 | 0.0196 | PASS |
+| F32 | "The quick brown fox jumps over the lazy dog" | 0.9940 | 0.0357 | PASS |
+| F32 | "Machine learning models can run on GPUs..." | 0.9940 | 0.0265 | PASS |
+| F32 | "Zig is a systems programming language" | 0.9968 | 0.0215 | PASS |
+| F32 | "Vulkan compute shaders enable general-purpose GPU..." | 0.9941 | 0.0316 | PASS |
+| Q8K | "Hello world" | 0.9941 | 0.0206 | PASS |
+| Q8K | "The quick brown fox jumps over the lazy dog" | 0.9936 | 0.0375 | PASS |
+| Q8K | "Machine learning models can run on GPUs..." | 0.9939 | 0.0265 | PASS |
+| Q8K | "Zig is a systems programming language" | 0.9967 | 0.0221 | PASS |
+| Q8K | "Vulkan compute shaders enable general-purpose GPU..." | 0.9940 | 0.0311 | PASS |
+
+**Batch consistency** (GPU single vs GPU batch — should be identical):
+
+| Sentence | Cosine Sim | Max Abs Diff | Status |
+|---|---|---|---|
+| All 5 sentences | 1.000000 | 0.000000 | PASS |
+
+**Latency** (warm start, ReleaseFast):
+
+| Metric | F32 | Q8K |
 |---|---|---|
-| LayerNorm | — | PENDING |
-| GELU | — | PENDING |
-| Attention | — | PENDING |
-| End-to-end forward | — | PENDING |
+| CPU single | 11.29 ms | 4.16 ms |
+| GPU single | 6.61 ms | 5.90 ms |
+| Single speedup | 1.71× | 0.70× |
+| CPU 5-sent sequential | 45.19 ms | 45.45 ms |
+| GPU 5-sent batch | 18.30 ms | 20.22 ms |
+| Batch speedup | 2.47× | 2.25× |
+| GPU per-sentence (batch) | 3.66 ms | 4.04 ms |
 
-**Model tests** (`zig build test-gpu-model` on macOS):
-
-| Test | Weights | Cosine Sim (GPU vs CPU) | GPU Single (ms) | GPU Batch 5-sent (ms) | Status |
-|---|---|---|---|---|---|
-| Metal F32 | F32 | — | — | — | PENDING |
-| Metal Q8K | Q8K | — | — | — | PENDING |
-
-> To run: `zig build test-gpu-forward && zig build test-gpu-model` on a Mac with Metal support. Update this section with results.
+> **Note:** On M1 Pro, Metal GPU is **1.71× faster** than CPU for F32 single inference, and **2.3–2.5× faster** for batched. Q8K single-sentence is slower on GPU (0.70×) because the model is small enough that CPU Q8K SIMD (4.16 ms) outpaces GPU dispatch overhead. The GPU advantage grows with batch size: 2.25–2.47× at 5 sentences. For this model size, **Q8K on CPU is the fastest single-sentence path on Apple Silicon** (4.16 ms).
+>
+> **Optimization applied:** Q/K/V projection dispatches run without intermediate memory barriers (independent writes to separate buffers), allowing Metal to overlap them on the GPU. This reduced F32 single-sentence latency by ~16% vs the fully-barriered baseline.
 
 ### PyTorch Comparison — Windows (RTX 4090) — April 2026
 

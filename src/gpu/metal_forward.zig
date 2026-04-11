@@ -414,8 +414,9 @@ pub const MetalForward = struct {
         const elem_count = seq_len * hidden;
 
         // Q, K, V projections: buf_a @ W + b → q_buf, k_buf, v_buf
-        self.recordGemm(self.buf_a, lw.q_weight, self.q_buf, lw.q_bias, seq_len, hidden, hidden);
-        self.recordGemm(self.buf_a, lw.k_weight, self.k_buf, lw.k_bias, seq_len, hidden, hidden);
+        // These are independent (all read buf_a, write separate buffers) — skip barriers on Q and K
+        self.recordGemmNoBarrier(self.buf_a, lw.q_weight, self.q_buf, lw.q_bias, seq_len, hidden, hidden);
+        self.recordGemmNoBarrier(self.buf_a, lw.k_weight, self.k_buf, lw.k_bias, seq_len, hidden, hidden);
         self.recordGemm(self.buf_a, lw.v_weight, self.v_buf, lw.v_bias, seq_len, hidden, hidden);
 
         // Multi-head attention: q_buf, k_buf, v_buf → buf_b
@@ -476,9 +477,9 @@ pub const MetalForward = struct {
         const ffn_dim = self.config.ffn_dim;
         const elem_count = total_tokens * hidden;
 
-        // Q, K, V projections
-        self.recordGemm(self.buf_a, lw.q_weight, self.q_buf, lw.q_bias, total_tokens, hidden, hidden);
-        self.recordGemm(self.buf_a, lw.k_weight, self.k_buf, lw.k_bias, total_tokens, hidden, hidden);
+        // Q, K, V projections — independent, skip barriers on Q and K
+        self.recordGemmNoBarrier(self.buf_a, lw.q_weight, self.q_buf, lw.q_bias, total_tokens, hidden, hidden);
+        self.recordGemmNoBarrier(self.buf_a, lw.k_weight, self.k_buf, lw.k_bias, total_tokens, hidden, hidden);
         self.recordGemm(self.buf_a, lw.v_weight, self.v_buf, lw.v_bias, total_tokens, hidden, hidden);
 
         // Batch-aware multi-head attention
@@ -527,6 +528,18 @@ pub const MetalForward = struct {
     fn recordGemm(self: *Self, a: mtl.MetalBuffer, b: mtl.MetalBuffer, c: mtl.MetalBuffer, bias: mtl.MetalBuffer, m: u32, n: u32, k: u32) void {
         const pc = SgemmBiasPC{ .m = m, .n = n, .k = k };
         self.ctx.cmdDispatch(
+            &self.sgemm_bias_pipe,
+            &[_]mtl.MetalBuffer{ a, b, c, bias },
+            std.mem.asBytes(&pc),
+            .{ .width = (n + 63) / 64, .height = (m + 63) / 64, .depth = 1 },
+            .{ .width = 16, .height = 16, .depth = 1 },
+        );
+    }
+
+    /// GEMM dispatch without trailing barrier — for independent parallel projections
+    fn recordGemmNoBarrier(self: *Self, a: mtl.MetalBuffer, b: mtl.MetalBuffer, c: mtl.MetalBuffer, bias: mtl.MetalBuffer, m: u32, n: u32, k: u32) void {
+        const pc = SgemmBiasPC{ .m = m, .n = n, .k = k };
+        self.ctx.cmdDispatchNoBarrier(
             &self.sgemm_bias_pipe,
             &[_]mtl.MetalBuffer{ a, b, c, bias },
             std.mem.asBytes(&pc),

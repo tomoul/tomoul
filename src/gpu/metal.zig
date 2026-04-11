@@ -439,6 +439,25 @@ pub const MetalContext = struct {
         groups: MTLSize,
         threads_per_group: MTLSize,
     ) void {
+        self.cmdDispatchNoBarrier(pipeline, buffers, params, groups, threads_per_group);
+
+        // Memory barrier between dispatches (ensures write visibility)
+        const enc = self.encoder orelse return;
+        msg1_uint_void(enc, self.sel_memoryBarrierWithScope, MTLBarrierScopeBuffers);
+    }
+
+    /// Record a compute dispatch WITHOUT a trailing memory barrier.
+    /// Use when the next dispatch does NOT read from buffers written by this one
+    /// (e.g. independent Q/K/V projections that all read the same input).
+    /// Caller must issue cmdBarrier() before any dispatch that reads the output.
+    pub fn cmdDispatchNoBarrier(
+        self: *Self,
+        pipeline: *const MetalPipeline,
+        buffers: []const MetalBuffer,
+        params: []const u8,
+        groups: MTLSize,
+        threads_per_group: MTLSize,
+    ) void {
         const enc = self.encoder orelse return;
 
         // Set pipeline state
@@ -456,8 +475,13 @@ pub const MetalContext = struct {
 
         // Dispatch threadgroups
         msg2_sizes(enc, self.sel_dispatchThreadgroups, groups, threads_per_group);
+    }
 
-        // Memory barrier between dispatches (ensures write visibility)
+    /// Issue an explicit memory barrier (buffer scope).
+    /// Call after a group of independent dispatches that write to separate buffers,
+    /// before any dispatch that needs to read those outputs.
+    pub fn cmdBarrier(self: *Self) void {
+        const enc = self.encoder orelse return;
         msg1_uint_void(enc, self.sel_memoryBarrierWithScope, MTLBarrierScopeBuffers);
     }
 
