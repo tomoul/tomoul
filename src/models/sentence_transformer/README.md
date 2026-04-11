@@ -104,6 +104,30 @@ Validated on NVIDIA GeForce RTX 4090, Zig 0.15.2, Vulkan 1.3:
 | Batch speedup | 15.28× | 25.15× |
 | GPU per-sentence (batch) | 1.44 ms | 1.33 ms |
 
+### WebGPU (Browser) — Windows (RTX 4090) — April 2026
+
+Tested in Chrome with WebGPU enabled, Q8K weights (25.5 MB WASM binary), 128 MB heap:
+
+| Metric | Value |
+|---|---|
+| Backend | WebGPU |
+| Sentences | 3 |
+| Total time | 104.0 ms |
+| Per sentence | 34.7 ms |
+| Dimensions | 384 |
+
+**Similarity matrix** (3 test sentences):
+
+| | The quick brown fox... | Machine learning is... | I had pizza for lunc... |
+|---|---|---|---|
+| The quick brown fox... | 1.000 | 0.995 | 0.949 |
+| Machine learning is... | 0.995 | 1.000 | 0.973 |
+| I had pizza for lunc... | 0.949 | 0.973 | 1.000 |
+
+First embedding: `[0.0379, 0.0707, 0.0218, 0.0079, -0.0192, 0.0216, 0.1314, 0.0500, -0.0733, -0.0436, ...]`
+
+> **Note:** Browser WebGPU is ~8× slower per-sentence than native Vulkan (34.7 ms vs 4.02 ms) due to JS↔WASM bridge overhead, WebGPU API abstraction, and lack of persistent command buffers. Still viable for interactive use — 100 ms total for 3 sentences is imperceptible.
+
 ### PyTorch Comparison — Windows (RTX 4090) — April 2026
 
 PyTorch 2.6.0+cu124, `sentence-transformers/all-MiniLM-L6-v2`, 10 iterations:
