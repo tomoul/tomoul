@@ -24,8 +24,11 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: write
+
 env:
-  ZIG_VERSION: '0.15.0'
+  ZIG_VERSION: '0.15.2'
 
 jobs:
   # ==========================================================================
@@ -150,12 +153,25 @@ jobs:
                   # Derive paths from model name
                   paths = derive_paths(name)
 
+                  # Parse weight_variants
+                  variants = []
+                  variants_match = re.search(r'\.weight_variants\s*=\s*&\.\{(.+?)\}\s*,', block, re.DOTALL)
+                  if variants_match:
+                      variant_blocks = re.finditer(r'\.\{\s*\.suffix\s*=\s*"([^"]*)"\s*,\s*\.path\s*=\s*"([^"]*)"', variants_match.group(1))
+                      for vm in variant_blocks:
+                          suffix = vm.group(1)  # e.g., "-q8k"
+                          # Map suffix to quantize arg: "-q8k" -> "q8_k", "-q8" -> "q8_0", "-q4" -> "q4_0"
+                          fmt_map = {'-q8k': 'q8_k', '-q8': 'q8_0', '-q4': 'q4_0', '-f16': 'f16'}
+                          quant_fmt = fmt_map.get(suffix, suffix.lstrip('-'))
+                          variants.append(quant_fmt)
+
                   models[name] = {
                       'weights_path': paths['weights_path'],
                       'hf_repo': paths['hf_repo'],
                       'description': desc_match.group(1) if desc_match else name,
                       'c_binding': paths['c_binding'],
                       'export_symbols': re.findall(r'"([^"]+)"', symbols_match.group(1)) if symbols_match else [],
+                      'weight_variants': variants,
                   }
 
           with open('model_metadata.json', 'w') as f:
@@ -190,23 +206,41 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r tools/requirements.txt
 
+      - name: Download metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: model-metadata
+          path: .
+
       - name: Generate model weights
         run: |
           MODEL="${{ matrix.model }}"
+          mkdir -p artifacts
 
-          # Run the model-specific export script
-          if [ -f "tools/export_${MODEL}.py" ]; then
-            echo "Running tools/export_${MODEL}.py..."
-            python tools/export_${MODEL}.py
-          else
+          if [ ! -f "tools/export_${MODEL}.py" ]; then
             echo "No export script found for ${MODEL}, skipping..."
+            exit 0
           fi
+
+          # Export default (f32) weights
+          echo "Exporting f32 weights..."
+          python tools/export_${MODEL}.py -o artifacts/
+
+          # Export quantized variants from registry metadata
+          VARIANTS=$(python3 -c "import json; m=json.load(open('model_metadata.json')); print(' '.join(m.get('$MODEL', {}).get('weight_variants', [])))")
+          for fmt in $VARIANTS; do
+            echo "Exporting $fmt variant..."
+            python tools/export_${MODEL}.py -o artifacts/ --quantize $fmt
+          done
+
+          echo "Generated artifacts:"
+          ls -lh artifacts/
 
       - name: Upload weights
         uses: actions/upload-artifact@v4
         with:
           name: weights-${{ matrix.model }}
-          path: artifacts/*.tl
+          path: artifacts/
 
   # ==========================================================================
   # Job 2: Generate C Header (from C binding file)
@@ -554,7 +588,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Hugging Face CLI
-        run: pip install huggingface_hub
+        run: pip install huggingface_hub[cli]
 
       - name: Organize artifacts for upload
         run: |
@@ -573,8 +607,10 @@ jobs:
           # Copy libraries
           find all-artifacts -path "*/lib/*" -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" \) -exec cp {} hf-upload/lib/ \; 2>/dev/null || true
 
-          # Copy model weights from generated weights artifact
+          # Copy model weights, vocab, and reference data from generated weights artifact
           find all-artifacts/weights-${MODEL} -name "*.tl" -exec cp {} hf-upload/ \; 2>/dev/null || true
+          find all-artifacts/weights-${MODEL} -name "*_vocab.txt" -exec cp {} hf-upload/ \; 2>/dev/null || true
+          find all-artifacts/weights-${MODEL} -name "*_reference_embeddings.json" -exec cp {} hf-upload/ \; 2>/dev/null || true
 
           echo "=== Upload structure for $MODEL ==="
           find hf-upload -type f | head -50
@@ -711,7 +747,7 @@ jobs:
           MODEL="${{ matrix.model }}"
           HF_REPO=$(python3 -c "import json; m=json.load(open('all-artifacts/model-metadata/model_metadata.json')); print(m['$MODEL']['hf_repo'])")
 
-          huggingface-cli login --token $HF_TOKEN
+          hf auth login --token $HF_TOKEN
 
           # Create repo if needed
           python3 << EOF
@@ -722,7 +758,7 @@ jobs:
               api.create_repo("$HF_REPO", repo_type="model", exist_ok=True)
           EOF
 
-          huggingface-cli upload "$HF_REPO" hf-upload/ . \
+          hf upload "$HF_REPO" hf-upload/ . \
             --repo-type model \
             --commit-message "Release ${{ github.ref_name }}"
 
@@ -744,11 +780,34 @@ jobs:
         with:
           path: all-artifacts
 
+      - name: Stage release assets (deduplicate)
+        run: |
+          mkdir -p release-assets
+
+          # Binaries (unique per platform)
+          find all-artifacts -path "*/bin/*" -type f -exec cp -n {} release-assets/ \;
+
+          # Libraries (unique per platform due to naming)
+          find all-artifacts -path "*/lib/*" -type f -exec cp -n {} release-assets/ \;
+
+          # Headers (same across platforms, just need one copy)
+          find all-artifacts -name "*.h" -type f -exec cp -n {} release-assets/ \;
+
+          # WASM
+          find all-artifacts -name "*.wasm" -type f -exec cp -n {} release-assets/ \;
+
+          # Weights and vocab (same across platforms, just need one copy)
+          find all-artifacts -name "*.tl" -type f -exec cp -n {} release-assets/ \;
+          find all-artifacts -name "*_vocab.txt" -type f -exec cp -n {} release-assets/ \;
+          find all-artifacts -name "*_reference_embeddings.json" -type f -exec cp -n {} release-assets/ \;
+
+          echo "Release assets:"
+          ls -lh release-assets/
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            all-artifacts/**/*
+          files: release-assets/*
           body: |
             ## Tomoul Release ${{ github.ref_name }}
 

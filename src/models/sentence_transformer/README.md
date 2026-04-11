@@ -178,6 +178,87 @@ Q8_K is the recommended variant: **3.6× smaller** model (24 MB vs 87 MB), **2.5
 
 **Accuracy:** All 5 reference sentences achieve cosine similarity ≥ 0.99 against HuggingFace `sentence-transformers` output (F32, Q8_K, and GPU variants).
 
+## Integration (Zig)
+
+> JavaScript/WASM integration guide coming soon.
+
+### Option 1: Zig Package Dependency (recommended)
+
+In your `build.zig.zon`:
+```zig
+.dependencies = .{
+    .tomoul = .{
+        .url = "https://github.com/tomoul/tomoul/archive/<commit>.tar.gz",
+        .hash = "...",
+    },
+},
+```
+
+In your `build.zig`:
+```zig
+const tomoul_dep = b.dependency("tomoul", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("sentence_transformer", tomoul_dep.module("sentence_transformer"));
+```
+
+Usage in Zig source:
+```zig
+const st = @import("sentence_transformer");
+
+var model = try st.SentenceTransformer.init(allocator, "all_minilm_l6_v2_q8k.tl", "all_minilm_l6_v2_vocab.txt");
+defer model.deinit();
+
+const embedding = try model.embed("Hello world");
+// embedding is [384]f32
+```
+
+Or use the lower-level split API for more control:
+```zig
+const st = @import("sentence_transformer");
+
+var model = try st.SentenceTransformerModel.init(allocator, "all_minilm_l6_v2_q8k.tl");
+defer model.deinit();
+
+var tokenizer = try st.Tokenizer.init(allocator, "all_minilm_l6_v2_vocab.txt");
+defer tokenizer.deinit();
+
+const embedding = try model.embed(&tokenizer, "Hello world");
+// embedding is [384]f32
+```
+
+### Option 2: C Static Library
+
+```bash
+zig build lib -Dmodel=sentence_transformer -Doptimize=ReleaseFast
+
+# Outputs:
+#   zig-out/lib/libtomoul_sentence_transformer.a
+#   zig-out/lib/libtomoul_sentence_transformer.so
+```
+
+Link against it with the C header:
+```c
+int tomoul_sentence_transformer_init(const char* weights, const char* vocab);
+int tomoul_sentence_transformer_embed(const uint8_t* text, size_t len, float output[384]);
+void tomoul_sentence_transformer_destroy(void);
+```
+
+### Option 3: CLI
+
+```bash
+zig build -Dmodel=sentence_transformer -Doptimize=ReleaseFast
+./zig-out/bin/tomoul_sentence_transformer \
+  --model all_minilm_l6_v2_q8k.tl \
+  --vocab all_minilm_l6_v2_vocab.txt \
+  --text "Hello world"
+```
+
+---
+
+**Weights**: Download from [HuggingFace](https://huggingface.co/tomoul/sentence-transformer). Use `all_minilm_l6_v2_q8k.tl` (24 MB, Q8_K) for production — it's 3.6× smaller than f32 with 0.9997+ cosine similarity accuracy.
+
 ## Quick Start
 
 ### Generate Weights
