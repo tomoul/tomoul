@@ -106,17 +106,17 @@ Validated on NVIDIA GeForce RTX 4090, Zig 0.15.2, Vulkan 1.3:
 
 ### WebGPU (Browser) — Windows (RTX 4090) — April 2026
 
-Tested in Chrome with WebGPU enabled, Q8K weights (25.5 MB WASM binary), 128 MB heap:
+Tested in Chrome, Q8K weights (25.5 MB WASM binary), 128 MB heap, 10 iterations (2 warmup):
 
-| Metric | Value |
-|---|---|
-| Backend | WebGPU |
-| Sentences | 3 |
-| Total time | 104.0 ms |
-| Per sentence | 34.7 ms |
-| Dimensions | 384 |
+| Backend | Single (ms) | 3-sent (ms) | Per-sent (ms) | vs Native Vulkan |
+|---|---|---|---|---|
+| **CPU WASM** | **20.77** | **64.50** | **21.50** | 5.2× slower |
+| WebGPU | 34.70 | 104.00 | 34.70 | 8.6× slower |
+| Native Vulkan (Q8K) | 4.02 | 6.64 | 1.33 | baseline |
 
-**Similarity matrix** (3 test sentences):
+**CPU WASM is 1.7× faster than WebGPU** for this model. For a 6-layer, 384-dim encoder, the compute is too small to amortize WebGPU's per-dispatch overhead (~30+ JS round-trips per sentence).
+
+**Similarity matrix** (3 test sentences, CPU WASM):
 
 | | The quick brown fox... | Machine learning is... | I had pizza for lunc... |
 |---|---|---|---|
@@ -124,18 +124,7 @@ Tested in Chrome with WebGPU enabled, Q8K weights (25.5 MB WASM binary), 128 MB 
 | Machine learning is... | 0.995 | 1.000 | 0.973 |
 | I had pizza for lunc... | 0.949 | 0.973 | 1.000 |
 
-First embedding: `[0.0379, 0.0707, 0.0218, 0.0079, -0.0192, 0.0216, 0.1314, 0.0500, -0.0733, -0.0436, ...]`
-
-> **Note:** Browser WebGPU is ~8× slower per-sentence than native Vulkan (34.7 ms vs 4.02 ms). CPU WASM would likely be faster for this model size. The overhead comes from:
-> - **Per-dispatch JS round-trips:** Each of the ~30+ dispatches per sentence (6 layers × 5+ ops) creates a new `beginComputePass()`/`end()`, bind group, and uniform buffer through JavaScript
-> - **Uniform buffer allocation:** Every dispatch calls `device.createBuffer()` + `writeBuffer()` for a fresh uniform buffer
-> - **No sentence batching:** Sentences are processed sequentially in a JS `for` loop — no cross-sentence GPU parallelism
-> - **Async readback sync:** `mapAsync()` at the end adds GPU→CPU synchronization latency
-> - **Cold-run costs:** First execution may include pipeline compilation overhead
->
-> For a model this small (6-layer, 384-dim), the per-dispatch overhead dominates compute. Native Vulkan avoids all of this with direct driver calls and pre-compiled SPIR-V. A CPU-only WASM path would skip GPU round-trips entirely and likely run in ~10-15ms per sentence.
->
-> **TODO:** Add CPU-only WASM benchmark for comparison and consider batching all dispatches into fewer command buffers.
+> **Why WebGPU is slower:** Each of the ~30+ dispatches per sentence creates a new `beginComputePass()`/`end()`, bind group, and uniform buffer through JavaScript. The per-dispatch overhead dominates the actual compute. For larger models (Qwen 2.5 3B: 36 layers, 2048-dim), WebGPU will outperform CPU WASM as the compute-to-overhead ratio inverts.
 
 ### GPU (Metal) — macOS — TODO
 

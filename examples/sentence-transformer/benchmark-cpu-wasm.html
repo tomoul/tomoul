@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Tomoul — CPU WASM vs WebGPU Benchmark</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }
+        .container { max-width: 700px; margin: 0 auto; }
+        h1 { color: #f97316; margin-bottom: 0.5rem; }
+        .subtitle { color: #94a3b8; margin-bottom: 1.5rem; }
+        #status { margin-bottom: 1rem; padding: 0.75rem; background: #1e293b; border-radius: 0.5rem; border-left: 3px solid #fbbf24; font-size: 0.9rem; }
+        #status.ok { border-left-color: #4ade80; }
+        #status.err { border-left-color: #f87171; }
+        button { background: #f97316; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-size: 1rem; cursor: pointer; margin-bottom: 1rem; }
+        button:hover { background: #ea580c; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+        pre { background: #1e293b; padding: 1rem; border-radius: 0.5rem; font-size: 0.85rem; white-space: pre-wrap; overflow-x: auto; line-height: 1.6; }
+        .highlight { color: #4ade80; font-weight: bold; }
+        .dim { color: #64748b; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>CPU WASM vs WebGPU Benchmark</h1>
+        <p class="subtitle">all-MiniLM-L6-v2 · Q8K weights · Same WASM binary, different code paths</p>
+        <div id="status">Loading WASM binary...</div>
+        <button id="runBtn" onclick="runBenchmark()" disabled>Run Benchmark</button>
+        <pre id="output">Waiting for model to load...</pre>
+    </div>
+
+    <script type="module">
+        import { TomoulWebGpuBridge } from './webgpu-bridge.js';
+
+        const SENTENCES = [
+            "The quick brown fox jumps over the lazy dog",
+            "Machine learning is a subset of artificial intelligence",
+            "I had pizza for lunch yesterday",
+        ];
+        const WARMUP = 2;
+        const ITERS = 10;
+
+        const statusEl = document.getElementById('status');
+        const outputEl = document.getElementById('output');
+        const runBtn = document.getElementById('runBtn');
+
+        let wasmExports = null;
+        let bridge = null;
+        let gpuAvailable = false;
+
+        function log(msg) {
+            outputEl.textContent += msg + '\n';
+        }
+
+        function writeText(exports, text) {
+            const inputPtr = exports.get_input_buffer_ptr();
+            const encoded = new TextEncoder().encode(text);
+            const maxInput = exports.get_max_input_bytes();
+            const len = Math.min(encoded.length, maxInput);
+            new Uint8Array(exports.memory.buffer, inputPtr, len).set(encoded.subarray(0, len));
+            return len;
+        }
+
+        function readEmbedding(exports) {
+            const outputPtr = exports.get_output_buffer_ptr();
+            return new Float32Array(exports.memory.buffer, outputPtr, 384).slice();
+        }
+
+        // --- CPU path: direct WASM call, no GPU ---
+        function cpuEmbed(exports, text) {
+            const len = writeText(exports, text);
+            const dim = exports.embed(len);
+            if (dim === 0) throw new Error('CPU embed failed');
+            return readEmbedding(exports);
+        }
+
+        // --- GPU path: through WebGPU bridge ---
+        async function gpuEmbed(bridge, instance, text) {
+            return await bridge.embed(instance, text);
+        }
+
+        async function init() {
+            // Try WebGPU bridge first (also loads WASM)
+            try {
+                bridge = new TomoulWebGpuBridge();
+                const gpuOk = await bridge.init();
+                if (gpuOk) {
+                    const instance = await bridge.loadWasm('tomoul_sentence_transformer.wasm');
+                    wasmExports = instance.exports;
+
+                    const initResult = wasmExports.init();
+                    if (initResult !== 1) throw new Error(`init() returned ${initResult}`);
+
+                    // Try GPU init
+                    if (wasmExports.gpu_init) {
+                        const gpuInit = wasmExports.gpu_init();
+                        gpuAvailable = gpuInit === 1 && wasmExports.gpu_is_active && wasmExports.gpu_is_active() === 1;
+                    }
+
+                    bridge._wasmInstance = instance; // stash for later
+                    statusEl.textContent = `Model loaded. CPU: ready. GPU: ${gpuAvailable ? bridge.deviceName : 'not available'}`;
+                    statusEl.className = 'ok';
+                    outputEl.textContent = `Ready to benchmark ${SENTENCES.length} sentences × ${ITERS} iterations (${WARMUP} warmup)\n\n`;
+                    runBtn.disabled = false;
+                    return;
+                }
+            } catch (e) {
+                console.warn('WebGPU init failed, falling back to CPU-only:', e);
+            }
+
+            // CPU-only fallback: load WASM without bridge
+            const response = await fetch('tomoul_sentence_transformer.wasm');
+            const bytes = await response.arrayBuffer();
+            const { instance } = await WebAssembly.instantiate(bytes, { env: {} });
+            wasmExports = instance.exports;
+            const initResult = wasmExports.init();
+            if (initResult !== 1) {
+                statusEl.textContent = `Init failed (code ${initResult})`;
+                statusEl.className = 'err';
+                return;
+            }
+            statusEl.textContent = 'Model loaded. CPU: ready. GPU: not available (no WebGPU)';
+            statusEl.className = 'ok';
+            outputEl.textContent = `Ready to benchmark ${SENTENCES.length} sentences × ${ITERS} iterations (${WARMUP} warmup)\nGPU benchmark will be skipped.\n\n`;
+            runBtn.disabled = false;
+        }
+
+        window.runBenchmark = async function() {
+            runBtn.disabled = true;
+            runBtn.textContent = 'Running...';
+            outputEl.textContent = '';
+
+            // ====== CPU BENCHMARK ======
+            log('═══════════════════════════════════════');
+            log('  CPU WASM (direct call, no GPU)');
+            log('═══════════════════════════════════════\n');
+
+            // Warmup
+            for (let w = 0; w < WARMUP; w++) {
+                for (const s of SENTENCES) cpuEmbed(wasmExports, s);
+            }
+
+            // Per-sentence timings
+            const cpuTimes = [];
+            for (const sentence of SENTENCES) {
+                const times = [];
+                for (let i = 0; i < ITERS; i++) {
+                    const t0 = performance.now();
+                    cpuEmbed(wasmExports, sentence);
+                    times.push(performance.now() - t0);
+                }
+                const median = times.sort((a, b) => a - b)[Math.floor(times.length / 2)];
+                cpuTimes.push(median);
+                const truncated = sentence.length > 40 ? sentence.slice(0, 40) + '…' : sentence;
+                log(`  "${truncated}"`);
+                log(`    median: ${median.toFixed(2)} ms  (min: ${times[0].toFixed(2)}, max: ${times[times.length-1].toFixed(2)})`);
+            }
+
+            // Batch: all sentences sequentially
+            const cpuBatchTimes = [];
+            for (let i = 0; i < ITERS; i++) {
+                const t0 = performance.now();
+                for (const s of SENTENCES) cpuEmbed(wasmExports, s);
+                cpuBatchTimes.push(performance.now() - t0);
+            }
+            const cpuBatchMedian = cpuBatchTimes.sort((a, b) => a - b)[Math.floor(cpuBatchTimes.length / 2)];
+            const cpuPerSent = cpuBatchMedian / SENTENCES.length;
+            const cpuSingleMedian = cpuTimes.reduce((a, b) => a + b, 0) / cpuTimes.length;
+
+            log(`\n  ── Summary ──`);
+            log(`  Single (avg median): ${cpuSingleMedian.toFixed(2)} ms`);
+            log(`  ${SENTENCES.length}-sent sequential:  ${cpuBatchMedian.toFixed(2)} ms  (${cpuPerSent.toFixed(2)} ms/sent)`);
+
+            // ====== GPU BENCHMARK ======
+            if (gpuAvailable && bridge) {
+                log('\n\n═══════════════════════════════════════');
+                log('  WebGPU (via JS bridge)');
+                log('═══════════════════════════════════════\n');
+
+                const instance = bridge._wasmInstance;
+
+                // Warmup
+                for (let w = 0; w < WARMUP; w++) {
+                    for (const s of SENTENCES) await gpuEmbed(bridge, instance, s);
+                }
+
+                const gpuTimes = [];
+                for (const sentence of SENTENCES) {
+                    const times = [];
+                    for (let i = 0; i < ITERS; i++) {
+                        const t0 = performance.now();
+                        await gpuEmbed(bridge, instance, sentence);
+                        times.push(performance.now() - t0);
+                    }
+                    const median = times.sort((a, b) => a - b)[Math.floor(times.length / 2)];
+                    gpuTimes.push(median);
+                    const truncated = sentence.length > 40 ? sentence.slice(0, 40) + '…' : sentence;
+                    log(`  "${truncated}"`);
+                    log(`    median: ${median.toFixed(2)} ms  (min: ${times[0].toFixed(2)}, max: ${times[times.length-1].toFixed(2)})`);
+                }
+
+                const gpuBatchTimes = [];
+                for (let i = 0; i < ITERS; i++) {
+                    const t0 = performance.now();
+                    for (const s of SENTENCES) await gpuEmbed(bridge, instance, s);
+                    gpuBatchTimes.push(performance.now() - t0);
+                }
+                const gpuBatchMedian = gpuBatchTimes.sort((a, b) => a - b)[Math.floor(gpuBatchTimes.length / 2)];
+                const gpuPerSent = gpuBatchMedian / SENTENCES.length;
+                const gpuSingleMedian = gpuTimes.reduce((a, b) => a + b, 0) / gpuTimes.length;
+
+                log(`\n  ── Summary ──`);
+                log(`  Single (avg median): ${gpuSingleMedian.toFixed(2)} ms`);
+                log(`  ${SENTENCES.length}-sent sequential:  ${gpuBatchMedian.toFixed(2)} ms  (${gpuPerSent.toFixed(2)} ms/sent)`);
+
+                // ====== COMPARISON ======
+                log('\n\n═══════════════════════════════════════');
+                log('  Comparison');
+                log('═══════════════════════════════════════\n');
+                log(`  Backend          Single (ms)   ${SENTENCES.length}-sent (ms)   Per-sent (ms)`);
+                log(`  ──────────────   ───────────   ──────────   ────────────`);
+                log(`  CPU WASM         ${cpuSingleMedian.toFixed(2).padStart(8)}      ${cpuBatchMedian.toFixed(2).padStart(8)}      ${cpuPerSent.toFixed(2).padStart(8)}`);
+                log(`  WebGPU           ${gpuSingleMedian.toFixed(2).padStart(8)}      ${gpuBatchMedian.toFixed(2).padStart(8)}      ${gpuPerSent.toFixed(2).padStart(8)}`);
+                const ratio = gpuSingleMedian / cpuSingleMedian;
+                if (ratio > 1) {
+                    log(`\n  CPU WASM is ${ratio.toFixed(1)}× faster than WebGPU for this model.`);
+                } else {
+                    log(`\n  WebGPU is ${(1/ratio).toFixed(1)}× faster than CPU WASM for this model.`);
+                }
+            } else {
+                log('\n\n  (WebGPU not available — GPU benchmark skipped)');
+            }
+
+            // Verify correctness: CPU vs GPU produce same results
+            if (gpuAvailable && bridge) {
+                log('\n\n═══════════════════════════════════════');
+                log('  Correctness: CPU vs GPU cosine sim');
+                log('═══════════════════════════════════════\n');
+                const instance = bridge._wasmInstance;
+                for (const sentence of SENTENCES) {
+                    const cpuEmb = cpuEmbed(wasmExports, sentence);
+                    const gpuEmb = await gpuEmbed(bridge, instance, sentence);
+                    let dot = 0, na = 0, nb = 0;
+                    for (let i = 0; i < 384; i++) {
+                        dot += cpuEmb[i] * gpuEmb[i];
+                        na += cpuEmb[i] * cpuEmb[i];
+                        nb += gpuEmb[i] * gpuEmb[i];
+                    }
+                    const cos = dot / (Math.sqrt(na) * Math.sqrt(nb));
+                    const truncated = sentence.length > 40 ? sentence.slice(0, 40) + '…' : sentence;
+                    log(`  "${truncated}": cos=${cos.toFixed(6)} ${cos > 0.99 ? '✓' : '✗'}`);
+                }
+            }
+
+            log('\n\nDone.');
+            runBtn.disabled = false;
+            runBtn.textContent = 'Run Benchmark';
+        };
+
+        init();
+    </script>
+</body>
+</html>
