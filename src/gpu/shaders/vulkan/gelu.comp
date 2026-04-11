@@ -1,0 +1,29 @@
+#version 450
+
+// GELU activation (in-place)
+// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Uses rational Padé approximation for tanh
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Data { float data[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= count) return;
+
+    float x = data[idx];
+    float x3 = x * x * x;
+    float inner = 0.7978845608 * (x + 0.044715 * x3);
+
+    // tanh via Padé approximation: tanh(t) ≈ t*(27+t²)/(27+9*t²), clamped
+    float t = clamp(inner, -5.0, 5.0);
+    float t2 = t * t;
+    float tanh_val = t * (27.0 + t2) / (27.0 + 9.0 * t2);
+
+    data[idx] = 0.5 * x * (1.0 + tanh_val);
+}

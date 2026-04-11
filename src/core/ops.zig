@@ -1,6 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// SIMD vector width (in f32 elements) for the current target architecture.
+/// Matches native SIMD register width to avoid LLVM codegen issues on wasm32.
+const VEC_F32_WIDTH: comptime_int = switch (builtin.cpu.arch) {
+    .x86_64 => 8, // AVX2: 256-bit = 8 floats
+    .aarch64 => 4, // NEON: 128-bit = 4 floats
+    .wasm32 => 4, // WASM SIMD: 128-bit = 4 floats
+    else => 4, // Conservative default
+};
+
 // Support both module imports (Wasm build) and relative imports (native build)
 const tensor_import = @import("tensor.zig");
 const Tensor = tensor_import.Tensor;
@@ -269,14 +278,13 @@ pub fn matmul(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tensor) 
     // Initialize result to zero
     @memset(result.data, 0.0);
 
-    // SIMD vector width (8 floats for AVX/AVX2)
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = VEC_F32_WIDTH;
     const Vec = @Vector(VEC_WIDTH, f32);
 
     // Register blocking: process MR rows of A at once
     // This keeps MR accumulators in registers, reducing memory traffic
     const MR = 4; // Number of rows to process together
-    const NR = 24; // Number of columns per micro-kernel (3 vectors)
+    const NR = VEC_WIDTH * 3; // Number of columns per micro-kernel (3 vectors)
 
     // Main loop with register blocking
     var i: usize = 0;
@@ -444,7 +452,7 @@ pub fn matmulBias(allocator: std.mem.Allocator, a: *const Tensor, b: *const Tens
     }
 
     // Add bias to each row
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = VEC_F32_WIDTH;
     const Vec = @Vector(VEC_WIDTH, f32);
     for (0..m) |row| {
         const row_start = row * n;
@@ -540,8 +548,7 @@ fn matmulRowRange(
     row_start: usize,
     row_end: usize,
 ) void {
-    // SIMD vector width (process 8 floats at once)
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = VEC_F32_WIDTH;
     const Vec = @Vector(VEC_WIDTH, f32);
 
     // Process each row in this thread's range
@@ -1854,7 +1861,7 @@ pub fn layerNormInPlace(
         return OpsError.ShapeMismatch;
     }
 
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = VEC_F32_WIDTH;
     const Vec = @Vector(VEC_WIDTH, f32);
     const hidden_dim_f: f32 = @floatFromInt(hidden_dim);
 
@@ -1941,7 +1948,7 @@ pub fn gelu(tensor: *Tensor) void {
     const sqrt_2_over_pi: f32 = 0.7978845608; // sqrt(2/pi)
     const coeff: f32 = 0.044715;
 
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = VEC_F32_WIDTH;
     const Vec = @Vector(VEC_WIDTH, f32);
     const len = tensor.data.len;
 
@@ -1972,8 +1979,8 @@ pub fn gelu(tensor: *Tensor) void {
 /// Fully vectorized tanh approximation using rational Padé approximant.
 /// tanh(x) ≈ x * (27 + x²) / (27 + 9*x²)  for |x| ≤ ~4.5
 /// Clamped to ±1 for large inputs. Max error ~3e-7 in the GELU operating range.
-fn tanhApproxVec(x: @Vector(8, f32)) @Vector(8, f32) {
-    const Vec = @Vector(8, f32);
+fn tanhApproxVec(x: @Vector(VEC_F32_WIDTH, f32)) @Vector(VEC_F32_WIDTH, f32) {
+    const Vec = @Vector(VEC_F32_WIDTH, f32);
     const ones: Vec = @splat(1.0);
     const neg_ones: Vec = @splat(-1.0);
     const c27: Vec = @splat(27.0);
@@ -2022,7 +2029,7 @@ fn erf(x: f32) f32 {
 pub fn geluExact(tensor: *Tensor) void {
     const inv_sqrt_2: f32 = 0.7071067811865476; // 1/sqrt(2)
 
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = VEC_F32_WIDTH;
     const Vec = @Vector(VEC_WIDTH, f32);
     const len = tensor.data.len;
 
@@ -2035,10 +2042,10 @@ pub fn geluExact(tensor: *Tensor) void {
         const x: Vec = tensor.data[i..][0..VEC_WIDTH].*;
         const scaled = x * inv_sqrt_2_vec;
         // Vectorized erf
-        const erf_v = Vec{
-            erf(scaled[0]), erf(scaled[1]), erf(scaled[2]), erf(scaled[3]),
-            erf(scaled[4]), erf(scaled[5]), erf(scaled[6]), erf(scaled[7]),
-        };
+        var erf_v: Vec = undefined;
+        inline for (0..VEC_WIDTH) |idx| {
+            erf_v[idx] = erf(scaled[idx]);
+        }
         tensor.data[i..][0..VEC_WIDTH].* = x * half_vec * (one_vec + erf_v);
     }
     // Handle remainder
@@ -2074,7 +2081,7 @@ pub fn softmax(tensor: *Tensor) void {
     const rows = tensor.shape[0];
     const cols = tensor.shape[1];
 
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = VEC_F32_WIDTH;
     const Vec = @Vector(VEC_WIDTH, f32);
 
     for (0..rows) |row| {
@@ -2114,10 +2121,10 @@ pub fn softmax(tensor: *Tensor) void {
                 const v: Vec = row_data[i..][0..VEC_WIDTH].*;
                 const shifted = v - max_vec;
                 // Vectorized exp
-                const exp_v = Vec{
-                    @exp(shifted[0]), @exp(shifted[1]), @exp(shifted[2]), @exp(shifted[3]),
-                    @exp(shifted[4]), @exp(shifted[5]), @exp(shifted[6]), @exp(shifted[7]),
-                };
+                var exp_v: Vec = undefined;
+                inline for (0..VEC_WIDTH) |idx| {
+                    exp_v[idx] = @exp(shifted[idx]);
+                }
                 row_data[i..][0..VEC_WIDTH].* = exp_v;
                 sum_vec += exp_v;
             }
@@ -2176,7 +2183,7 @@ pub fn addBiasInPlace(input: *Tensor, bias: *const Tensor) OpsError!void {
         return OpsError.ShapeMismatch;
     }
 
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = VEC_F32_WIDTH;
     const Vec = @Vector(VEC_WIDTH, f32);
 
     for (0..seq_len) |row| {

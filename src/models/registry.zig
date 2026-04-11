@@ -172,6 +172,12 @@ pub const models = [_]ModelConfig{
             "is_ready",
             "get_version",
             "reset",
+            "get_heap_used",
+            "get_heap_size",
+            "gpu_init",
+            "gpu_is_active",
+            "gpu_embed",
+            "gpu_destroy",
         },
         .weight_variants = &.{
             .{ .suffix = "-q8k", .path = "artifacts/all_minilm_l6_v2_q8k.tl", .description = "Q8_K block-wise - 3.6x smaller, 0.9997+ accuracy" },

@@ -1,0 +1,104 @@
+#version 450
+
+// Batched Multi-Head Self-Attention (per-sentence, packed sequences)
+//
+// Like attention.comp but handles batched packed input where multiple
+// sentences are concatenated in a single buffer. Each workgroup handles
+// one (sentence, head, query_row) triple.
+//
+// Offsets buffer stores [batch_size] uint32 values: the starting token
+// index for each sentence. Sentence i spans offset[i]..offset[i+1]-1.
+// The last sentence goes up to total_tokens.
+//
+// Dispatch: (num_heads, total_tokens, 1) — each invocation determines
+// which sentence its query row belongs to via the offsets.
+//
+// Memory layout (all row-major, packed across batch):
+//   Q, K, V: [total_tokens, hidden_dim]
+//   Output:  [total_tokens, hidden_dim]
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer Q      { float q_buf[]; };
+layout(set = 0, binding = 1) readonly  buffer K      { float k_buf[]; };
+layout(set = 0, binding = 2) readonly  buffer V      { float v_buf[]; };
+layout(set = 0, binding = 3) writeonly buffer Output { float out_buf[]; };
+layout(set = 0, binding = 4) readonly  buffer Offsets { uint offsets[]; };
+
+layout(push_constant) uniform Params {
+    uint total_tokens;    // total tokens across all sentences
+    uint num_heads;
+    uint head_dim;
+    float scale;
+    uint batch_size;      // number of sentences
+};
+
+void main() {
+    uint head   = gl_GlobalInvocationID.x;
+    uint row    = gl_GlobalInvocationID.y;  // global row in packed buffer
+
+    if (head >= num_heads || row >= total_tokens) return;
+
+    uint hidden_dim = num_heads * head_dim;
+
+    // Find which sentence this row belongs to, and the sentence boundaries
+    uint sent_start = 0;
+    uint sent_end = total_tokens;
+    for (uint s = 0; s < batch_size; s++) {
+        uint off = offsets[s];
+        if (off <= row) {
+            sent_start = off;
+            if (s + 1 < batch_size) {
+                sent_end = offsets[s + 1];
+            } else {
+                sent_end = total_tokens;
+            }
+        }
+    }
+    uint sent_len = sent_end - sent_start;
+
+    // Compute attention scores for this head and row within its sentence
+    uint head_offset = head * head_dim;
+
+    // Step 1: scaled dot-product scores for this row vs all keys in same sentence
+    float max_score = -1e30;
+    for (uint j = 0; j < sent_len; j++) {
+        uint k_row = sent_start + j;
+        float dot = 0.0;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += q_buf[row * hidden_dim + head_offset + d]
+                 * k_buf[k_row * hidden_dim + head_offset + d];
+        }
+        dot *= scale;
+        max_score = max(max_score, dot);
+    }
+
+    // Step 2: softmax (exp and sum)
+    float exp_sum = 0.0;
+    for (uint j = 0; j < sent_len; j++) {
+        uint k_row = sent_start + j;
+        float dot = 0.0;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += q_buf[row * hidden_dim + head_offset + d]
+                 * k_buf[k_row * hidden_dim + head_offset + d];
+        }
+        exp_sum += exp(dot * scale - max_score);
+    }
+    float inv_sum = 1.0 / (exp_sum + 1e-12);
+
+    // Step 3: weighted sum of values
+    for (uint d = 0; d < head_dim; d++) {
+        float acc = 0.0;
+        for (uint j = 0; j < sent_len; j++) {
+            uint k_row = sent_start + j;
+            float dot = 0.0;
+            for (uint dd = 0; dd < head_dim; dd++) {
+                dot += q_buf[row * hidden_dim + head_offset + dd]
+                     * k_buf[k_row * hidden_dim + head_offset + dd];
+            }
+            float attn = exp(dot * scale - max_score) * inv_sum;
+            acc += attn * v_buf[k_row * hidden_dim + head_offset + d];
+        }
+        out_buf[row * hidden_dim + head_offset + d] = acc;
+    }
+}

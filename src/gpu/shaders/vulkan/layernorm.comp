@@ -1,0 +1,65 @@
+#version 450
+
+// Layer Normalization: in-place
+// y[i] = (x[i] - mean) / sqrt(var + eps) * gamma[i] + beta[i]
+// One workgroup per row, parallel reduction for mean/variance
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Data { float data[]; };
+layout(set = 0, binding = 1) readonly buffer Gamma { float gamma_buf[]; };
+layout(set = 0, binding = 2) readonly buffer Beta { float beta_buf[]; };
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+    float eps;
+};
+
+shared float sdata[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= rows) return;
+
+    uint base = row * cols;
+
+    // Phase 1: Compute mean
+    float sum = 0.0;
+    for (uint i = tid; i < cols; i += 256) {
+        sum += data[base + i];
+    }
+    sdata[tid] = sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float mean = sdata[0] / float(cols);
+    barrier();
+
+    // Phase 2: Compute variance
+    float var_sum = 0.0;
+    for (uint i = tid; i < cols; i += 256) {
+        float diff = data[base + i] - mean;
+        var_sum += diff * diff;
+    }
+    sdata[tid] = var_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float variance = sdata[0] / float(cols);
+    float inv_std = inversesqrt(variance + eps);
+    barrier();
+
+    // Phase 3: Normalize in-place
+    for (uint i = tid; i < cols; i += 256) {
+        data[base + i] = (data[base + i] - mean) * inv_std * gamma_buf[i] + beta_buf[i];
+    }
+}

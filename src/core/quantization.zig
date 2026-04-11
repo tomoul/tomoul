@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const tensor_import = @import("tensor.zig");
 const Tensor = tensor_import.Tensor;
 
@@ -6,6 +7,19 @@ const Tensor = tensor_import.Tensor;
 const ops_module = @import("ops.zig");
 const use_zblas: bool = @hasDecl(ops_module, "use_zblas") and ops_module.use_zblas;
 const zblas = if (use_zblas) @import("zblas") else undefined;
+
+/// SIMD vector width for quantized operations, tuned per architecture.
+/// Must not exceed native SIMD width to avoid LLVM codegen issues on wasm32.
+const VEC_Q_WIDTH: comptime_int = switch (builtin.cpu.arch) {
+    .x86_64 => 32, // AVX2: process 32 i8 values (256-bit) at once
+    .aarch64 => 16, // NEON: 128-bit
+    .wasm32 => 4, // WASM SIMD: keep vectors ≤128-bit (4 × f32)
+    else => 4, // Conservative default
+};
+const VEC_Q_WIDTH_SMALL: comptime_int = switch (builtin.cpu.arch) {
+    .x86_64 => 8,
+    else => 4,
+};
 
 /// Quantization error types
 pub const QuantError = error{
@@ -226,39 +240,39 @@ pub fn matmulF32Q8Simd(
     // Initialize result to zero
     @memset(result.data, 0.0);
 
-    // 32-wide SIMD for maximum throughput
-    const VEC_WIDTH = 32;
-    const Vec32i8 = @Vector(VEC_WIDTH, i8);
-    const Vec32i16 = @Vector(VEC_WIDTH, i16);
-    const Vec32f32 = @Vector(VEC_WIDTH, f32);
+    // SIMD for maximum throughput (width tuned per arch)
+    const VEC_WIDTH = VEC_Q_WIDTH;
+    const VecI8 = @Vector(VEC_WIDTH, i8);
+    const VecI16 = @Vector(VEC_WIDTH, i16);
+    const VecF32 = @Vector(VEC_WIDTH, f32);
 
     // i, k, j loop order with SIMD on j dimension
     for (0..m) |i| {
         for (0..k) |kk| {
             const a_val = a.data[i * k + kk];
-            const a_vec: Vec32f32 = @splat(a_val);
-            const scale_vec: Vec32f32 = @splat(scale);
+            const a_vec: VecF32 = @splat(a_val);
+            const scale_vec: VecF32 = @splat(scale);
 
             const row_start = kk * n;
             var j: usize = 0;
 
-            // 32-wide SIMD vectorized loop
+            // SIMD vectorized loop
             while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
-                // Load 32 int8 weights
-                const w_i8: Vec32i8 = b.data[row_start + j ..][0..VEC_WIDTH].*;
+                // Load int8 weights
+                const w_i8: VecI8 = b.data[row_start + j ..][0..VEC_WIDTH].*;
 
                 // Convert to i16 first (Zig doesn't support direct i8→f32 vector conversion)
-                const w_i16: Vec32i16 = w_i8;
+                const w_i16: VecI16 = w_i8;
 
                 // Convert to float32
-                const w_f32: Vec32f32 = @floatFromInt(w_i16);
+                const w_f32: VecF32 = @floatFromInt(w_i16);
 
                 // Scale to dequantize
                 const w_scaled = w_f32 * scale_vec;
 
                 // Load current result
                 const result_ptr = result.data[i * n + j ..];
-                var result_vec: Vec32f32 = result_ptr[0..VEC_WIDTH].*;
+                var result_vec: VecF32 = result_ptr[0..VEC_WIDTH].*;
 
                 // Multiply and accumulate
                 result_vec += a_vec * w_scaled;
@@ -267,22 +281,22 @@ pub fn matmulF32Q8Simd(
                 result_ptr[0..VEC_WIDTH].* = result_vec;
             }
 
-            // Handle remainder with 8-wide vector
-            const VEC_WIDTH_SMALL = 8;
-            const Vec8i8 = @Vector(VEC_WIDTH_SMALL, i8);
-            const Vec8i16 = @Vector(VEC_WIDTH_SMALL, i16);
-            const Vec8f32 = @Vector(VEC_WIDTH_SMALL, f32);
-            const a_vec_small: Vec8f32 = @splat(a_val);
-            const scale_vec_small: Vec8f32 = @splat(scale);
+            // Handle remainder with smaller vector
+            const VEC_WIDTH_SMALL = VEC_Q_WIDTH_SMALL;
+            const VecSmI8 = @Vector(VEC_WIDTH_SMALL, i8);
+            const VecSmI16 = @Vector(VEC_WIDTH_SMALL, i16);
+            const VecSmF32 = @Vector(VEC_WIDTH_SMALL, f32);
+            const a_vec_small: VecSmF32 = @splat(a_val);
+            const scale_vec_small: VecSmF32 = @splat(scale);
 
             while (j + VEC_WIDTH_SMALL <= n) : (j += VEC_WIDTH_SMALL) {
-                const w_i8: Vec8i8 = b.data[row_start + j ..][0..VEC_WIDTH_SMALL].*;
-                const w_i16: Vec8i16 = w_i8;
-                const w_f32: Vec8f32 = @floatFromInt(w_i16);
+                const w_i8: VecSmI8 = b.data[row_start + j ..][0..VEC_WIDTH_SMALL].*;
+                const w_i16: VecSmI16 = w_i8;
+                const w_f32: VecSmF32 = @floatFromInt(w_i16);
                 const w_scaled = w_f32 * scale_vec_small;
 
                 const result_ptr = result.data[i * n + j ..];
-                var result_vec: Vec8f32 = result_ptr[0..VEC_WIDTH_SMALL].*;
+                var result_vec: VecSmF32 = result_ptr[0..VEC_WIDTH_SMALL].*;
                 result_vec += a_vec_small * w_scaled;
                 result_ptr[0..VEC_WIDTH_SMALL].* = result_vec;
             }
@@ -545,29 +559,28 @@ pub fn matmulF32Q8KSimd(
     // Initialize result to zero
     @memset(result.data, 0.0);
 
-    // 32-wide SIMD vectors for AVX2 optimization
-    const VEC_WIDTH = 32;
-    const Vec32i8 = @Vector(VEC_WIDTH, i8);
-    const Vec32i16 = @Vector(VEC_WIDTH, i16);
-    const Vec32f32 = @Vector(VEC_WIDTH, f32);
+    // SIMD vectors (width tuned per arch)
+    const VEC_WIDTH = VEC_Q_WIDTH;
+    const VecI8 = @Vector(VEC_WIDTH, i8);
+    const VecI16 = @Vector(VEC_WIDTH, i16);
+    const VecF32 = @Vector(VEC_WIDTH, f32);
 
     // i,k,j loop order for cache-friendly row-major access
     for (0..m) |i| {
         for (0..k) |kk| {
             const a_val = a.data[i * k + kk];
-            const a_vec: Vec32f32 = @splat(a_val);
+            const a_vec: VecF32 = @splat(a_val);
             const row_start = kk * n;
 
             var j: usize = 0;
 
-            // 32-wide SIMD loop
+            // SIMD loop
             while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
-                // Load 32 int8 weights contiguously
-                const w_i8: Vec32i8 = b.data[row_start + j ..][0..VEC_WIDTH].*;
+                // Load int8 weights contiguously
+                const w_i8: VecI8 = b.data[row_start + j ..][0..VEC_WIDTH].*;
 
                 // Get scales for each weight (Q8_K has per-block scales)
-                // block_size is typically 32, so we may span 1-2 blocks
-                var scale_vec: Vec32f32 = undefined;
+                var scale_vec: VecF32 = undefined;
                 inline for (0..VEC_WIDTH) |vi| {
                     const w_idx = row_start + j + vi;
                     const block_idx = w_idx / b.block_size;
@@ -575,20 +588,20 @@ pub fn matmulF32Q8KSimd(
                 }
 
                 // Convert i8 -> i16 -> f32 (widening conversion)
-                const w_i16: Vec32i16 = w_i8;
-                const w_f32: Vec32f32 = @floatFromInt(w_i16);
+                const w_i16: VecI16 = w_i8;
+                const w_f32: VecF32 = @floatFromInt(w_i16);
 
                 // Dequantize: w_float = w_int * scale
                 const w_scaled = w_f32 * scale_vec;
 
                 // Load current result, multiply-accumulate, store back
                 const result_ptr = result.data[i * n + j ..];
-                var result_vec: Vec32f32 = result_ptr[0..VEC_WIDTH].*;
+                var result_vec: VecF32 = result_ptr[0..VEC_WIDTH].*;
                 result_vec += a_vec * w_scaled;
                 result_ptr[0..VEC_WIDTH].* = result_vec;
             }
 
-            // Handle remainder (< 32 elements)
+            // Handle remainder
             while (j < n) : (j += 1) {
                 const w_idx = row_start + j;
                 const block_idx = w_idx / b.block_size;
@@ -843,91 +856,76 @@ pub fn matmulF32Q4Simd(
     // Initialize result to zero
     @memset(result.data, 0.0);
 
-    // Use 32-wide SIMD (16 packed bytes = 32 nibbles)
-    const VEC_WIDTH = 32;
-    const Vec32f32 = @Vector(VEC_WIDTH, f32);
-    const Vec16u8 = @Vector(16, u8);
-    const Vec16i16 = @Vector(16, i16);
-
     // i, k, j loop order with SIMD on j dimension
     for (0..m) |i| {
         for (0..k) |kk| {
             const a_val = a.data[i * k + kk];
-            const a_vec: Vec32f32 = @splat(a_val);
-            const scale_vec: Vec32f32 = @splat(scale);
 
             // Element index for row kk of B
             const row_start = kk * n;
 
             var j: usize = 0;
 
-            // SIMD vectorized loop (32 elements = 16 packed bytes at a time)
-            while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
-                const elem_idx = row_start + j;
-                const byte_idx = elem_idx / 2;
+            // Wide SIMD path: 32-wide (16 packed bytes = 32 nibbles) — x86_64 only
+            // Uses Vec16u8/Vec16i16 which are >128-bit after widening, so guard behind comptime arch check
+            if (comptime builtin.cpu.arch == .x86_64) {
+                const VEC_WIDTH = 32;
+                const Vec32f32 = @Vector(VEC_WIDTH, f32);
+                const Vec16u8 = @Vector(16, u8);
+                const Vec16i16 = @Vector(16, i16);
 
-                // Load 16 contiguous packed bytes (32 nibbles)
-                const packed_bytes: Vec16u8 = b.data[byte_idx..][0..16].*;
+                const a_vec: Vec32f32 = @splat(a_val);
+                const scale_vec_wide: Vec32f32 = @splat(scale);
 
-                // SIMD nibble extraction using vector operations
-                // Low nibbles: AND with 0x0F
-                const lo_mask: Vec16u8 = @splat(0x0F);
-                const lo_nibbles = packed_bytes & lo_mask;
+                while (j + VEC_WIDTH <= n) : (j += VEC_WIDTH) {
+                    const elem_idx = row_start + j;
+                    const byte_idx = elem_idx / 2;
 
-                // High nibbles: shift right by 4
-                const hi_nibbles = packed_bytes >> @splat(4);
+                    const packed_bytes: Vec16u8 = b.data[byte_idx..][0..16].*;
 
-                // Sign extend using arithmetic: if bit 3 is set, subtract 16
-                // For low nibbles
-                const sign_bit: Vec16u8 = @splat(0x08);
-                const sixteen: Vec16i16 = @splat(16);
+                    const lo_mask: Vec16u8 = @splat(0x0F);
+                    const lo_nibbles = packed_bytes & lo_mask;
+                    const hi_nibbles = packed_bytes >> @splat(4);
 
-                // Convert to i16 for sign extension math
-                const lo_i16: Vec16i16 = @intCast(lo_nibbles);
-                const hi_i16: Vec16i16 = @intCast(hi_nibbles);
-                const lo_sign: Vec16u8 = lo_nibbles & sign_bit;
-                const hi_sign: Vec16u8 = hi_nibbles & sign_bit;
+                    const sign_bit: Vec16u8 = @splat(0x08);
+                    const sixteen: Vec16i16 = @splat(16);
 
-                // Branchless sign extension: val - 16 if sign bit set
-                const lo_signed = lo_i16 - @select(i16, lo_sign != @as(Vec16u8, @splat(0)), sixteen, @as(Vec16i16, @splat(0)));
-                const hi_signed = hi_i16 - @select(i16, hi_sign != @as(Vec16u8, @splat(0)), sixteen, @as(Vec16i16, @splat(0)));
+                    const lo_i16: Vec16i16 = @intCast(lo_nibbles);
+                    const hi_i16: Vec16i16 = @intCast(hi_nibbles);
+                    const lo_sign: Vec16u8 = lo_nibbles & sign_bit;
+                    const hi_sign: Vec16u8 = hi_nibbles & sign_bit;
 
-                // Interleave low and high nibbles to get correct order
-                // Memory order: [lo0,hi0], [lo1,hi1], ... -> output: lo0,hi0,lo1,hi1,...
-                var w_f32: [VEC_WIDTH]f32 = undefined;
-                inline for (0..16) |idx| {
-                    w_f32[idx * 2] = @floatFromInt(lo_signed[idx]);
-                    w_f32[idx * 2 + 1] = @floatFromInt(hi_signed[idx]);
+                    const lo_signed = lo_i16 - @select(i16, lo_sign != @as(Vec16u8, @splat(0)), sixteen, @as(Vec16i16, @splat(0)));
+                    const hi_signed = hi_i16 - @select(i16, hi_sign != @as(Vec16u8, @splat(0)), sixteen, @as(Vec16i16, @splat(0)));
+
+                    var w_f32: [VEC_WIDTH]f32 = undefined;
+                    inline for (0..16) |idx| {
+                        w_f32[idx * 2] = @floatFromInt(lo_signed[idx]);
+                        w_f32[idx * 2 + 1] = @floatFromInt(hi_signed[idx]);
+                    }
+
+                    const w_vec: Vec32f32 = w_f32;
+                    const w_scaled = w_vec * scale_vec_wide;
+
+                    const result_ptr = result.data[i * n + j ..];
+                    var result_vec: Vec32f32 = result_ptr[0..VEC_WIDTH].*;
+                    result_vec += a_vec * w_scaled;
+                    result_ptr[0..VEC_WIDTH].* = result_vec;
                 }
-
-                const w_vec: Vec32f32 = w_f32;
-
-                // Scale to dequantize
-                const w_scaled = w_vec * scale_vec;
-
-                // Load current result
-                const result_ptr = result.data[i * n + j ..];
-                var result_vec: Vec32f32 = result_ptr[0..VEC_WIDTH].*;
-
-                // Multiply and accumulate
-                result_vec += a_vec * w_scaled;
-
-                // Store back
-                result_ptr[0..VEC_WIDTH].* = result_vec;
             }
 
-            // Handle remainder with smaller vector (8-wide)
-            const VEC_WIDTH_SMALL = 8;
-            const Vec8f32 = @Vector(VEC_WIDTH_SMALL, f32);
-            const a_vec_small: Vec8f32 = @splat(a_val);
-            const scale_vec_small: Vec8f32 = @splat(scale);
+            // Smaller SIMD remainder path (arch-aware width)
+            const VEC_WIDTH_SMALL = VEC_Q_WIDTH_SMALL;
+            const VecSmF32 = @Vector(VEC_WIDTH_SMALL, f32);
+            const a_vec_small: VecSmF32 = @splat(a_val);
+            const scale_vec_small: VecSmF32 = @splat(scale);
 
             while (j + VEC_WIDTH_SMALL <= n) : (j += VEC_WIDTH_SMALL) {
                 const elem_idx = row_start + j;
                 const byte_idx = elem_idx / 2;
 
                 var w_f32: [VEC_WIDTH_SMALL]f32 = undefined;
-                inline for (0..4) |bi| {
+                inline for (0..VEC_WIDTH_SMALL / 2) |bi| {
                     const byte = b.data[byte_idx + bi];
                     const lo: u8 = byte & 0x0F;
                     const hi: u8 = byte >> 4;
@@ -937,10 +935,10 @@ pub fn matmulF32Q4Simd(
                     w_f32[bi * 2 + 1] = @floatFromInt(hi_s);
                 }
 
-                const w_vec: Vec8f32 = w_f32;
+                const w_vec: VecSmF32 = w_f32;
                 const w_scaled = w_vec * scale_vec_small;
                 const result_ptr = result.data[i * n + j ..];
-                var result_vec: Vec8f32 = result_ptr[0..VEC_WIDTH_SMALL].*;
+                var result_vec: VecSmF32 = result_ptr[0..VEC_WIDTH_SMALL].*;
                 result_vec += a_vec_small * w_scaled;
                 result_ptr[0..VEC_WIDTH_SMALL].* = result_vec;
             }

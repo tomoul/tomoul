@@ -7,6 +7,7 @@
 // Supports float32, Q8_K quantized, and f16 half-precision weights (auto-detected from .tl file).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tensor_mod = @import("tensor.zig");
 const Tensor = tensor_mod.Tensor;
 const ops = @import("ops.zig");
@@ -73,19 +74,34 @@ pub const WeightStorage = union(enum) {
     },
 
     pub fn deinit(self: *WeightStorage, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .f32 => |*f| {
-                for (f.blocks) |*block| block.deinit();
-                allocator.free(f.blocks);
-            },
-            .q8k => |*q| {
-                for (q.blocks) |*block| block.deinit();
-                allocator.free(q.blocks);
-            },
-            .f16 => |*h| {
-                for (h.blocks) |*block| block.deinit();
-                allocator.free(h.blocks);
-            },
+        // Workaround for Zig issue #24345: LLVM Invalid Cast in switch dispatch
+        // lowering on 32-bit targets. Use if/else chains for union(enum) on wasm32.
+        if (comptime builtin.cpu.arch == .wasm32) {
+            if (std.meta.activeTag(self.*) == .f32) {
+                for (self.f32.blocks) |*block| block.deinit();
+                allocator.free(self.f32.blocks);
+            } else if (std.meta.activeTag(self.*) == .q8k) {
+                for (self.q8k.blocks) |*block| block.deinit();
+                allocator.free(self.q8k.blocks);
+            } else {
+                for (self.f16.blocks) |*block| block.deinit();
+                allocator.free(self.f16.blocks);
+            }
+        } else {
+            switch (self.*) {
+                .f32 => |*f| {
+                    for (f.blocks) |*block| block.deinit();
+                    allocator.free(f.blocks);
+                },
+                .q8k => |*q| {
+                    for (q.blocks) |*block| block.deinit();
+                    allocator.free(q.blocks);
+                },
+                .f16 => |*h| {
+                    for (h.blocks) |*block| block.deinit();
+                    allocator.free(h.blocks);
+                },
+            }
         }
     }
 };
@@ -287,31 +303,45 @@ pub const SentenceTransformerModel = struct {
 
         // 2. Run through transformer blocks
         var output: Tensor = undefined;
-        switch (self.weights) {
-            .f32 => |f| {
-                output = try transformer.transformerStackF32(
-                    scratch,
-                    &hidden,
-                    f.blocks,
-                    transformer_config,
-                );
-            },
-            .q8k => |q| {
-                output = try transformer.transformerStackQ8K(
-                    scratch,
-                    &hidden,
-                    q.blocks,
-                    transformer_config,
-                );
-            },
-            .f16 => |h| {
-                output = try transformer.transformerStackF16(
-                    scratch,
-                    &hidden,
-                    h.blocks,
-                    transformer_config,
-                );
-            },
+        if (comptime builtin.cpu.arch == .wasm32) {
+            // wasm32: F16 codegen disabled — LLVM wasm backend cannot lower
+            // @Vector(N, f16) → @Vector(N, f32) casts (no native f16 SIMD).
+            // Use if/else (not switch) to avoid union(enum) dispatch lowering bug (#24345).
+            if (std.meta.activeTag(self.weights) == .q8k) {
+                output = try transformer.transformerStackQ8K(scratch, &hidden, self.weights.q8k.blocks, transformer_config);
+            } else if (std.meta.activeTag(self.weights) == .f32) {
+                output = try transformer.transformerStackF32(scratch, &hidden, self.weights.f32.blocks, transformer_config);
+            } else {
+                // F16 weights not supported on wasm32 — convert to F32 at load time
+                unreachable;
+            }
+        } else {
+            switch (self.weights) {
+                .f32 => |f| {
+                    output = try transformer.transformerStackF32(
+                        scratch,
+                        &hidden,
+                        f.blocks,
+                        transformer_config,
+                    );
+                },
+                .q8k => |q| {
+                    output = try transformer.transformerStackQ8K(
+                        scratch,
+                        &hidden,
+                        q.blocks,
+                        transformer_config,
+                    );
+                },
+                .f16 => |h| {
+                    output = try transformer.transformerStackF16(
+                        scratch,
+                        &hidden,
+                        h.blocks,
+                        transformer_config,
+                    );
+                },
+            }
         }
 
         // output is now [seq_len, hidden_dim] — caller owns it
@@ -461,22 +491,37 @@ pub const SentenceTransformerModel = struct {
 
         // 2. Run through transformer blocks (batched)
         var output: Tensor = undefined;
-        switch (self.weights) {
-            .f32 => |f| {
+        if (comptime builtin.cpu.arch == .wasm32) {
+            // wasm32: F16 disabled (no f16 SIMD), if/else avoids union switch bug (#24345)
+            if (std.meta.activeTag(self.weights) == .q8k) {
                 output = try transformer.transformerStackBatched(
-                    Tensor, scratch, &hidden, f.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
+                    QuantizedTensorQ8K, scratch, &hidden, self.weights.q8k.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
                 );
-            },
-            .q8k => |q| {
+            } else if (std.meta.activeTag(self.weights) == .f32) {
                 output = try transformer.transformerStackBatched(
-                    QuantizedTensorQ8K, scratch, &hidden, q.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
+                    Tensor, scratch, &hidden, self.weights.f32.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
                 );
-            },
-            .f16 => |h| {
-                output = try transformer.transformerStackBatched(
-                    F16Tensor, scratch, &hidden, h.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
-                );
-            },
+            } else {
+                unreachable;
+            }
+        } else {
+            switch (self.weights) {
+                .f32 => |f| {
+                    output = try transformer.transformerStackBatched(
+                        Tensor, scratch, &hidden, f.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
+                    );
+                },
+                .q8k => |q| {
+                    output = try transformer.transformerStackBatched(
+                        QuantizedTensorQ8K, scratch, &hidden, q.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
+                    );
+                },
+                .f16 => |h| {
+                    output = try transformer.transformerStackBatched(
+                        F16Tensor, scratch, &hidden, h.blocks, transformer_config, batch_size, max_seq_len, sentence_lengths,
+                    );
+                },
+            }
         }
 
         return output;

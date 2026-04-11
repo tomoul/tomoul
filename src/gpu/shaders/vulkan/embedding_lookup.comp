@@ -1,0 +1,36 @@
+#version 450
+
+// Embedding Lookup + Sum
+// output[t, d] = word_emb[token_id[t], d] + pos_emb[pos_id[t], d] + type_emb[type_id[t], d]
+//
+// ids buffer layout: [0..seq_len) = token_ids, [seq_len..2*seq_len) = pos_ids, [2*seq_len..3*seq_len) = type_ids
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Ids { uint ids[]; };
+layout(set = 0, binding = 1) readonly buffer WordEmb { float word_emb[]; };
+layout(set = 0, binding = 2) readonly buffer PosEmb { float pos_emb[]; };
+layout(set = 0, binding = 3) readonly buffer TypeEmb { float type_emb[]; };
+layout(set = 0, binding = 4) writeonly buffer Output { float output_buf[]; };
+
+layout(push_constant) uniform Params {
+    uint seq_len;
+    uint hidden_dim;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = seq_len * hidden_dim;
+    if (idx >= total) return;
+
+    uint row = idx / hidden_dim;
+    uint col = idx % hidden_dim;
+
+    uint token_id = ids[row];
+    uint pos_id = ids[seq_len + row];
+    uint type_id = ids[2 * seq_len + row];
+
+    output_buf[idx] = word_emb[token_id * hidden_dim + col]
+                    + pos_emb[pos_id * hidden_dim + col]
+                    + type_emb[type_id * hidden_dim + col];
+}

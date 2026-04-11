@@ -409,6 +409,173 @@ pub fn build(b: *std.Build) void {
     st_test_step.dependOn(&run_st_tests.step);
 
     // ==========================================================================
+    // GPU HAL (Hardware Abstraction Layer) + Vulkan Backend
+    // ==========================================================================
+    {
+        // --- Runtime Vulkan loader (dlopen — zero link-time dependency) ---
+        const vk_loader_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vk_loader.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // needed for dlopen to search standard library paths
+        });
+
+        // --- Low-level Vulkan wrapper (uses vk_loader at runtime) ---
+        const vulkan_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vulkan.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        vulkan_module.addImport("vk_loader", vk_loader_module);
+
+        // --- Vulkan forward pass (embeds SPIR-V shaders via @embedFile) ---
+        const vulkan_forward_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vulkan_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        vulkan_forward_module.addImport("vulkan", vulkan_module);
+
+        // --- HAL interface (backend-agnostic) ---
+        const hal_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/hal.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        // --- Vulkan backend (implements HAL for Linux/Windows/Android) ---
+        const vulkan_backend_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vulkan_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        vulkan_backend_module.addImport("vulkan_forward", vulkan_forward_module);
+
+        // --- Metal low-level wrapper (Obj-C runtime, zero link-time Metal dep) ---
+        const metal_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/metal.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // needed for dlopen + libobjc
+        });
+        // Only link libobjc on Apple platforms (Metal is dead code elsewhere)
+        const os_tag = target.query.os_tag orelse @import("builtin").os.tag;
+        if (os_tag == .macos or os_tag == .ios) {
+            metal_module.linkSystemLibrary("objc", .{}); // for objc_msgSend, sel_registerName, objc_getClass
+        }
+
+        // --- Metal forward pass (embeds MSL shaders via @embedFile) ---
+        const metal_forward_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/metal_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        metal_forward_module.addImport("metal", metal_module);
+
+        // --- Metal backend (implements HAL for macOS/iOS) ---
+        const metal_backend_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/metal_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        metal_backend_module.addImport("metal_forward", metal_forward_module);
+
+        // --- WebGPU low-level bridge (extern JS imports for WASM) ---
+        const webgpu_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/webgpu.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        // --- WebGPU forward pass (embeds WGSL shaders via @embedFile) ---
+        const webgpu_forward_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/webgpu_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        webgpu_forward_module.addImport("webgpu", webgpu_module);
+
+        // --- WebGPU backend (implements HAL for WASM/browser) ---
+        const webgpu_backend_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/webgpu_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        webgpu_backend_module.addImport("webgpu_forward", webgpu_forward_module);
+
+        // HAL imports all backends for auto-detection
+        hal_module.addImport("vulkan_backend", vulkan_backend_module);
+        hal_module.addImport("vulkan_forward", vulkan_forward_module);
+        hal_module.addImport("metal_backend", metal_backend_module);
+        hal_module.addImport("metal_forward", metal_forward_module);
+        hal_module.addImport("webgpu_backend", webgpu_backend_module);
+        hal_module.addImport("webgpu_forward", webgpu_forward_module);
+
+        // Basic Vulkan compute tests (vec_add, sgemm)
+        const gpu_test_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_vulkan_compute.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_test_module.addImport("vulkan", vulkan_module);
+
+        const gpu_tests = b.addTest(.{
+            .root_module = gpu_test_module,
+        });
+
+        const run_gpu_tests = b.addRunArtifact(gpu_tests);
+        const gpu_test_step = b.step("test-gpu", "Run Vulkan GPU compute tests");
+        gpu_test_step.dependOn(&run_gpu_tests.step);
+
+        // GPU forward pass tests (layernorm, gelu, attention, full forward)
+        const gpu_fwd_test_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_gpu_forward.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_fwd_test_module.addImport("vulkan", vulkan_module);
+        gpu_fwd_test_module.addImport("vulkan_forward", vulkan_forward_module);
+
+        const gpu_fwd_tests = b.addTest(.{
+            .root_module = gpu_fwd_test_module,
+        });
+
+        const run_gpu_fwd_tests = b.addRunArtifact(gpu_fwd_tests);
+        const gpu_fwd_test_step = b.step("test-gpu-forward", "Run GPU forward pass tests");
+        gpu_fwd_test_step.dependOn(&run_gpu_fwd_tests.step);
+        gpu_test_step.dependOn(&run_gpu_fwd_tests.step);
+
+        // GPU model wrapper (uses HAL auto-detection)
+        const gpu_model_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/gpu_model.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_model_module.addImport("hal", hal_module);
+        gpu_model_module.addImport("model", st_model_module);
+        gpu_model_module.addImport("tokenizer", st_tokenizer_module);
+        gpu_model_module.addImport("transformer", transformer_module);
+
+        // GPU vs CPU model test (loads real weights)
+        const gpu_model_test_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_gpu_model.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        gpu_model_test_module.addImport("gpu_model", gpu_model_module);
+        gpu_model_test_module.addImport("model", st_model_module);
+        gpu_model_test_module.addImport("tokenizer", st_tokenizer_module);
+
+        const gpu_model_tests = b.addTest(.{
+            .root_module = gpu_model_test_module,
+        });
+
+        const run_gpu_model_tests = b.addRunArtifact(gpu_model_tests);
+        const gpu_model_test_step = b.step("test-gpu-model", "Run GPU vs CPU model comparison tests");
+        gpu_model_test_step.dependOn(&run_gpu_model_tests.step);
+    }
+
+    // ==========================================================================
     // WebAssembly targets (data-driven from model_registry.zig)
     // ==========================================================================
     const wasm_target = b.resolveTargetQuery(.{
@@ -599,10 +766,74 @@ fn buildWasmModel(
     wasm_binding.addImport("tensor", wasm_tensor_module);
     wasm_binding.addImport("model", wasm_model_module);
 
+    // =========================================================================
+    // GPU modules for WASM (WebGPU acceleration via JS bridge)
+    // =========================================================================
+
+    // Tokenizer module (needed by gpu_model)
+    const wasm_tokenizer_module = b.createModule(.{
+        .root_source_file = b.path("src/models/sentence_transformer/tokenizer.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_model_module.addImport("tokenizer.zig", wasm_tokenizer_module);
+
+    // WebGPU modules (active on wasm32)
+    // Note: Vulkan and Metal modules are NOT built for wasm32 — they contain
+    // platform-specific code (objc_msgSend @ptrCast, Vulkan loaders) that
+    // triggers LLVM Invalid Cast errors on 32-bit targets (Zig issue #24345).
+    const wasm_webgpu_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    const wasm_webgpu_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu_forward.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_webgpu_forward_module.addImport("webgpu", wasm_webgpu_module);
+
+    const wasm_webgpu_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu_backend.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_webgpu_backend_module.addImport("webgpu_forward", wasm_webgpu_forward_module);
+
+    // HAL interface (auto-detects WebGPU on wasm32-freestanding)
+    const wasm_hal_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/hal.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_hal_module.addImport("webgpu_backend", wasm_webgpu_backend_module);
+    wasm_hal_module.addImport("webgpu_forward", wasm_webgpu_forward_module);
+
+    // GPU model wrapper (uses HAL auto-detection)
+    const wasm_gpu_model_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/gpu_model.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_gpu_model_module.addImport("hal", wasm_hal_module);
+    wasm_gpu_model_module.addImport("model", wasm_model_module);
+    wasm_gpu_model_module.addImport("tokenizer", wasm_tokenizer_module);
+    wasm_gpu_model_module.addImport("transformer", wasm_transformer_module);
+
+    wasm_binding.addImport("gpu_model", wasm_gpu_model_module);
+
     // Embed model weights if bundled
+    // For WASM, prefer Q8K variant if available (smaller download, fits in less memory)
     if (model.supports_bundled) {
+        const wasm_weights = blk: {
+            for (model.weight_variants) |v| {
+                if (std.mem.eql(u8, v.suffix, "-q8k")) break :blk v.path;
+            }
+            break :blk weights_path;
+        };
         wasm_binding.addAnonymousImport("model_weights", .{
-            .root_source_file = b.path(weights_path),
+            .root_source_file = b.path(wasm_weights),
         });
     }
 
@@ -751,6 +982,127 @@ fn buildNativeLib(
     const options = b.addOptions();
     options.addOption(bool, "embed_weights", bundled and model.supports_bundled);
 
+    // =========================================================================
+    // GPU modules for native lib (Vulkan/Metal acceleration)
+    // =========================================================================
+
+    // Tokenizer module (needed by model.zig as @import("tokenizer.zig") and by gpu_model separately)
+    const lib_tokenizer_module = b.createModule(.{
+        .root_source_file = b.path("src/models/sentence_transformer/tokenizer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Wire tokenizer into model module so model.zig's @import("tokenizer.zig") resolves to the module
+    model_module.addImport("tokenizer.zig", lib_tokenizer_module);
+
+    // Runtime Vulkan loader (dlopen — zero link-time dependency)
+    const lib_vk_loader_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vk_loader.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // Low-level Vulkan wrapper
+    const lib_vulkan_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vulkan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_vulkan_module.addImport("vk_loader", lib_vk_loader_module);
+
+    // Vulkan forward pass (embeds SPIR-V shaders)
+    const lib_vulkan_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vulkan_forward.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_vulkan_forward_module.addImport("vulkan", lib_vulkan_module);
+
+    // Vulkan backend (implements HAL)
+    const lib_vulkan_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vulkan_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_vulkan_backend_module.addImport("vulkan_forward", lib_vulkan_forward_module);
+
+    // --- Metal low-level wrapper (Obj-C runtime, zero link-time Metal dep) ---
+    const lib_metal_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/metal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // Only link libobjc on Apple platforms (Metal is dead code elsewhere)
+    const lib_os_tag = target.query.os_tag orelse @import("builtin").os.tag;
+    if (lib_os_tag == .macos or lib_os_tag == .ios) {
+        lib_metal_module.linkSystemLibrary("objc", .{});
+    }
+
+    // --- Metal forward pass (embeds MSL shaders via @embedFile) ---
+    const lib_metal_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/metal_forward.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_metal_forward_module.addImport("metal", lib_metal_module);
+
+    // --- Metal backend (implements HAL for macOS/iOS) ---
+    const lib_metal_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/metal_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_metal_backend_module.addImport("metal_forward", lib_metal_forward_module);
+
+    // --- WebGPU low-level bridge (extern JS imports for WASM) ---
+    const lib_webgpu_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // --- WebGPU forward pass (embeds WGSL shaders via @embedFile) ---
+    const lib_webgpu_forward_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu_forward.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_webgpu_forward_module.addImport("webgpu", lib_webgpu_module);
+
+    // --- WebGPU backend (implements HAL for WASM/browser) ---
+    const lib_webgpu_backend_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/webgpu_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_webgpu_backend_module.addImport("webgpu_forward", lib_webgpu_forward_module);
+
+    // HAL interface (backend-agnostic)
+    const lib_hal_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/hal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_hal_module.addImport("vulkan_backend", lib_vulkan_backend_module);
+    lib_hal_module.addImport("vulkan_forward", lib_vulkan_forward_module);
+    lib_hal_module.addImport("metal_backend", lib_metal_backend_module);
+    lib_hal_module.addImport("metal_forward", lib_metal_forward_module);
+    lib_hal_module.addImport("webgpu_backend", lib_webgpu_backend_module);
+    lib_hal_module.addImport("webgpu_forward", lib_webgpu_forward_module);
+
+    // GPU model wrapper (uses HAL auto-detection)
+    const lib_gpu_model_module = b.createModule(.{
+        .root_source_file = b.path("src/gpu/gpu_model.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_gpu_model_module.addImport("hal", lib_hal_module);
+    lib_gpu_model_module.addImport("model", model_module);
+    lib_gpu_model_module.addImport("tokenizer", lib_tokenizer_module);
+    lib_gpu_model_module.addImport("transformer", transformer_module);
+
     // Helper to configure a C binding module
     const configureBindingModule = struct {
         fn configure(
@@ -809,6 +1161,9 @@ fn buildNativeLib(
         });
     }
 
+    // Add GPU module to static lib binding
+    c_binding_module.addImport("gpu_model", lib_gpu_model_module);
+
     // Build static library
     const lib_name = b.fmt("tomoul_{s}", .{model.name});
     const static_lib = b.addLibrary(.{
@@ -845,6 +1200,9 @@ fn buildNativeLib(
             .root_source_file = b.path(vp),
         });
     }
+
+    // Add GPU module to shared lib binding
+    c_binding_module_shared.addImport("gpu_model", lib_gpu_model_module);
 
     const shared_lib = b.addLibrary(.{
         .linkage = .dynamic,
