@@ -58,6 +58,65 @@ Tomoul Vulkan is within **1.2× of PyTorch CUDA** on single inference while usin
 
 **Key advantage:** Vulkan runs on any GPU with a Vulkan driver (NVIDIA, AMD, Intel) — no CUDA toolkit required. The entire Tomoul runtime is a **14 MB DLL** vs ~2 GB for PyTorch + CUDA.
 
+### GPU Correctness — Windows (RTX 4090) — April 2026
+
+Validated on NVIDIA GeForce RTX 4090, Zig 0.15.2, Vulkan 1.3:
+
+**Kernel tests** (synthetic weights, `zig build test-gpu-forward`):
+
+| Kernel | Max Error vs CPU | Status |
+|---|---|---|
+| LayerNorm | 2.38e-7 | PASS |
+| GELU | 4.77e-7 | PASS |
+| Attention | 5.96e-8 | PASS |
+| End-to-end forward (1 layer, hidden=8) | 2.98e-8 | PASS |
+
+**Model tests** (real weights, `zig build test-gpu-model`):
+
+| Test | Sentence | Cosine Sim (GPU vs CPU) | Max Abs Diff | Status |
+|---|---|---|---|---|
+| F32 | "Hello world" | 0.9891 | 0.0220 | PASS |
+| F32 | "The quick brown fox jumps over the lazy dog" | 0.9865 | 0.0287 | PASS |
+| F32 | "Machine learning models can run on GPUs..." | 0.9862 | 0.0301 | PASS |
+| F32 | "Zig is a systems programming language" | 0.9884 | 0.0263 | PASS |
+| F32 | "Vulkan compute shaders enable general-purpose GPU..." | 0.9865 | 0.0287 | PASS |
+| Q8K | "Hello world" | 0.9884 | 0.0241 | PASS |
+| Q8K | "The quick brown fox jumps over the lazy dog" | 0.9859 | 0.0295 | PASS |
+| Q8K | "Machine learning models can run on GPUs..." | 0.9856 | 0.0312 | PASS |
+| Q8K | "Zig is a systems programming language" | 0.9878 | 0.0274 | PASS |
+| Q8K | "Vulkan compute shaders enable general-purpose GPU..." | 0.9859 | 0.0295 | PASS |
+
+**Batch consistency** (GPU single vs GPU batch — should be identical):
+
+| Sentence | Cosine Sim | Max Abs Diff | Status |
+|---|---|---|---|
+| All 5 sentences | 1.000000 | 0.000000 | PASS |
+
+**Latency** (warm start, 5 iterations):
+
+| Metric | F32 | Q8K |
+|---|---|---|
+| CPU single | 19.01 ms | 12.99 ms |
+| GPU single | 4.18 ms | 4.02 ms |
+| Single speedup | 4.55× | 3.24× |
+| CPU 5-sent sequential | 109.72 ms | 167.04 ms |
+| GPU 5-sent batch | 7.18 ms | 6.64 ms |
+| Batch speedup | 15.28× | 25.15× |
+| GPU per-sentence (batch) | 1.44 ms | 1.33 ms |
+
+### PyTorch Comparison — Windows (RTX 4090) — April 2026
+
+PyTorch 2.6.0+cu124, `sentence-transformers/all-MiniLM-L6-v2`, 10 iterations:
+
+| Engine | Backend | Single (ms) | 5-sent seq (ms) | 10-sent batch (ms) | Per-sent batch (ms) |
+|---|---|---|---|---|---|
+| PyTorch | CPU (MKL) | 6.20 | 27.69 | 11.55 | 1.15 |
+| PyTorch | CUDA (RTX 4090) | 3.64 | 15.99 | 8.48 | 0.85 |
+| **Tomoul** | **Vulkan (RTX 4090)** | **4.02** | **—** | **—** | **1.33** |
+| **Tomoul** | **CPU (Q8K)** | **12.99** | **—** | **—** | **—** |
+
+**Tomoul Vulkan single-sentence is within 1.1× of PyTorch CUDA** (4.02 ms vs 3.64 ms) on the same GPU, using portable compute shaders with zero CUDA dependency.
+
 Q8_K is the recommended variant: **3.6× smaller** model (24 MB vs 87 MB), **2.5× faster** than F32 on CPU, and competitive with PyTorch CUDA on GPU — with negligible accuracy loss (cosine similarity ≥ 0.9997 vs F32).
 
 **Optimizations applied:** arena allocator for inference scratch, fused strided multi-head attention (no per-head copies), vectorized GELU (Padé tanh approximation), SIMD bias addition, in-place layerNorm, zblas skinny-M SGEMM kernel, zblas Q8_K weight-only quantized SGEMM, Vulkan compute shaders with SPIR-V (9 embedded shaders: sgemm_bias, layernorm, gelu, residual_add, attention, embedding_lookup, pool_normalize, attention_batch, pool_normalize_batch). See [zblas](https://github.com/tomoul/zblas) for BLAS-level optimization details.

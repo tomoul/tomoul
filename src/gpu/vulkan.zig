@@ -609,7 +609,7 @@ pub const VulkanContext = struct {
             .pCommandBuffers = @ptrCast(&self.command_buffer),
         };
 
-        if (self.vk.vkQueueSubmit(self.compute_queue, 1, &submit_info, self.fence) != vkl.VK_SUCCESS) {
+        if (self.vk.vkQueueSubmit(self.compute_queue, 1, @ptrCast(&submit_info), self.fence) != vkl.VK_SUCCESS) {
             return VulkanError.QueueSubmitFailed;
         }
 

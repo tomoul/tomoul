@@ -153,7 +153,7 @@ test "gpu layernorm correctness" {
     try ctx.uploadToBuffer(&gamma_buf, std.mem.sliceAsBytes(&gamma));
     try ctx.uploadToBuffer(&beta_buf, std.mem.sliceAsBytes(&beta));
 
-    const spirv = try loadShader("src/gpu/shaders/layernorm.spv");
+    const spirv = try loadShader("src/gpu/shaders/vulkan/layernorm.spv");
     defer std.testing.allocator.free(spirv);
     var pipe = try ctx.createComputePipeline(spirv, 3, 12);
     defer ctx.destroyPipeline(&pipe);
@@ -195,7 +195,7 @@ test "gpu gelu correctness" {
     defer ctx.destroyBuffer(&buf);
     try ctx.uploadToBuffer(&buf, std.mem.sliceAsBytes(&data_gpu));
 
-    const spirv = try loadShader("src/gpu/shaders/gelu.spv");
+    const spirv = try loadShader("src/gpu/shaders/vulkan/gelu.spv");
     defer std.testing.allocator.free(spirv);
     var pipe = try ctx.createComputePipeline(spirv, 1, 4);
     defer ctx.destroyPipeline(&pipe);
@@ -249,7 +249,7 @@ test "gpu attention correctness" {
     try ctx.uploadToBuffer(&k_buf, std.mem.sliceAsBytes(&k_data));
     try ctx.uploadToBuffer(&v_buf, std.mem.sliceAsBytes(&v_data));
 
-    const spirv = try loadShader("src/gpu/shaders/attention.spv");
+    const spirv = try loadShader("src/gpu/shaders/vulkan/attention.spv");
     defer std.testing.allocator.free(spirv);
     var pipe = try ctx.createComputePipeline(spirv, 4, 16);
     defer ctx.destroyPipeline(&pipe);
