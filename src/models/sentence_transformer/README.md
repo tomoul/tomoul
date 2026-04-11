@@ -126,7 +126,38 @@ Tested in Chrome with WebGPU enabled, Q8K weights (25.5 MB WASM binary), 128 MB 
 
 First embedding: `[0.0379, 0.0707, 0.0218, 0.0079, -0.0192, 0.0216, 0.1314, 0.0500, -0.0733, -0.0436, ...]`
 
-> **Note:** Browser WebGPU is ~8× slower per-sentence than native Vulkan (34.7 ms vs 4.02 ms) due to JS↔WASM bridge overhead, WebGPU API abstraction, and lack of persistent command buffers. Still viable for interactive use — 100 ms total for 3 sentences is imperceptible.
+> **Note:** Browser WebGPU is ~8× slower per-sentence than native Vulkan (34.7 ms vs 4.02 ms). CPU WASM would likely be faster for this model size. The overhead comes from:
+> - **Per-dispatch JS round-trips:** Each of the ~30+ dispatches per sentence (6 layers × 5+ ops) creates a new `beginComputePass()`/`end()`, bind group, and uniform buffer through JavaScript
+> - **Uniform buffer allocation:** Every dispatch calls `device.createBuffer()` + `writeBuffer()` for a fresh uniform buffer
+> - **No sentence batching:** Sentences are processed sequentially in a JS `for` loop — no cross-sentence GPU parallelism
+> - **Async readback sync:** `mapAsync()` at the end adds GPU→CPU synchronization latency
+> - **Cold-run costs:** First execution may include pipeline compilation overhead
+>
+> For a model this small (6-layer, 384-dim), the per-dispatch overhead dominates compute. Native Vulkan avoids all of this with direct driver calls and pre-compiled SPIR-V. A CPU-only WASM path would skip GPU round-trips entirely and likely run in ~10-15ms per sentence.
+>
+> **TODO:** Add CPU-only WASM benchmark for comparison and consider batching all dispatches into fewer command buffers.
+
+### GPU (Metal) — macOS — TODO
+
+Metal compute shaders with MSL. Code complete, pending hardware validation on macOS.
+
+**Kernel tests** (`zig build test-gpu-forward` on macOS):
+
+| Kernel | Max Error vs CPU | Status |
+|---|---|---|
+| LayerNorm | — | PENDING |
+| GELU | — | PENDING |
+| Attention | — | PENDING |
+| End-to-end forward | — | PENDING |
+
+**Model tests** (`zig build test-gpu-model` on macOS):
+
+| Test | Weights | Cosine Sim (GPU vs CPU) | GPU Single (ms) | GPU Batch 5-sent (ms) | Status |
+|---|---|---|---|---|---|
+| Metal F32 | F32 | — | — | — | PENDING |
+| Metal Q8K | Q8K | — | — | — | PENDING |
+
+> To run: `zig build test-gpu-forward && zig build test-gpu-model` on a Mac with Metal support. Update this section with results.
 
 ### PyTorch Comparison — Windows (RTX 4090) — April 2026
 
