@@ -64,21 +64,20 @@ export class TomoulWebGpuBridge {
             return false;
         }
 
-        this.adapter = await navigator.gpu.requestAdapter({
-            powerPreference: 'high-performance',
-        });
+        this.adapter = await navigator.gpu.requestAdapter();
 
         if (!this.adapter) {
             console.error('No WebGPU adapter found');
             return false;
         }
 
-        // Request device with maximum buffer size
+        // Request device with maximum buffer size and workgroup storage
         const requiredLimits = {};
         const adapterLimits = this.adapter.limits;
         requiredLimits.maxStorageBufferBindingSize = adapterLimits.maxStorageBufferBindingSize;
         requiredLimits.maxBufferSize = adapterLimits.maxBufferSize;
         requiredLimits.maxComputeWorkgroupsPerDimension = adapterLimits.maxComputeWorkgroupsPerDimension;
+        requiredLimits.maxComputeWorkgroupStorageSize = adapterLimits.maxComputeWorkgroupStorageSize;
 
         this.device = await this.adapter.requestDevice({
             requiredLimits,

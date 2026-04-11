@@ -308,11 +308,11 @@ pub const GpuForward = struct {
             );
         }
 
-        // Submit
-        self.ctx.submit();
-
-        // Readback (JS host ensures GPU work is complete before this returns)
+        // Queue readback BEFORE submit so staging copy is included in the command buffer
         self.ctx.readbackFromBuffer(&self.output_buf, std.mem.sliceAsBytes(output[0..hidden])) catch return WebGpuForwardError.ReadbackFailed;
+
+        // Submit (includes the readback staging copy)
+        self.ctx.submit();
     }
 
     // ====================================================================
@@ -388,9 +388,11 @@ pub const GpuForward = struct {
             );
         }
 
-        // Submit and readback
-        self.ctx.submit();
+        // Queue readback BEFORE submit so staging copy is included in the command buffer
         self.ctx.readbackFromBuffer(&self.batch_output_buf, std.mem.sliceAsBytes(output[0 .. batch_size * hidden])) catch return WebGpuForwardError.ReadbackFailed;
+
+        // Submit (includes the readback staging copy)
+        self.ctx.submit();
     }
 
     // ====================================================================

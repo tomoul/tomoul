@@ -95,10 +95,20 @@
         }
 
         async function gpuEmbed(text) {
+            // Zero output buffer so we can verify GPU actually wrote data
+            const outputPtr = wasmExports.get_output_buffer_ptr();
+            new Float32Array(wasmExports.memory.buffer, outputPtr, 384).fill(0);
+
             const len = writeText(wasmExports, text);
             const dim = wasmExports.gpu_embed(len);
             if (dim === 0) throw new Error('gpu_embed() returned 0');
+
+            // Explicit GPU fence — wait for ALL submitted GPU work to complete.
+            // mapAsync alone can resolve without a full event-loop round-trip in
+            // tight benchmark loops, giving artificially low timings.
+            await bridge.device.queue.onSubmittedWorkDone();
             await bridge.fulfillReadbacks();
+
             return readEmbedding(wasmExports);
         }
 
@@ -350,7 +360,31 @@
                     const gpuEmb = await gpuEmbed(sentence);
                     const cos = cosineSim(cpuEmb, gpuEmb);
                     const ok = cos > 0.99;
-                    log(`  "${truncate(sentence, 40)}": cos=${cos.toFixed(6)} ${ok ? '✓ PASS' : '✗ FAIL'}`);
+                    const norm = Math.sqrt(gpuEmb.reduce((s, v) => s + v * v, 0));
+                    log(`  "${truncate(sentence, 40)}": cos=${cos.toFixed(6)} norm=${norm.toFixed(4)} ${ok ? '✓ PASS' : '✗ FAIL'}`);
+                }
+
+                // GPU timing breakdown
+                log(`\n${'═'.repeat(60)}`);
+                log(`  GPU Timing Breakdown`);
+                log(`${'═'.repeat(60)}\n`);
+                const testSent = SENTENCES[0];
+                for (let trial = 0; trial < 3; trial++) {
+                    const outputPtr = wasmExports.get_output_buffer_ptr();
+                    new Float32Array(wasmExports.memory.buffer, outputPtr, 384).fill(0);
+
+                    const t0 = performance.now();
+                    const len = writeText(wasmExports, testSent);
+                    const dim = wasmExports.gpu_embed(len);
+                    const t1 = performance.now();
+                    await bridge.device.queue.onSubmittedWorkDone();
+                    const t2 = performance.now();
+                    await bridge.fulfillReadbacks();
+                    const t3 = performance.now();
+
+                    const emb = readEmbedding(wasmExports);
+                    const n = Math.sqrt(emb.reduce((s, v) => s + v * v, 0));
+                    log(`  Trial ${trial + 1}: record=${(t1-t0).toFixed(2)}ms  gpuWait=${(t2-t1).toFixed(2)}ms  readback=${(t3-t2).toFixed(2)}ms  total=${(t3-t0).toFixed(2)}ms  norm=${n.toFixed(4)}`);
                 }
             }
 

@@ -31,8 +31,9 @@ const vocab_bytes = @embedFile("vocab");
 
 // Static heap — Q8K: dequantized word embeddings ~45MB, Q8K blocks ~12MB,
 // tokenizer ~3MB, other embeddings ~1MB, inference scratch ~2MB ≈ ~63MB peak.
+// GPU init (gpu_embed path) dequantizes Q8K→F32 for upload: +~87MB.
 // FixedBufferAllocator can't reclaim freed temps, so need headroom.
-var heap: [128 * 1024 * 1024]u8 = undefined;
+var heap: [256 * 1024 * 1024]u8 = undefined;
 var fba = std.heap.FixedBufferAllocator.init(&heap);
 const allocator = fba.allocator();
 
@@ -175,6 +176,11 @@ export fn gpu_is_active() u32 {
 /// Embed text using the GPU backend.
 /// text_len: Number of UTF-8 bytes in the input buffer.
 /// Returns: EMBEDDING_DIM (384) on success, 0 on error.
+///
+/// NOTE: For the WebGPU path, we call backend.forward() directly with
+/// output_buffer as the readback target. This ensures the readback writes
+/// to a stable address in WASM linear memory (not a stack-local that
+/// vanishes before the JS fulfillReadbacks() runs).
 export fn gpu_embed(text_len: usize) u32 {
     if (!gpu_initialized) return 0;
     if (text_len == 0 or text_len > MAX_INPUT_BYTES) return 0;
@@ -184,11 +190,15 @@ export fn gpu_embed(text_len: usize) u32 {
 
     const input_text = input_buffer[0..text_len];
 
-    const embedding = gpu_instance.?.embed(&model_instance.?.tokenizer, input_text) catch {
-        return 0;
-    };
+    // Tokenize using the CPU tokenizer
+    var enc = model_instance.?.tokenizer.encode(input_text) catch return 0;
+    defer enc.deinit(allocator);
 
-    @memcpy(&output_buffer, &embedding);
+    // Forward directly into output_buffer — the readback target must be
+    // a persistent address so the JS bridge can write GPU results there
+    // asynchronously via fulfillReadbacks().
+    gpu_instance.?.backend.forward(enc.input_ids, &output_buffer) catch return 0;
+
     return EMBEDDING_DIM;
 }
 
