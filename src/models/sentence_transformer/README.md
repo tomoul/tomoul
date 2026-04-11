@@ -104,17 +104,17 @@ Validated on NVIDIA GeForce RTX 4090, Zig 0.15.2, Vulkan 1.3:
 | Batch speedup | 15.28× | 25.15× |
 | GPU per-sentence (batch) | 1.44 ms | 1.33 ms |
 
-### WebGPU (Browser) — Windows (RTX 4090) — April 2026
+### Browser (WASM) — Windows (RTX 4090) — April 2026
 
-Tested in Chrome, Q8K weights (25.5 MB WASM binary), 128 MB heap, 10 iterations (2 warmup):
+Tested in Chrome 146, Q8K weights (25.5 MB WASM binary), 128 MB heap, 3 warmup, 10 iterations:
 
 | Backend | Single (ms) | 3-sent (ms) | Per-sent (ms) | vs Native Vulkan |
 |---|---|---|---|---|
-| **CPU WASM** | **20.77** | **64.50** | **21.50** | 5.2× slower |
-| WebGPU | 34.70 | 104.00 | 34.70 | 8.6× slower |
+| **CPU WASM** | **21.03** | **62.60** | **20.87** | 5.2× slower |
 | Native Vulkan (Q8K) | 4.02 | 6.64 | 1.33 | baseline |
+| Native CPU (Q8K) | 12.99 | — | — | 3.2× slower |
 
-**CPU WASM is 1.7× faster than WebGPU** for this model. For a 6-layer, 384-dim encoder, the compute is too small to amortize WebGPU's per-dispatch overhead (~30+ JS round-trips per sentence).
+**WebGPU `gpu_init()` OOMs** — the 128 MB WASM heap uses 108.6 MB after CPU model init, leaving only 19.4 MB free. GPU init needs to dequantize Q8K→F32 for upload (~87 MB), which exceeds available heap. Needs 256 MB+ heap to run both paths. The earlier webgpu.html demo (34.7 ms) was actually calling CPU `embed()` with bridge overhead, not true GPU inference.
 
 **Similarity matrix** (3 test sentences, CPU WASM):
 
@@ -124,7 +124,9 @@ Tested in Chrome, Q8K weights (25.5 MB WASM binary), 128 MB heap, 10 iterations 
 | Machine learning is... | 0.995 | 1.000 | 0.973 |
 | I had pizza for lunc... | 0.949 | 0.973 | 1.000 |
 
-> **Why WebGPU is slower:** Each of the ~30+ dispatches per sentence creates a new `beginComputePass()`/`end()`, bind group, and uniform buffer through JavaScript. The per-dispatch overhead dominates the actual compute. For larger models (Qwen 2.5 3B: 36 layers, 2048-dim), WebGPU will outperform CPU WASM as the compute-to-overhead ratio inverts.
+> **WASM CPU is 5.2× slower than native Vulkan** and 1.6× slower than native CPU. The gap is due to wasm32 lacking SIMD vectorization used by zblas (no `@Vector` hardware acceleration) and FixedBufferAllocator overhead. For interactive browser use, 21 ms per sentence is still fast enough — below the 100 ms perceptual threshold for 5 sentences.
+>
+> **TODO:** Test with 256 MB heap to enable `gpu_init()` and benchmark actual WebGPU `gpu_embed()` compute path. For larger models (Qwen 2.5 3B), WebGPU will be essential.
 
 ### GPU (Metal) — macOS — TODO
 
