@@ -251,13 +251,13 @@ pub const VulkanContext = struct {
         const pool_sizes = [_]vkl.VkDescriptorPoolSize{
             .{
                 .type = vkl.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .descriptorCount = 512,
+                .descriptorCount = 4096,
             },
         };
 
         const desc_pool_info = vkl.VkDescriptorPoolCreateInfo{
             .flags = vkl.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 128,
+            .maxSets = 1024,
             .poolSizeCount = pool_sizes.len,
             .pPoolSizes = &pool_sizes,
         };
@@ -374,6 +374,72 @@ pub const VulkanContext = struct {
     pub fn destroyBuffer(self: *Self, buf: *const GpuBuffer) void {
         self.vk.vkDestroyBuffer(self.device, buf.buffer, null);
         self.vk.vkFreeMemory(self.device, buf.memory, null);
+    }
+
+    /// Upload data to a device-local buffer via a temporary host-visible staging buffer.
+    /// Returns the device-local GPU buffer (caller must destroyBuffer when done).
+    pub fn uploadToDeviceBuffer(self: *Self, size: usize, data: []const u8) VulkanError!GpuBuffer {
+        // 1. Create host-visible staging buffer (TRANSFER_SRC)
+        var staging = try self.createBuffer(
+            size,
+            vkl.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            true,
+        );
+        defer self.destroyBuffer(&staging);
+
+        // 2. Upload data to staging buffer via map/memcpy/unmap
+        try self.uploadToBuffer(&staging, data);
+
+        // 3. Create device-local buffer (STORAGE_BUFFER | TRANSFER_DST)
+        var device_buf = try self.createBuffer(
+            size,
+            vkl.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vkl.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            false,
+        );
+        errdefer self.destroyBuffer(&device_buf);
+
+        // 4. Record and execute copy command
+        _ = self.vk.vkResetCommandBuffer(self.command_buffer, 0);
+
+        const begin_info = vkl.VkCommandBufferBeginInfo{
+            .flags = vkl.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        if (self.vk.vkBeginCommandBuffer(self.command_buffer, &begin_info) != vkl.VK_SUCCESS) {
+            return VulkanError.CommandBufferBeginFailed;
+        }
+
+        const copy_region = vkl.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = @intCast(size),
+        };
+        self.vk.vkCmdCopyBuffer(
+            self.command_buffer,
+            staging.buffer,
+            device_buf.buffer,
+            1,
+            @ptrCast(&copy_region),
+        );
+
+        if (self.vk.vkEndCommandBuffer(self.command_buffer) != vkl.VK_SUCCESS) {
+            return VulkanError.CommandBufferEndFailed;
+        }
+
+        // 5. Submit and wait for completion
+        _ = self.vk.vkResetFences(self.device, 1, @ptrCast(&self.fence));
+
+        const submit_info = vkl.VkSubmitInfo{
+            .commandBufferCount = 1,
+            .pCommandBuffers = @ptrCast(&self.command_buffer),
+        };
+        if (self.vk.vkQueueSubmit(self.compute_queue, 1, @ptrCast(&submit_info), self.fence) != vkl.VK_SUCCESS) {
+            return VulkanError.QueueSubmitFailed;
+        }
+        if (self.vk.vkWaitForFences(self.device, 1, @ptrCast(&self.fence), vkl.VK_TRUE, std.math.maxInt(u64)) != vkl.VK_SUCCESS) {
+            return VulkanError.FenceWaitFailed;
+        }
+
+        return device_buf;
     }
 
     fn findMemoryType(self: *const Self, type_filter: u32, properties: vkl.VkMemoryPropertyFlags) ?u32 {
@@ -700,6 +766,104 @@ pub const VulkanContext = struct {
         }
 
         self.vk.vkCmdDispatch(self.command_buffer, group_count_x, group_count_y, group_count_z);
+    }
+
+    /// Record a compute dispatch WITHOUT a preceding memory barrier.
+    /// Use when consecutive dispatches have no data dependency (e.g. parallel projections).
+    pub fn cmdDispatchNoBarrier(
+        self: *Self,
+        pipe: *const ComputePipeline,
+        descriptor_set: vkl.VkDescriptorSet,
+        group_count_x: u32,
+        group_count_y: u32,
+        group_count_z: u32,
+        push_constants: ?[]const u8,
+    ) void {
+        self.vk.vkCmdBindPipeline(self.command_buffer, vkl.VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
+        self.vk.vkCmdBindDescriptorSets(
+            self.command_buffer,
+            vkl.VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipe.layout,
+            0,
+            1,
+            @ptrCast(&descriptor_set),
+            0,
+            null,
+        );
+
+        if (push_constants) |pc| {
+            self.vk.vkCmdPushConstants(
+                self.command_buffer,
+                pipe.layout,
+                vkl.VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                @intCast(pc.len),
+                pc.ptr,
+            );
+        }
+
+        self.vk.vkCmdDispatch(self.command_buffer, group_count_x, group_count_y, group_count_z);
+    }
+
+    /// Record a buffer-to-buffer copy into the current command buffer (no submit).
+    /// Inserts a compute→transfer barrier so prior shader writes to `src` are visible,
+    /// and a transfer→compute barrier so subsequent dispatches can read `dst`.
+    /// Use this to snapshot a GPU-resident buffer (e.g. residual capture) without
+    /// an intervening host round-trip.
+    pub fn cmdCopyBuffer(
+        self: *Self,
+        src: *const GpuBuffer,
+        dst: *const GpuBuffer,
+        size: usize,
+    ) void {
+        // Barrier 1: ensure any prior shader writes to src are flushed before the copy reads them
+        const pre_barrier = vkl.VkMemoryBarrier{
+            .srcAccessMask = vkl.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vkl.VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        self.vk.vkCmdPipelineBarrier(
+            self.command_buffer,
+            vkl.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vkl.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            1,
+            @ptrCast(&pre_barrier),
+            0,
+            null,
+            0,
+            null,
+        );
+
+        const region = vkl.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = @intCast(size),
+        };
+        self.vk.vkCmdCopyBuffer(
+            self.command_buffer,
+            src.buffer,
+            dst.buffer,
+            1,
+            @ptrCast(&region),
+        );
+
+        // Barrier 2: ensure copy writes to dst are visible to subsequent shaders
+        const post_barrier = vkl.VkMemoryBarrier{
+            .srcAccessMask = vkl.VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = vkl.VK_ACCESS_SHADER_READ_BIT | vkl.VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        self.vk.vkCmdPipelineBarrier(
+            self.command_buffer,
+            vkl.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            vkl.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            1,
+            @ptrCast(&post_barrier),
+            0,
+            null,
+            0,
+            null,
+        );
     }
 
     /// End recording and submit the command buffer, then wait for completion.

@@ -1,0 +1,55 @@
+#version 450
+
+// RMSNorm Compute Shader (in-place):
+//   x[i] = x[i] * w[i] / sqrt(mean(x*x) + eps)
+//
+// Phase 3 / 2B: bit-exact match to CPU.
+//   - Uses 1.0 / sqrt(...) instead of inversesqrt() — on NVIDIA the latter
+//     is RSQ.APPROX which drifts ~1e-6 and cascades through softmax,
+//     breaking bit-exactness with the CPU path.
+//   - 256-thread workgroup, classic shared-memory tree reduction
+//     (subgroup intrinsics not supported by @webgpu/glslang WASM).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer          VecX { float x[]; };
+layout(set = 0, binding = 1) readonly buffer VecW { float w[]; };
+
+layout(push_constant) uniform Params {
+    uint  N;
+    float eps;
+};
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Per-thread sum of squares
+    float sum = 0.0;
+    for (uint i = tid; i < N; i += 256) {
+        float v = x[i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    barrier();
+
+    // Tree reduction
+    if (tid < 128) sdata[tid] += sdata[tid + 128]; barrier();
+    if (tid <  64) sdata[tid] += sdata[tid +  64]; barrier();
+    if (tid <  32) sdata[tid] += sdata[tid +  32]; barrier();
+    if (tid <  16) sdata[tid] += sdata[tid +  16]; barrier();
+    if (tid <   8) sdata[tid] += sdata[tid +   8]; barrier();
+    if (tid <   4) sdata[tid] += sdata[tid +   4]; barrier();
+    if (tid <   2) sdata[tid] += sdata[tid +   2]; barrier();
+    if (tid <   1) sdata[tid] += sdata[tid +   1];
+    barrier();
+
+    float total = sdata[0];
+    // Bit-exact match to CPU: 1.0/sqrt(x), NOT inversesqrt(x)
+    float scale = 1.0 / sqrt(total / float(N) + eps);
+
+    for (uint i = tid; i < N; i += 256) {
+        x[i] = x[i] * w[i] * scale;
+    }
+}

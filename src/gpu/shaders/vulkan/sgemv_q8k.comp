@@ -1,0 +1,107 @@
+#version 450
+
+// SGEMV with Q8K-direct dequantization: y = dequant(A) @ x
+// One workgroup per output row.
+//
+// Phase 3 optimization:
+//   - uvec4 weight loads (16 packed weights = 16 bytes, exactly half a Q8K block)
+//   - vec4  input loads (4 floats = 16 bytes)
+//   - dot() FMAs across 4-wide vectors
+//   - shared-memory tree reduction (subgroup intrinsics not supported by
+//     @webgpu/glslang WASM)
+//
+// Q8K format:
+//   - A_packed: M*N int8 weights, packed 4 per uint (so M*N/4 uints,
+//     M*N/16 uvec4)
+//   - scales:   one f32 scale per block of 32 weights
+//   - Each uvec4 covers 16 weights = first or second half of a 32-weight block.
+//     Block index = uvec4_index >> 1.
+//
+// Buffer reinterpretation: same VkBuffers as the original uint/float layout,
+// just typed as uvec4/vec4. Vulkan SSBOs are 16-byte aligned by default.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer  MatA   { uvec4 A4[]; };
+layout(set = 0, binding = 1) readonly buffer  Scales { float scales[]; };
+layout(set = 0, binding = 2) readonly buffer  VecX   { vec4  x4[]; };
+layout(set = 0, binding = 3) writeonly buffer VecY   { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;              // must be multiple of 32
+    uint blocks_per_row; // = N / 32
+};
+
+shared float sdata[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+
+    uint scale_base    = row * blocks_per_row;
+    uint uvec4_per_row = N >> 4;            // N/16 uvec4 per row
+    uint base_uvec4    = row * uvec4_per_row;
+
+    float sum = 0.0;
+    for (uint u = tid; u < uvec4_per_row; u += 256) {
+        uvec4 packed4 = A4[base_uvec4 + u];
+
+        // Both halves of a 32-weight block share the same scale.
+        uint  block_idx = u >> 1;
+        float scale     = scales[scale_base + block_idx];
+
+        // Load matching 16 floats of input (4 vec4s).
+        uint xb4 = u << 2;
+        vec4 xa = x4[xb4 + 0];
+        vec4 xb = x4[xb4 + 1];
+        vec4 xc = x4[xb4 + 2];
+        vec4 xd = x4[xb4 + 3];
+
+        // Sign-extend 4 packed int8 per uint into vec4.
+        int p0 = int(packed4.x);
+        vec4 wa = vec4(
+            bitfieldExtract(p0,  0, 8),
+            bitfieldExtract(p0,  8, 8),
+            bitfieldExtract(p0, 16, 8),
+            bitfieldExtract(p0, 24, 8));
+        int p1 = int(packed4.y);
+        vec4 wb = vec4(
+            bitfieldExtract(p1,  0, 8),
+            bitfieldExtract(p1,  8, 8),
+            bitfieldExtract(p1, 16, 8),
+            bitfieldExtract(p1, 24, 8));
+        int p2 = int(packed4.z);
+        vec4 wc = vec4(
+            bitfieldExtract(p2,  0, 8),
+            bitfieldExtract(p2,  8, 8),
+            bitfieldExtract(p2, 16, 8),
+            bitfieldExtract(p2, 24, 8));
+        int p3 = int(packed4.w);
+        vec4 wd = vec4(
+            bitfieldExtract(p3,  0, 8),
+            bitfieldExtract(p3,  8, 8),
+            bitfieldExtract(p3, 16, 8),
+            bitfieldExtract(p3, 24, 8));
+
+        float partial = dot(wa, xa) + dot(wb, xb) + dot(wc, xc) + dot(wd, xd);
+        sum += scale * partial;
+    }
+
+    sdata[tid] = sum;
+    barrier();
+
+    // Tree reduction
+    if (tid < 128) sdata[tid] += sdata[tid + 128]; barrier();
+    if (tid <  64) sdata[tid] += sdata[tid +  64]; barrier();
+    if (tid <  32) sdata[tid] += sdata[tid +  32]; barrier();
+    if (tid <  16) sdata[tid] += sdata[tid +  16]; barrier();
+    if (tid <   8) sdata[tid] += sdata[tid +   8]; barrier();
+    if (tid <   4) sdata[tid] += sdata[tid +   4]; barrier();
+    if (tid <   2) sdata[tid] += sdata[tid +   2]; barrier();
+    if (tid <   1) sdata[tid] += sdata[tid +   1];
+
+    if (tid == 0) y[row] = sdata[0];
+}

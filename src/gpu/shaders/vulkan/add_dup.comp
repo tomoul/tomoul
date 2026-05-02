@@ -1,0 +1,28 @@
+#version 450
+
+// Add + Duplicate:
+//   v = a[i] + b[i]
+//   hidden[i]   = v
+//   residual[i] = v
+//
+// Used to combine "post-attention residual add" with "save for FFN residual"
+// into a single dispatch (eliminates a buffer copy / readback round-trip).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Hidden    { float hidden[]; };
+layout(set = 0, binding = 1) readonly buffer A { float a[]; };
+layout(set = 0, binding = 2) readonly buffer B { float b[]; };
+layout(set = 0, binding = 3) buffer Residual  { float residual[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= count) return;
+    float v = a[idx] + b[idx];
+    hidden[idx]   = v;
+    residual[idx] = v;
+}

@@ -1,0 +1,56 @@
+#version 450
+
+// SGEMV Compute Shader: y = A @ x  (one workgroup per output row).
+//
+// Phase 3 optimization: vec4 loads on both the matrix row and the input
+// vector for coalesced 16-byte memory transactions and dot-product fma.
+//
+// Requires N % 4 == 0 (true for all Qwen3.5 dims: 1024, 2816, etc.).
+// Buffers are reinterpretations of the original float buffers — same bytes,
+// just typed as vec4. Vulkan SSBOs are 16-byte aligned by default, so
+// the same VkBuffer can be bound here without modification.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer  MatA { vec4  A4[]; };
+layout(set = 0, binding = 1) readonly buffer  VecX { vec4  x4[]; };
+layout(set = 0, binding = 2) writeonly buffer VecY { float y[];  };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;
+    uint _unused;
+};
+
+shared float sdata[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint vec4_per_row = N >> 2;
+    uint base = row * vec4_per_row;
+
+    float sum = 0.0;
+    for (uint i = tid; i < vec4_per_row; i += 256) {
+        vec4 a = A4[base + i];
+        vec4 b = x4[i];
+        sum += dot(a, b);
+    }
+
+    sdata[tid] = sum;
+    barrier();
+
+    // Tree reduction
+    if (tid < 128) sdata[tid] += sdata[tid + 128]; barrier();
+    if (tid <  64) sdata[tid] += sdata[tid +  64]; barrier();
+    if (tid <  32) sdata[tid] += sdata[tid +  32]; barrier();
+    if (tid <  16) sdata[tid] += sdata[tid +  16]; barrier();
+    if (tid <   8) sdata[tid] += sdata[tid +   8]; barrier();
+    if (tid <   4) sdata[tid] += sdata[tid +   4]; barrier();
+    if (tid <   2) sdata[tid] += sdata[tid +   2]; barrier();
+    if (tid <   1) sdata[tid] += sdata[tid +   1];
+
+    if (tid == 0) y[row] = sdata[0];
+}

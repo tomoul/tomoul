@@ -215,6 +215,33 @@ pub const models = [_]ModelConfig{
         .supports_bundled = false, // Weights loaded separately at runtime
         .release_mode = .fast,
     },
+    // Qwen3.5-0.8B — Hybrid DeltaNet + Attention Language Model
+    .{
+        .name = "qwen3_5-0.8b",
+        .kind = .text,
+        .description = "Text Generation (Qwen3.5-0.8B — Hybrid DeltaNet + GQA, 0.8B params)",
+        .model_module = "src/models/qwen3_5/model.zig",
+        .cli_module = "src/models/qwen3_5/cli.zig",
+        .c_binding = "src/models/qwen3_5/c.zig",
+        .weights_path = "artifacts/qwen3_5_0.8b.tl",
+        .vocab_path = "artifacts/qwen3_5_vocab.bin",
+        .export_symbols = &.{
+            "tomoul_qwen3_5_init",
+            "tomoul_qwen3_5_generate",
+            "tomoul_qwen3_5_get_output_buffer_ptr",
+            "tomoul_qwen3_5_get_output_length",
+            "tomoul_qwen3_5_is_ready",
+            "tomoul_qwen3_5_destroy",
+        },
+        .weight_variants = &.{
+            .{ .suffix = "-q8k", .path = "artifacts/qwen3_5_0.8b_q8k.tl", .description = "Q8_K block-wise - ~0.8 GB" },
+            .{ .suffix = "-q4", .path = "artifacts/qwen3_5_0.8b_q4.tl", .description = "Q4 quantized - ~0.4 GB" },
+        },
+        .has_example = false,
+        .has_cli = true,
+        .supports_bundled = false,
+        .release_mode = .fast,
+    },
     .{
         .name = "whisper-base",
         .kind = .audio,

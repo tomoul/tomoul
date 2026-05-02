@@ -1,0 +1,26 @@
+#version 450
+
+// SiLU-Mul Compute Shader (SwiGLU activation):
+//   gate[i] = silu(gate[i]) * up[i]
+//   where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+//
+// gate: N-element vector, modified in-place (binding 0)
+// up:   N-element vector, read-only (binding 1)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Gate { float gate[]; };
+layout(set = 0, binding = 1) readonly buffer Up { float up[]; };
+
+layout(push_constant) uniform Params {
+    uint N;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= N) return;
+
+    float g = gate[idx];
+    float sigmoid = 1.0 / (1.0 + exp(-g));
+    gate[idx] = g * sigmoid * up[idx];
+}

@@ -409,6 +409,25 @@ pub fn build(b: *std.Build) void {
     st_test_step.dependOn(&run_st_tests.step);
 
     // ==========================================================================
+    // Qwen3.5 unit tests
+    // ==========================================================================
+    const qwen35_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/test_qwen3_5.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    qwen35_test_module.addImport("tensor.zig", tensor_module);
+    qwen35_test_module.addImport("ops.zig", ops_module);
+
+    const qwen35_tests = b.addTest(.{
+        .root_module = qwen35_test_module,
+    });
+
+    const run_qwen35_tests = b.addRunArtifact(qwen35_tests);
+    const qwen35_test_step = b.step("test-qwen3_5", "Run Qwen3.5 model unit tests");
+    qwen35_test_step.dependOn(&run_qwen35_tests.step);
+
+    // ==========================================================================
     // GPU HAL (Hardware Abstraction Layer) + Vulkan Backend
     // ==========================================================================
     {
@@ -435,6 +454,16 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         vulkan_forward_module.addImport("vulkan", vulkan_module);
+
+        // --- Qwen3.5 GPU accelerator (SGEMV matvec via Vulkan compute) ---
+        const qwen3_5_gpu_module = b.createModule(.{
+            .root_source_file = b.path("src/models/qwen3_5/qwen3_5_gpu.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        qwen3_5_gpu_module.addImport("vulkan", vulkan_module);
+        qwen3_5_gpu_module.addImport("vk_loader", vk_loader_module);
+        exe_module.addImport("qwen3_5_gpu", qwen3_5_gpu_module);
 
         // --- HAL interface (backend-agnostic) ---
         const hal_module = b.createModule(.{

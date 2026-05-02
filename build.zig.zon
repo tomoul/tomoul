@@ -10,8 +10,7 @@
     },
     .dependencies = .{
         .zblas = .{
-            .url = "https://github.com/tomoul/zblas/archive/7dba661.tar.gz",
-            .hash = "zblas-0.1.0-b19dIg53BADdlRWACFj4GyW1hbr801YeLJyKW4dz01rp",
+            .path = "../zblas",
         },
     },
 }

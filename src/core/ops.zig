@@ -2750,3 +2750,316 @@ test "apply attention mask additive" {
     try std.testing.expectEqual(@as(f32, 2.0), scores.data[4]);
     try std.testing.expect(std.math.isNegativeInf(scores.data[5]));
 }
+
+// ============================================================================
+// RMS Normalization (for LLMs: Qwen3.5, Gemma, LLaMA, etc.)
+// ============================================================================
+
+/// In-place RMS normalization: x = x * weight / rms(x)
+/// input: [seq_len, hidden_dim], weight: [hidden_dim]
+/// Unlike LayerNorm, RMSNorm has no mean centering or beta.
+/// Formula: x_i = x_i * weight_i / sqrt(mean(x^2) + epsilon)
+pub fn rmsNormInPlace(
+    input: *Tensor,
+    weight: *const Tensor,
+    epsilon: f32,
+) OpsError!void {
+    if (input.shape.len != 2) return OpsError.InvalidShape;
+
+    const seq_len = input.shape[0];
+    const hidden_dim = input.shape[1];
+
+    if (weight.shape.len != 1 or weight.shape[0] != hidden_dim) {
+        return OpsError.ShapeMismatch;
+    }
+
+    const VEC_WIDTH = VEC_F32_WIDTH;
+    const Vec = @Vector(VEC_WIDTH, f32);
+    const hidden_dim_f: f32 = @floatFromInt(hidden_dim);
+
+    for (0..seq_len) |row| {
+        const row_data = input.data[row * hidden_dim ..][0..hidden_dim];
+
+        // Calculate mean of squares using SIMD
+        var sum_sq: f32 = 0.0;
+        if (hidden_dim >= VEC_WIDTH) {
+            var sum_vec: Vec = @splat(0.0);
+            var i: usize = 0;
+            while (i + VEC_WIDTH <= hidden_dim) : (i += VEC_WIDTH) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH].*;
+                sum_vec += v * v;
+            }
+            sum_sq = @reduce(.Add, sum_vec);
+            while (i < hidden_dim) : (i += 1) {
+                sum_sq += row_data[i] * row_data[i];
+            }
+        } else {
+            for (row_data) |v| sum_sq += v * v;
+        }
+
+        const inv_rms: f32 = 1.0 / @sqrt(sum_sq / hidden_dim_f + epsilon);
+        const inv_rms_vec: Vec = @splat(inv_rms);
+
+        // Normalize and scale: x = x * weight * inv_rms
+        if (hidden_dim >= VEC_WIDTH) {
+            var i: usize = 0;
+            while (i + VEC_WIDTH <= hidden_dim) : (i += VEC_WIDTH) {
+                const v: Vec = row_data[i..][0..VEC_WIDTH].*;
+                const w: Vec = weight.data[i..][0..VEC_WIDTH].*;
+                row_data[i..][0..VEC_WIDTH].* = v * w * inv_rms_vec;
+            }
+            while (i < hidden_dim) : (i += 1) {
+                row_data[i] = row_data[i] * weight.data[i] * inv_rms;
+            }
+        } else {
+            for (row_data, 0..) |*v, i| {
+                v.* = v.* * weight.data[i] * inv_rms;
+            }
+        }
+    }
+}
+
+/// RMS normalization for a 1D vector (single token)
+/// input: [hidden_dim], weight: [hidden_dim]
+pub fn rmsNorm1DInPlace(
+    input: []f32,
+    weight: []const f32,
+    hidden_dim: usize,
+    epsilon: f32,
+) void {
+    var sum_sq: f32 = 0.0;
+    for (input[0..hidden_dim]) |v| sum_sq += v * v;
+
+    const inv_rms: f32 = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(hidden_dim)) + epsilon);
+
+    for (0..hidden_dim) |i| {
+        input[i] = input[i] * weight[i] * inv_rms;
+    }
+}
+
+// ============================================================================
+// SiLU / Swish Activation
+// ============================================================================
+
+/// In-place SiLU (Sigmoid Linear Unit): x = x * sigmoid(x)
+/// Also known as Swish activation. Used by LLaMA, Qwen, Gemma.
+pub fn siluInPlace(a: *Tensor) void {
+    const VEC_WIDTH = VEC_F32_WIDTH;
+    const len = a.data.len;
+
+    var i: usize = 0;
+    while (i + VEC_WIDTH <= len) : (i += VEC_WIDTH) {
+        inline for (0..VEC_WIDTH) |j| {
+            const x = a.data[i + j];
+            a.data[i + j] = x / (1.0 + @exp(-x));
+        }
+    }
+    while (i < len) : (i += 1) {
+        const x = a.data[i];
+        a.data[i] = x / (1.0 + @exp(-x));
+    }
+}
+
+/// In-place SiLU on a raw slice
+pub fn siluSliceInPlace(data: []f32) void {
+    for (data) |*v| {
+        v.* = v.* / (1.0 + @exp(-v.*));
+    }
+}
+
+// ============================================================================
+// RoPE (Rotary Position Embeddings)
+// ============================================================================
+
+/// Apply Rotary Position Embeddings in-place.
+/// Supports partial rotary (only first partial_dim dimensions get RoPE).
+/// q: [seq_len, num_heads * head_dim], k: [seq_len, num_kv_heads * head_dim]
+/// partial_dim: number of dims to apply RoPE to (head_dim for full, head_dim*factor for partial)
+pub fn ropeInPlace(
+    q: []f32,
+    k: []f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    partial_dim: usize,
+    position: usize,
+    rope_base: f32,
+) void {
+    // Apply RoPE to Q
+    for (0..num_heads) |h| {
+        const offset = h * head_dim;
+        ropeHeadInPlace(q[offset..][0..head_dim], partial_dim, position, rope_base);
+    }
+    // Apply RoPE to K
+    for (0..num_kv_heads) |h| {
+        const offset = h * head_dim;
+        ropeHeadInPlace(k[offset..][0..head_dim], partial_dim, position, rope_base);
+    }
+}
+
+/// Apply RoPE to a single head vector in-place.
+/// head: [head_dim], only first partial_dim dimensions are rotated.
+fn ropeHeadInPlace(head: []f32, partial_dim: usize, position: usize, rope_base: f32) void {
+    const pos_f: f32 = @floatFromInt(position);
+    const half = partial_dim / 2;
+
+    for (0..half) |i| {
+        const freq_exp: f32 = -2.0 * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(partial_dim));
+        const freq = pos_f / std.math.pow(f32, rope_base, freq_exp);
+        const cos_val = @cos(freq);
+        const sin_val = @sin(freq);
+
+        const x0 = head[i];
+        const x1 = head[i + half];
+        head[i] = x0 * cos_val - x1 * sin_val;
+        head[i + half] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+// ============================================================================
+// L2 Normalization (per-vector)
+// ============================================================================
+
+/// L2-normalize a vector in place: v = v / ||v||
+pub fn l2NormInPlace(data: []f32) void {
+    var sum_sq: f32 = 0.0;
+    for (data) |v| sum_sq += v * v;
+    if (sum_sq < 1e-12) return;
+    const inv_norm: f32 = 1.0 / @sqrt(sum_sq);
+    for (data) |*v| v.* *= inv_norm;
+}
+
+// ============================================================================
+// Softplus: log(1 + exp(x))
+// ============================================================================
+
+/// Softplus activation: log(1 + exp(x))
+pub fn softplus(x: f32) f32 {
+    if (x > 20.0) return x; // For large x, softplus ≈ x
+    if (x < -20.0) return 0.0; // For very negative x, softplus ≈ 0
+    return @log(1.0 + @exp(x));
+}
+
+// ============================================================================
+// Outer Product
+// ============================================================================
+
+/// Rank-1 outer product: result = alpha * (a ⊗ b) where a[M], b[N] -> result[M, N]
+/// result[i,j] += alpha * a[i] * b[j]
+pub fn outerProductAddInPlace(
+    result: []f32,
+    a: []const f32,
+    b: []const f32,
+    m: usize,
+    n: usize,
+    alpha: f32,
+) void {
+    for (0..m) |i| {
+        const a_val = a[i] * alpha;
+        const row = result[i * n ..][0..n];
+        for (0..n) |j| {
+            row[j] += a_val * b[j];
+        }
+    }
+}
+
+/// Matrix-vector multiply: result = M @ v where M[rows, cols], v[cols] -> result[rows]
+pub fn matvecMul(result: []f32, mat: []const f32, vec: []const f32, rows: usize, cols: usize) void {
+    if (use_zblas) {
+        zblas.sgemv(rows, cols, mat, vec, result, 1.0, 0.0);
+    } else if (use_blas) {
+        blas.sgemv(rows, cols, mat, vec, result, 1.0, 0.0);
+    } else {
+        for (0..rows) |i| {
+            var sum_val: f32 = 0.0;
+            const row = mat[i * cols ..][0..cols];
+            for (0..cols) |j| {
+                sum_val += row[j] * vec[j];
+            }
+            result[i] = sum_val;
+        }
+    }
+}
+
+/// Q8K matrix-vector multiply: result = dequant(M_q8k) @ v
+/// M_q8k is int8 row-major [rows × cols] with per-block f32 scales.
+pub fn matvecMulQ8K(result: []f32, mat_data: []const i8, mat_scales: []const f32, vec: []const f32, rows: usize, cols: usize) void {
+    if (use_zblas) {
+        zblas.sgemvQ8K(rows, cols, mat_data, mat_scales, vec, result);
+    } else {
+        // Scalar fallback with on-the-fly dequant
+        for (0..rows) |i| {
+            var sum_val: f32 = 0.0;
+            const row_base = i * cols;
+            for (0..cols) |j| {
+                const flat_idx = row_base + j;
+                const sc = mat_scales[flat_idx / 32];
+                sum_val += @as(f32, @floatFromInt(mat_data[flat_idx])) * sc * vec[j];
+            }
+            result[i] = sum_val;
+        }
+    }
+}
+
+/// Dequantize a single row from a Q8K matrix into f32.
+/// Used for embedding lookup from quantized embed_tokens.
+pub fn dequantRowQ8K(out: []f32, data: []const i8, scales: []const f32, row: usize, cols: usize) void {
+    const row_base = row * cols;
+    for (0..cols) |j| {
+        const flat_idx = row_base + j;
+        const sc = scales[flat_idx / 32];
+        out[j] = @as(f32, @floatFromInt(data[flat_idx])) * sc;
+    }
+}
+
+/// Matmul into slice (no allocation): C[M,N] = A[M,K] @ B[K,N]
+pub fn matmulInto(c: []f32, a: []const f32, b: []const f32, m: usize, k: usize, n: usize) void {
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var sum_val: f32 = 0.0;
+            for (0..k) |kk| {
+                sum_val += a[i * k + kk] * b[kk * n + j];
+            }
+            c[i * n + j] = sum_val;
+        }
+    }
+}
+
+// ============================================================================
+// Group Normalization
+// ============================================================================
+
+/// Group normalization on a flat vector with gated output.
+/// Normalizes each group independently, then applies: output = norm(x) * silu(z)
+/// data: [total_dim], z: [total_dim], weight: [group_size] (shared across groups)
+/// num_groups: number of groups to normalize over independently
+pub fn groupNormGatedInPlace(
+    data: []f32,
+    z: []const f32,
+    weight: []const f32,
+    total_dim: usize,
+    num_groups: usize,
+    epsilon: f32,
+) void {
+    const group_size = total_dim / num_groups;
+
+    for (0..num_groups) |g| {
+        const start = g * group_size;
+
+        // Compute RMS (root mean square) for this group — no mean subtraction
+        var sum_sq: f32 = 0.0;
+        for (0..group_size) |i| {
+            const v = data[start + i];
+            sum_sq += v * v;
+        }
+        const rms_inv = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(group_size)) + epsilon);
+
+        // Normalize by RMS, apply weight (per-group), and gate with silu(z)
+        for (0..group_size) |i| {
+            const idx = start + i;
+            const normalized = data[idx] * rms_inv * weight[i];
+            const gate = z[idx] / (1.0 + @exp(-z[idx])); // silu(z)
+            data[idx] = normalized * gate;
+        }
+    }
+}

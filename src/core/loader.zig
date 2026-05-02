@@ -402,6 +402,26 @@ pub const ModelLoader = struct {
         return qtensor;
     }
 
+    /// Load a Q8_K tensor and dequantize to F32.
+    /// Used for small tensors (norms, biases) in Q8K-format files.
+    pub fn getQ8KAsF32(self: *Self, name: []const u8) !Tensor {
+        var qtensor = try self.getQuantizedTensorQ8K(name);
+        defer qtensor.deinit();
+
+        // Create F32 tensor with the same shape
+        var tensor = try Tensor.init(self.allocator, qtensor.shape);
+        errdefer tensor.deinit();
+
+        // Dequantize
+        const block_size = qtensor.block_size;
+        for (tensor.data, 0..) |*out, i| {
+            const scale = qtensor.scales[i / block_size];
+            out.* = @as(f32, @floatFromInt(qtensor.data[i])) * scale;
+        }
+
+        return tensor;
+    }
+
     /// Load tensor as F16 (half-precision)
     pub fn getF16Tensor(self: *Self, name: []const u8) !F16Tensor {
         if (self.quant_format != .f16) {

@@ -112,6 +112,8 @@ pub const VK_PHYSICAL_DEVICE_TYPE_CPU: i32 = 4;
 pub const VK_QUEUE_COMPUTE_BIT: VkFlags = 0x00000002;
 
 // Buffer usage
+pub const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: VkBufferUsageFlags = 0x00000001;
+pub const VK_BUFFER_USAGE_TRANSFER_DST_BIT: VkBufferUsageFlags = 0x00000002;
 pub const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: VkBufferUsageFlags = 0x00000020;
 
 // Memory property flags
@@ -137,6 +139,11 @@ pub const VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: VkPipelineStageFlags = 0x0000080
 // Access flags
 pub const VK_ACCESS_SHADER_READ_BIT: VkAccessFlags = 0x00000020;
 pub const VK_ACCESS_SHADER_WRITE_BIT: VkAccessFlags = 0x00000040;
+pub const VK_ACCESS_TRANSFER_READ_BIT: VkAccessFlags = 0x00000800;
+pub const VK_ACCESS_TRANSFER_WRITE_BIT: VkAccessFlags = 0x00001000;
+
+// Pipeline stage (transfer)
+pub const VK_PIPELINE_STAGE_TRANSFER_BIT: VkPipelineStageFlags = 0x00001000;
 
 // Command buffer level
 pub const VK_COMMAND_BUFFER_LEVEL_PRIMARY: i32 = 0;
@@ -543,6 +550,12 @@ pub const VkMemoryBarrier = extern struct {
     dstAccessMask: VkAccessFlags = 0,
 };
 
+pub const VkBufferCopy = extern struct {
+    srcOffset: VkDeviceSize = 0,
+    dstOffset: VkDeviceSize = 0,
+    size: VkDeviceSize = 0,
+};
+
 // ============================================================================
 // Function Pointer Types
 // ============================================================================
@@ -588,6 +601,7 @@ pub const PFN_vkCmdBindPipeline = *const fn (VkCommandBuffer, i32, VkPipeline) c
 pub const PFN_vkCmdBindDescriptorSets = *const fn (VkCommandBuffer, i32, VkPipelineLayout, u32, u32, [*]const VkDescriptorSet, u32, ?[*]const u32) callconv(.c) void;
 pub const PFN_vkCmdPushConstants = *const fn (VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, u32, u32, *const anyopaque) callconv(.c) void;
 pub const PFN_vkCmdDispatch = *const fn (VkCommandBuffer, u32, u32, u32) callconv(.c) void;
+pub const PFN_vkCmdCopyBuffer = *const fn (VkCommandBuffer, VkBuffer, VkBuffer, u32, [*]const VkBufferCopy) callconv(.c) void;
 pub const PFN_vkCmdPipelineBarrier = *const fn (VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, u32, ?[*]const VkMemoryBarrier, u32, ?*const anyopaque, u32, ?*const anyopaque) callconv(.c) void;
 pub const PFN_vkQueueSubmit = *const fn (VkQueue, u32, [*]const VkSubmitInfo, VkFence) callconv(.c) VkResult;
 pub const PFN_vkCreateFence = *const fn (VkDevice, *const VkFenceCreateInfo, ?*const VkAllocationCallbacks, *VkFence) callconv(.c) VkResult;
@@ -650,6 +664,7 @@ pub const VkLoader = struct {
     vkCmdBindDescriptorSets: PFN_vkCmdBindDescriptorSets,
     vkCmdPushConstants: PFN_vkCmdPushConstants,
     vkCmdDispatch: PFN_vkCmdDispatch,
+    vkCmdCopyBuffer: PFN_vkCmdCopyBuffer,
     vkCmdPipelineBarrier: PFN_vkCmdPipelineBarrier,
     vkQueueSubmit: PFN_vkQueueSubmit,
     vkCreateFence: PFN_vkCreateFence,
@@ -749,6 +764,7 @@ pub const VkLoader = struct {
             .vkCmdBindDescriptorSets = resolve(PFN_vkCmdBindDescriptorSets, getProc, probe_instance, "vkCmdBindDescriptorSets") orelse return error.VulkanNotAvailable,
             .vkCmdPushConstants = resolve(PFN_vkCmdPushConstants, getProc, probe_instance, "vkCmdPushConstants") orelse return error.VulkanNotAvailable,
             .vkCmdDispatch = resolve(PFN_vkCmdDispatch, getProc, probe_instance, "vkCmdDispatch") orelse return error.VulkanNotAvailable,
+            .vkCmdCopyBuffer = resolve(PFN_vkCmdCopyBuffer, getProc, probe_instance, "vkCmdCopyBuffer") orelse return error.VulkanNotAvailable,
             .vkCmdPipelineBarrier = resolve(PFN_vkCmdPipelineBarrier, getProc, probe_instance, "vkCmdPipelineBarrier") orelse return error.VulkanNotAvailable,
             .vkQueueSubmit = resolve(PFN_vkQueueSubmit, getProc, probe_instance, "vkQueueSubmit") orelse return error.VulkanNotAvailable,
             .vkCreateFence = resolve(PFN_vkCreateFence, getProc, probe_instance, "vkCreateFence") orelse return error.VulkanNotAvailable,
