@@ -215,6 +215,21 @@ pub const models = [_]ModelConfig{
         .supports_bundled = false, // Weights loaded separately at runtime
         .release_mode = .fast,
     },
+    // InkubaLM-0.4B — African-languages LLM (stock Llama, runs on arch/llama.zig)
+    .{
+        .name = "inkubalm-0.4b",
+        .kind = .text,
+        .description = "Text Generation (InkubaLM-0.4B — Llama, 0.4B params, African languages)",
+        .model_module = "src/models/inkubalm/model.zig",
+        .cli_module = "src/models/inkubalm/cli.zig",
+        .weights_path = "artifacts/inkubalm_0.4b.safetensors",
+        .hf_repo = "lelapa/InkubaLM-0.4B",
+        .export_symbols = &.{},
+        .has_example = false,
+        .has_cli = true,
+        .supports_bundled = false,
+        .release_mode = .fast,
+    },
     // Qwen3.5-0.8B — Hybrid DeltaNet + Attention Language Model
     .{
         .name = "qwen3_5-0.8b",

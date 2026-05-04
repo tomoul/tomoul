@@ -176,6 +176,35 @@ pub fn build(b: *std.Build) void {
     });
     audio_module.addImport("tensor.zig", tensor_module);
 
+    // ==========================================================================
+    // arch/ + format/ modules (shared by tests and per-model CLIs)
+    // ==========================================================================
+    const llama_arch_module = b.createModule(.{
+        .root_source_file = b.path("src/arch/llama.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    llama_arch_module.addImport("tensor.zig", tensor_module);
+    llama_arch_module.addImport("ops.zig", ops_module);
+    llama_arch_module.addImport("quantization.zig", quantization_module);
+
+    const safetensors_module = b.createModule(.{
+        .root_source_file = b.path("src/format/safetensors.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const llama_loader_module = b.createModule(.{
+        .root_source_file = b.path("src/format/llama_loader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    llama_loader_module.addImport("tensor.zig", tensor_module);
+    llama_loader_module.addImport("ops.zig", ops_module);
+    llama_loader_module.addImport("quantization.zig", quantization_module);
+    llama_loader_module.addImport("llama.zig", llama_arch_module);
+    llama_loader_module.addImport("safetensors.zig", safetensors_module);
+
     // Create build options for bundled mode
     const exe_options = b.addOptions();
     exe_options.addOption(bool, "bundled", bundled);
@@ -232,6 +261,10 @@ pub fn build(b: *std.Build) void {
         model_module.addImport("transformer.zig", transformer_module);
         model_module.addImport("cache.zig", cache_module);
         model_module.addImport("audio.zig", audio_module);
+        // Llama-family models reuse arch/llama.zig + format/* via these named imports.
+        model_module.addImport("llama.zig", llama_arch_module);
+        model_module.addImport("llama_loader.zig", llama_loader_module);
+        model_module.addImport("safetensors.zig", safetensors_module);
         exe_module.addImport("model.zig", model_module);
     }
 
@@ -336,6 +369,58 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // ==========================================================================
+    // Format module tests (src/format/*.zig — safetensors, config.json, dtype)
+    // ==========================================================================
+    const format_test_module = b.createModule(.{
+        .root_source_file = b.path("src/format/_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const format_tests = b.addTest(.{ .root_module = format_test_module });
+    const run_format_tests = b.addRunArtifact(format_tests);
+    const format_test_step = b.step("test-format", "Run format/ unit tests (safetensors, config_json, dtype)");
+    format_test_step.dependOn(&run_format_tests.step);
+    test_step.dependOn(&run_format_tests.step);
+
+    // ==========================================================================
+    // arch/llama.zig tests
+    // ==========================================================================
+    const llama_tests = b.addTest(.{ .root_module = llama_arch_module });
+    const run_llama_tests = b.addRunArtifact(llama_tests);
+    const llama_test_step = b.step("test-llama", "Run arch/llama.zig unit tests");
+    llama_test_step.dependOn(&run_llama_tests.step);
+    test_step.dependOn(&run_llama_tests.step);
+
+    // ==========================================================================
+    // format/llama_loader.zig tests (safetensors -> LlamaWeights bridge)
+    // ==========================================================================
+    const llama_loader_tests = b.addTest(.{ .root_module = llama_loader_module });
+
+    // ==========================================================================
+    // models/inkubalm tests
+    // ==========================================================================
+    const inkubalm_test_module = b.createModule(.{
+        .root_source_file = b.path("src/models/inkubalm/model.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inkubalm_test_module.addImport("tensor.zig", tensor_module);
+    inkubalm_test_module.addImport("ops.zig", ops_module);
+    inkubalm_test_module.addImport("quantization.zig", quantization_module);
+    inkubalm_test_module.addImport("llama.zig", llama_arch_module);
+    inkubalm_test_module.addImport("llama_loader.zig", llama_loader_module);
+    inkubalm_test_module.addImport("safetensors.zig", safetensors_module);
+    const inkubalm_tests = b.addTest(.{ .root_module = inkubalm_test_module });
+    const run_inkubalm_tests = b.addRunArtifact(inkubalm_tests);
+    const inkubalm_test_step = b.step("test-inkubalm", "Run InkubaLM model wrapper tests");
+    inkubalm_test_step.dependOn(&run_inkubalm_tests.step);
+    test_step.dependOn(&run_inkubalm_tests.step);
+    const run_llama_loader_tests = b.addRunArtifact(llama_loader_tests);
+    const llama_loader_test_step = b.step("test-llama-loader", "Run format/llama_loader.zig tests");
+    llama_loader_test_step.dependOn(&run_llama_loader_tests.step);
+    test_step.dependOn(&run_llama_loader_tests.step);
 
     // ==========================================================================
     // Integration tests

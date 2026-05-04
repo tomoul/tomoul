@@ -1,0 +1,42 @@
+# models/inkubalm/model.toml
+# InkubaLM-0.4B — African languages LLM (Llama-style)
+#
+# This file is a human-readable spec. The runtime config used by the
+# Tomoul build is the comptime literal in config.zig.
+
+[model]
+name = "inkubalm-0.4b"
+family = "inkubalm"
+architecture = "llama"
+
+[architecture]
+type = "llama"
+hidden_size = 2048
+num_layers = 8
+intermediate_size = 5632
+vocab_size = 61788
+max_seq_len = 2048
+
+[attention]
+num_heads = 32
+num_kv_heads = 32        # MHA (no GQA)
+head_dim = 64
+
+[norm]
+type = "rmsnorm"
+eps = 1e-5
+
+[rope]
+theta = 10000.0
+
+[embeddings]
+tie_word_embeddings = true
+
+[weights]
+format = "safetensors"
+hub = "lelapa/InkubaLM-0.4B"
+files = ["artifacts/inkubalm_0.4b.safetensors"]
+
+[tokenizer]
+type = "sentencepiece"   # not yet implemented in Zig — driven externally for now
+vocab_size = 61788
